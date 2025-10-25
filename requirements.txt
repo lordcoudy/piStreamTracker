@@ -1,0 +1,6 @@
+opencv-contrib-python
+numpy
+ev3-dc
+picamera2
+vidgear[asyncio]
+uvloop
