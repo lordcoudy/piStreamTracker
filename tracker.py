@@ -4,9 +4,6 @@ import logging
 import os
 import time
 from datetime import datetime
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
-import socket
-
 import cv2
 import numpy as np
 
@@ -27,7 +24,7 @@ class EV3Controller:
     """Controller for EV3 motors to track human position"""
     def __init__(self, 
                  deadzone_x=50, deadzone_y=50,
-                 speed_factor=1.0, max_speed=10,
+                 speed_factor=1.0, max_speed=50,
                  invert_x=False, invert_y=False):
         self.deadzone_x = deadzone_x
         self.deadzone_y = deadzone_y
@@ -41,7 +38,7 @@ class EV3Controller:
         self.motor_b = None  # Vertical control
         self.connected = False
         self.last_command_time = 0
-        self.command_cooldown = 15  # Minimum time between commands (seconds)
+        self.command_cooldown = 0.05  # Minimum time between commands (seconds)
 
         self.connect()
 
@@ -94,24 +91,25 @@ class EV3Controller:
         except:
             pass
 
-    def calculate_motor_direction_speed(self, shift, deadzone, invert=False):
+    def calculate_motor_turn_degree_and_speed(self, shift, deadzone, invert=False, axis='x'):
         """
         Calculate motor direction and speed based on shift from center
         Returns: (direction, speed) where direction is 1 or -1
         """
         if abs(shift) < deadzone:
             return None, 0
-
-        direction = 1 if shift > 0 else -1
+        
+        speed = max(abs(shift) / 100.0 * self.speed_factor, 5)
+        speed = min(speed, self.max_speed)
         if invert:
-            direction = -direction
-
-        speed = min(abs(shift) / 100.0 * self.speed_factor, self.max_speed)
-
-        if speed > 0:
-            speed = max(speed, 2)  # Minimum speed to overcome motor friction
-
-        return direction, int(speed)
+            shift = -shift
+        if axis == 'x':
+            degree_coeff = self.cam_width / 128
+        else:
+            degree_coeff = self.cam_height / 96
+        degree = shift / degree_coeff
+        
+        return int(degree), speed
 
     def update_motors(self, shift_x, shift_y):
         """Update motor positions based on human position shift"""
@@ -123,18 +121,18 @@ class EV3Controller:
             return
 
         try:
-            dir_a, speed_a = self.calculate_motor_direction_speed(
-                shift_x / 5, self.deadzone_x, self.invert_x
+            degree_a, speed_a = self.calculate_motor_turn_degree_and_speed(
+                shift_x, self.deadzone_x, self.invert_x, axis='x'
             )
 
-            dir_b, speed_b = self.calculate_motor_direction_speed(
-                shift_y / 50, self.deadzone_y, self.invert_y
+            degree_b, speed_b = self.calculate_motor_turn_degree_and_speed(
+                shift_y, self.deadzone_y, self.invert_y, axis='y'
             )
 
-            if dir_a is not None and speed_a > 0:
+            if degree_a is not None and speed_a > 0:
                 try:
-                    self.motor_a.run(direction=dir_a, speed=speed_a)
-                    logger.debug(f"Motor A: dir={dir_a}, speed={speed_a}, shift_x={shift_x}")
+                    self.motor_a.run_to(degrees=degree_a, speed=speed_a)
+                    logger.debug(f"Motor A: degrees={degree_a}, speed={speed_a}, shift_x={shift_x}")
                 except Exception as e:
                     logger.error(f"Motor A error: {e}")
             else:
@@ -143,10 +141,10 @@ class EV3Controller:
                 except Exception as e:
                     logger.debug(f"Motor A stop error: {e}")
 
-            if dir_b is not None and speed_b > 0:
+            if degree_b is not None and speed_b > 0:
                 try:
-                    self.motor_b.run(direction=dir_b, speed=speed_b)
-                    logger.debug(f"Motor B: dir={dir_b}, speed={speed_b}, shift_y={shift_y}")
+                    self.motor_b.run_to(degrees=degree_b, speed=speed_b)
+                    logger.debug(f"Motor B: degrees={degree_b}, speed={speed_b}, shift_y={shift_y}")
                 except Exception as e:
                     logger.error(f"Motor B error: {e}")
             else:
@@ -165,7 +163,7 @@ class EV3Controller:
             return
 
         try:
-            # logger.info("Stopping all EV3 motors")
+            # logger.debug("Stopping all EV3 motors")
             if self.motor_a:
                 try:
                     self.motor_a.stop()
@@ -203,18 +201,15 @@ class EV3Controller:
             self.connected = False
             logger.info("EV3 disconnected")
 
-
-
 class MJPEGTracker:
     def __init__(self, stream_url, output_dir="recordings",
-                 detection_method="haarcascade", confidence_threshold=0.5,
+                 confidence_threshold=0.5,
                  detection_interval=10, process_scale=0.4,
                  ev3_deadzone_x=50, ev3_deadzone_y=50,
                  ev3_speed_factor=1.0, ev3_max_speed=30,
                  ev3_invert_x=False, ev3_invert_y=False):
         self.stream_url = stream_url
         self.output_dir = output_dir
-        self.detection_method = detection_method
         self.confidence_threshold = confidence_threshold
         self.detection_interval = detection_interval  # Run detection every N frames
         self.process_scale = process_scale  # Scale factor for processing
@@ -257,8 +252,8 @@ class MJPEGTracker:
         self.ev3_controller = EV3Controller(
                 deadzone_x=ev3_deadzone_x,
                 deadzone_y=ev3_deadzone_y,
-                speed_factor=ev3_speed_factor,
-                max_speed=ev3_max_speed,
+                speed_factor=min(ev3_speed_factor, 2),
+                max_speed=min(ev3_max_speed, 100),
                 invert_x=ev3_invert_x,
                 invert_y=ev3_invert_y
             )
@@ -277,23 +272,11 @@ class MJPEGTracker:
 
     def initialize_detection(self):
         try:
-            if self.detection_method == "haarcascade":
-                # Use upper body cascade for better performance
-                self.body_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_upperbody.xml')
-                if self.body_cascade.empty():
-                    self.body_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fullbody.xml')
-                logger.info("Haar Cascade initialized successfully")
-            elif self.detection_method == "hog":
-                self.hog = cv2.HOGDescriptor()
-                self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-                logger.info("HOG people detector initialized successfully")
-            else:
-                # Default to Haar Cascade (faster on RPi)
-                self.detection_method = "haarcascade"
-                self.body_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_upperbody.xml')
-                if self.body_cascade.empty():
-                    self.body_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fullbody.xml')
-                logger.info("Default Haar Cascade initialized successfully")
+            # Use frontal face cascade for better performance
+            self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            if self.face_cascade.empty():
+                self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fullbody.xml')
+            logger.info("Haar Cascade initialized successfully")
         except Exception as e:
             logger.error(f"Error initializing detection: {e}")
 
@@ -306,14 +289,14 @@ class MJPEGTracker:
             if self.cap.isOpened():
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
-                width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                self.cam_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                self.cam_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
                 # Calculate frame center
-                self.frame_center_x = width // 2
-                self.frame_center_y = height // 2
+                self.frame_center_x = self.cam_width // 2
+                self.frame_center_y = self.cam_height // 2
 
-                logger.info(f"Connected to stream: {width}x{height} @ {fps} FPS")
+                logger.info(f"Connected to stream: {self.cam_width}x{self.cam_height} @ {fps} FPS")
                 logger.info(f"Frame center: ({self.frame_center_x}, {self.frame_center_y})")
                 return True
             else:
@@ -322,32 +305,6 @@ class MJPEGTracker:
         except Exception as e:
             logger.error(f"Error connecting to stream: {e}")
             return False
-
-    def detect_humans_hog(self, frame):
-        """Detect humans using HOG descriptor - optimized for single detection"""
-        # Detect people with larger stride for speed
-        boxes, weights = self.hog.detectMultiScale(frame, winStride=(16, 16),
-                                                    padding=(8, 8), scale=1.1)
-
-        if len(boxes) == 0:
-            return None
-
-        # Find human with maximum confidence
-        # weights can be shape (N,) or (N,1) - normalize accordingly
-        w_arr = np.array(weights).reshape(-1)
-        max_idx = int(np.argmax(w_arr))
-        x, y, w, h = boxes[max_idx]
-        # Map SVM score to probability-like confidence [0,1]
-        svm_score = float(w_arr[max_idx])
-        confidence = 1.0 / (1.0 + math.exp(-svm_score))
-
-        if confidence >= self.confidence_threshold:
-            return {
-                'bbox': (int(x), int(y), int(w), int(h)),
-                'label': 'human',
-                'confidence': confidence
-            }
-        return None
 
     def detect_humans_haarcascade(self, frame):
         """Detect humans using Haar Cascade - optimized for single detection"""
@@ -359,8 +316,8 @@ class MJPEGTracker:
 
         # Prefer APIs that return weights to estimate confidence
         try:
-            if hasattr(self.body_cascade, 'detectMultiScale3'):
-                bodies, rejectLevels, level_weights = self.body_cascade.detectMultiScale3(
+            if hasattr(self.face_cascade, 'detectMultiScale3'):
+                bodies, rejectLevels, level_weights = self.face_cascade.detectMultiScale3(
                     gray,
                     scaleFactor=1.5,
                     minNeighbors=3,
@@ -374,8 +331,8 @@ class MJPEGTracker:
 
         if bodies is None:
             try:
-                if hasattr(self.body_cascade, 'detectMultiScale2'):
-                    bodies, level_weights = self.body_cascade.detectMultiScale2(
+                if hasattr(self.face_cascade, 'detectMultiScale2'):
+                    bodies, level_weights = self.face_cascade.detectMultiScale2(
                         gray,
                         scaleFactor=1.5,
                         minNeighbors=3,
@@ -387,10 +344,10 @@ class MJPEGTracker:
 
         if bodies is None:
             # Final fallback without weights
-            bodies = self.body_cascade.detectMultiScale(
+            bodies = self.face_cascade.detectMultiScale(
                 gray,
-                scaleFactor=1.5,
-                minNeighbors=3,
+                scaleFactor=1.1,
+                minNeighbors=4,
                 minSize=(30, 30)
             )
             level_weights = None
@@ -419,13 +376,6 @@ class MJPEGTracker:
             'label': 'human',
             'confidence': confidence
         }
-
-    def detect_single_human(self, frame):
-        """Detect single human with highest confidence"""
-        if self.detection_method == "haarcascade":
-            return self.detect_humans_haarcascade(frame)
-        else:
-            return self.detect_humans_hog(frame)
 
     def calculate_shift_from_center(self, bbox):
         """Calculate the shift of bounding box center from frame center"""
@@ -470,7 +420,6 @@ class MJPEGTracker:
             return False
 
         def _factory(name):
-            # Try legacy first (OpenCV >=4.5 moved trackers here)
             try:
                 if hasattr(cv2, 'legacy'):
                     ctor = getattr(cv2.legacy, f'Tracker{name}_create', None)
@@ -478,7 +427,6 @@ class MJPEGTracker:
                         return ctor()
             except Exception:
                 pass
-            # Try top-level (older builds)
             try:
                 ctor = getattr(cv2, f'Tracker{name}_create', None)
                 if callable(ctor):
@@ -529,7 +477,7 @@ class MJPEGTracker:
                 self.tracked_human = {
                     'bbox': tuple(int(v) for v in bbox),
                     'label': 'human',
-                    'confidence': 0.9
+                    'confidence': self.tracked_human['confidence'] 
                 }
                 # Re-detect every N frames or every 2 seconds to correct drift
                 if (self.frame_count % self.detection_interval == 0 or
@@ -551,7 +499,7 @@ class MJPEGTracker:
         small_frame = cv2.resize(frame, None, fx=self.process_scale, fy=self.process_scale)
 
         # Detect human
-        detected_human = self.detect_single_human(small_frame)
+        detected_human = self.detect_humans_haarcascade(small_frame)
 
         if detected_human:
             # Scale bbox back to original size
@@ -799,9 +747,6 @@ def main():
                         help='MJPEG stream URL')
     parser.add_argument('--output-dir', default='recordings',
                         help='Output directory for recordings')
-    parser.add_argument('--detection-method', choices=['hog', 'haarcascade'],
-                        default='haarcascade',
-                        help='Human detection method (haarcascade is faster on RPi)')
     parser.add_argument('--confidence-threshold', type=float, default=0.75,
                         help='Confidence threshold for human detection')
     parser.add_argument('--detection-interval', type=int, default=15,
@@ -814,13 +759,13 @@ def main():
                         help='Do not start recording automatically')
 
     # EV3 arguments
-    parser.add_argument('--ev3-deadzone-x', type=int, default=100,
+    parser.add_argument('--ev3-deadzone-x', type=int, default=120,
                         help='Horizontal deadzone in pixels (no motor movement within this range)')
-    parser.add_argument('--ev3-deadzone-y', type=int, default=100,
+    parser.add_argument('--ev3-deadzone-y', type=int, default=120,
                         help='Vertical deadzone in pixels (no motor movement within this range)')
     parser.add_argument('--ev3-speed-factor', type=float, default=1.0,
                         help='Speed multiplier for motor control (0.1-2.0)')
-    parser.add_argument('--ev3-max-speed', type=int, default=5,
+    parser.add_argument('--ev3-max-speed', type=int, default=50,
                         help='Maximum motor speed (1-100)')
     parser.add_argument('--ev3-invert-x', action='store_true', default=False,
                         help='Invert horizontal motor direction')
@@ -832,7 +777,6 @@ def main():
     tracker = MJPEGTracker(
         stream_url=args.url,
         output_dir=args.output_dir,
-        detection_method=args.detection_method,
         confidence_threshold=args.confidence_threshold,
         detection_interval=args.detection_interval,
         process_scale=args.process_scale,

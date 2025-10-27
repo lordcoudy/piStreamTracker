@@ -41,10 +41,10 @@ PAGE = """\
 <body>
     <h1>Raspberry Pi Camera Stream</h1>
     <div class="info">
-        <p>Resolution: 1920 x 1080</p>
+        <p>Resolution: 1280 x 960</p>
         <p>Server IP: 192.168.100.1:8000</p>
     </div>
-    <img src="stream.mjpg" width="1920" height="1080" />
+    <img src="stream.mjpg" width="1280" height="960" />
 </body>
 </html>
 """
@@ -115,7 +115,7 @@ if __name__ == '__main__':
 
     logging.info("Initializing Raspberry Pi Camera...")
     picam2 = Picamera2()
-    picam2.configure(picam2.create_video_configuration(main={"size": (1920, 1080)}))
+    picam2.configure(picam2.create_video_configuration(main={"size": (1280, 960)}))
     output = StreamingOutput()
     picam2.start_recording(JpegEncoder(), FileOutput(output))
 
