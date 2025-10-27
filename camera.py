@@ -44,7 +44,7 @@ PAGE = """\
         <p>Resolution: 1280 x 960</p>
         <p>Server IP: 192.168.100.1:8000</p>
     </div>
-    <img src="stream.mjpg" width="1280" height="960" />
+    <img src="stream" width="1280" height="960" />
 </body>
 </html>
 """
@@ -74,7 +74,7 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', len(content))
             self.end_headers()
             self.wfile.write(content)
-        elif self.path == '/stream.mjpg':
+        elif self.path == '/stream':
             self.send_response(200)
             self.send_header('Age', 0)
             self.send_header('Cache-Control', 'no-cache, private')
@@ -127,7 +127,7 @@ if __name__ == '__main__':
         logging.info("=" * 60)
         logging.info("Camera Server Started!")
         logging.info("=" * 60)
-        logging.info(f"Stream URL: http://192.168.100.1:8000/stream.mjpg")
+        logging.info(f"Stream URL: http://192.168.100.1:8000/stream")
         logging.info(f"Web Interface: http://192.168.100.1:8000/")
         logging.info("Press Ctrl+C to stop")
         logging.info("=" * 60)

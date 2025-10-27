@@ -1,9 +1,9 @@
 import argparse
-import math
 import logging
 import os
 import time
 from datetime import datetime
+
 import cv2
 import numpy as np
 
@@ -38,8 +38,9 @@ class EV3Controller:
         self.motor_b = None  # Vertical control
         self.connected = False
         self.last_command_time = 0
-        self.command_cooldown = 0.05  # Minimum time between commands (seconds)
-
+        self.command_cooldown = 5  # Minimum time between commands (seconds)
+        self.cam_width = 1280  
+        self.cam_height = 960   
         self.connect()
 
     def connect(self):
@@ -109,7 +110,7 @@ class EV3Controller:
             degree_coeff = self.cam_height / 96
         degree = shift / degree_coeff
         
-        return int(degree), speed
+        return int(degree), int(speed)
 
     def update_motors(self, shift_x, shift_y):
         """Update motor positions based on human position shift"""
@@ -201,7 +202,7 @@ class EV3Controller:
             self.connected = False
             logger.info("EV3 disconnected")
 
-class MJPEGTracker:
+class Tracker:
     def __init__(self, stream_url, output_dir="recordings",
                  confidence_threshold=0.5,
                  detection_interval=10, process_scale=0.4,
@@ -263,7 +264,7 @@ class MJPEGTracker:
             logger.debug(f"OpenCV version: {cv2.__version__}")
         except Exception:
             pass
-        logger.info(f"MJPEG Tracker initialized with URL: {stream_url}")
+        logger.info(f"Tracker initialized with URL: {stream_url}")
         logger.debug(f"Detection interval: every {detection_interval} frames")
         logger.debug(f"Process scale: {process_scale}")
         logger.debug(f"Shift log file: {self.shift_log_file}")
@@ -288,19 +289,19 @@ class MJPEGTracker:
 
             if self.cap.isOpened():
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
-                self.cam_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                self.cam_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = self.cap.get(cv2.CAP_PROP_FPS) or 60
+                self.ev3_controller.cam_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                self.ev3_controller.cam_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
                 # Calculate frame center
-                self.frame_center_x = self.cam_width // 2
-                self.frame_center_y = self.cam_height // 2
+                self.frame_center_x = self.ev3_controller.cam_width // 2
+                self.frame_center_y = self.ev3_controller.cam_height // 2
 
-                logger.info(f"Connected to stream: {self.cam_width}x{self.cam_height} @ {fps} FPS")
+                logger.info(f"Connected to stream: {self.ev3_controller.cam_width}x{self.ev3_controller.cam_height} @ {fps} FPS")
                 logger.debug(f"Frame center: ({self.frame_center_x}, {self.frame_center_y})")
                 return True
             else:
-                logger.error("Failed to connect to MJPEG stream")
+                logger.error("Failed to connect to stream")
                 return False
         except Exception as e:
             logger.error(f"Error connecting to stream: {e}")
@@ -582,7 +583,7 @@ class MJPEGTracker:
         """Start recording with Raspberry Pi compatible codecs"""
         if not self.is_recording and self.cap is not None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
+            fps = self.cap.get(cv2.CAP_PROP_FPS) or 60
             width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -716,12 +717,12 @@ class MJPEGTracker:
                         cv2.putText(annotated_frame, "EV3: OFF",
                                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-                    cv2.imshow('MJPEG Human Tracker', annotated_frame)
+                    cv2.imshow('Human Tracker', annotated_frame)
                     key = cv2.waitKey(1) & 0xFF
                     if self.process_key(key, annotated_frame) == -1:
                         break
                 else:
-                    key = input() & 0xFF
+                    key = int(input()) & 0xFF
                     if self.process_key(key, annotated_frame) == -1:
                         break
         except KeyboardInterrupt:
@@ -750,14 +751,14 @@ class MJPEGTracker:
         logger.info("Cleanup completed")
 
 def main():
-    parser = argparse.ArgumentParser(description='Optimized MJPEG Human Tracker for Raspberry Pi 5 with EV3 Control')
-    parser.add_argument('--url', default='http://192.168.100.1:8000/stream.mjpg',
-                        help='MJPEG stream URL')
+    parser = argparse.ArgumentParser(description='Human Tracker for Raspberry Pi 5 with EV3 Control')
+    parser.add_argument('--url', default='http://192.168.100.1:8000/stream',
+                        help='Stream URL')
     parser.add_argument('--output-dir', default='recordings',
                         help='Output directory for recordings')
-    parser.add_argument('--confidence-threshold', type=float, default=0.75,
+    parser.add_argument('--confidence-threshold', type=float, default=0.7,
                         help='Confidence threshold for human detection')
-    parser.add_argument('--detection-interval', type=int, default=15,
+    parser.add_argument('--detection-interval', type=int, default=5,
                         help='Run detection every N frames (higher = faster but less responsive)')
     parser.add_argument('--process-scale', type=float, default=0.3,
                         help='Scale factor for detection processing (lower = faster)')
@@ -767,9 +768,9 @@ def main():
                         help='Do not start recording automatically')
 
     # EV3 arguments
-    parser.add_argument('--ev3-deadzone-x', type=int, default=120,
+    parser.add_argument('--ev3-deadzone-x', type=int, default=90,
                         help='Horizontal deadzone in pixels (no motor movement within this range)')
-    parser.add_argument('--ev3-deadzone-y', type=int, default=120,
+    parser.add_argument('--ev3-deadzone-y', type=int, default=90,
                         help='Vertical deadzone in pixels (no motor movement within this range)')
     parser.add_argument('--ev3-speed-factor', type=float, default=1.0,
                         help='Speed multiplier for motor control (0.1-2.0)')
@@ -782,7 +783,7 @@ def main():
 
     args = parser.parse_args()
 
-    tracker = MJPEGTracker(
+    tracker = Tracker(
         stream_url=args.url,
         output_dir=args.output_dir,
         confidence_threshold=args.confidence_threshold,
