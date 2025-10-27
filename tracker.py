@@ -14,7 +14,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('stream.log'),
+        logging.FileHandler('tracker.log'),
         logging.StreamHandler()
     ]
 )
@@ -51,15 +51,15 @@ class EV3Controller:
             self.ev3 = EV3_USB()
 
             # Try to initialize motors with error handling
-            logger.info("Initializing Motor A (Horizontal)...")
+            logger.debug("Initializing Motor A (Horizontal)...")
             self.motor_a = self.ev3.Motor('a') 
-            logger.info("Initializing Motor B (Vertical)...")
+            logger.debug("Initializing Motor B (Vertical)...")
             self.motor_b = self.ev3.Motor('b')
 
             self.connected = True
             logger.info("EV3 connected successfully!")
-            logger.info("Motor A (Port A): Horizontal control")
-            logger.info("Motor B (Port B): Vertical control")
+            logger.debug("Motor A (Port A): Horizontal control")
+            logger.debug("Motor B (Port B): Vertical control")
 
             try:
                 self.ev3.Led('green', 'pulse')
@@ -260,13 +260,13 @@ class MJPEGTracker:
 
         self.initialize_detection()
         try:
-            logger.info(f"OpenCV version: {cv2.__version__}")
+            logger.debug(f"OpenCV version: {cv2.__version__}")
         except Exception:
             pass
         logger.info(f"MJPEG Tracker initialized with URL: {stream_url}")
-        logger.info(f"Detection interval: every {detection_interval} frames")
-        logger.info(f"Process scale: {process_scale}")
-        logger.info(f"Shift log file: {self.shift_log_file}")
+        logger.debug(f"Detection interval: every {detection_interval} frames")
+        logger.debug(f"Process scale: {process_scale}")
+        logger.debug(f"Shift log file: {self.shift_log_file}")
         if self.ev3_controller and self.ev3_controller.connected:
             logger.info(f"EV3 control enabled")
 
@@ -276,7 +276,7 @@ class MJPEGTracker:
             self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
             if self.face_cascade.empty():
                 self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fullbody.xml')
-            logger.info("Haar Cascade initialized successfully")
+            logger.debug("Haar Cascade initialized successfully")
         except Exception as e:
             logger.error(f"Error initializing detection: {e}")
 
@@ -297,7 +297,7 @@ class MJPEGTracker:
                 self.frame_center_y = self.cam_height // 2
 
                 logger.info(f"Connected to stream: {self.cam_width}x{self.cam_height} @ {fps} FPS")
-                logger.info(f"Frame center: ({self.frame_center_x}, {self.frame_center_y})")
+                logger.debug(f"Frame center: ({self.frame_center_x}, {self.frame_center_y})")
                 return True
             else:
                 logger.error("Failed to connect to MJPEG stream")
@@ -603,7 +603,7 @@ class MJPEGTracker:
                     if self.video_writer.isOpened():
                         self.is_recording = True
                         logger.info(f"Started recording with {name} codec: {self.output_filename}")
-                        logger.info(f"Recording at {width}x{height} @ {fps} FPS")
+                        logger.debug(f"Recording at {width}x{height} @ {fps} FPS")
                         return
                     else:
                         logger.warning(f"Failed to initialize {name} codec, trying next...")
@@ -623,7 +623,7 @@ class MJPEGTracker:
             self.is_recording = False
             logger.info(f"Stopped recording: {self.output_filename}")
 
-    def process_key(self, key):
+    def process_key(self, key, frame):
         if key == ord('q'):
             return -1
         elif key == ord('r'):
@@ -634,7 +634,7 @@ class MJPEGTracker:
         elif key == ord('s'):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             screenshot_path = os.path.join(self.output_dir, f"screenshot_{timestamp}.jpg")
-            cv2.imwrite(screenshot_path, annotated_frame)
+            cv2.imwrite(screenshot_path, frame)
             logger.info(f"Screenshot saved: {screenshot_path}")
         elif key == ord('d'):
             # Force detection
@@ -677,8 +677,7 @@ class MJPEGTracker:
         if auto_record:
             self.start_recording()
 
-        logger.info("Starting optimized human tracking...")
-        logger.info("Tracking SINGLE human with maximum confidence")
+        logger.info("Starting human tracking...")
         logger.info("Press 'q' to quit, 'r' to toggle recording, 's' to take screenshot, 'd' to force detection, 'e' to toggle EV3")
 
         fps_start_time = time.time()
@@ -719,11 +718,11 @@ class MJPEGTracker:
 
                     cv2.imshow('MJPEG Human Tracker', annotated_frame)
                     key = cv2.waitKey(1) & 0xFF
-                    if self.process_key(key) == -1:
+                    if self.process_key(key, annotated_frame) == -1:
                         break
                 else:
                     key = input() & 0xFF
-                    if self.process_key(key) == -1:
+                    if self.process_key(key, annotated_frame) == -1:
                         break
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
@@ -747,7 +746,7 @@ class MJPEGTracker:
         if self.cap is not None:
             self.cap.release()
         cv2.destroyAllWindows()
-        logger.info(f"Shift log saved to: {self.shift_log_file}")
+        logger.debug(f"Shift log saved to: {self.shift_log_file}")
         logger.info("Cleanup completed")
 
 def main():
