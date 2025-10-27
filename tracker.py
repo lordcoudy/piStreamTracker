@@ -623,6 +623,36 @@ class MJPEGTracker:
             self.is_recording = False
             logger.info(f"Stopped recording: {self.output_filename}")
 
+    def process_key(self, key):
+        if key == ord('q'):
+            return -1
+        elif key == ord('r'):
+            if self.is_recording:
+                self.stop_recording()
+            else:
+                self.start_recording()
+        elif key == ord('s'):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            screenshot_path = os.path.join(self.output_dir, f"screenshot_{timestamp}.jpg")
+            cv2.imwrite(screenshot_path, annotated_frame)
+            logger.info(f"Screenshot saved: {screenshot_path}")
+        elif key == ord('d'):
+            # Force detection
+            logger.info("Forcing detection...")
+            self.tracker = None
+            self.tracked_human = None
+        elif key == ord('e'):
+            # Toggle EV3 connection
+            if self.ev3_controller:
+                if self.ev3_controller.connected:
+                    self.ev3_controller.disconnect()
+                    logger.info("EV3 disabled")
+                else:
+                    self.ev3_controller.connect()
+                    logger.info("EV3 enabled")
+        return 0
+
+
     def process_frame(self, frame):
         """Process frame with optimized tracking"""
         self.frame_count += 1
@@ -689,33 +719,12 @@ class MJPEGTracker:
 
                     cv2.imshow('MJPEG Human Tracker', annotated_frame)
                     key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
+                    if self.process_key(key) == -1:
                         break
-                    elif key == ord('r'):
-                        if self.is_recording:
-                            self.stop_recording()
-                        else:
-                            self.start_recording()
-                    elif key == ord('s'):
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        screenshot_path = os.path.join(self.output_dir, f"screenshot_{timestamp}.jpg")
-                        cv2.imwrite(screenshot_path, annotated_frame)
-                        logger.info(f"Screenshot saved: {screenshot_path}")
-                    elif key == ord('d'):
-                        # Force detection
-                        logger.info("Forcing detection...")
-                        self.tracker = None
-                        self.tracked_human = None
-                    elif key == ord('e'):
-                        # Toggle EV3 connection
-                        if self.ev3_controller:
-                            if self.ev3_controller.connected:
-                                self.ev3_controller.disconnect()
-                                logger.info("EV3 disabled")
-                            else:
-                                self.ev3_controller.connect()
-                                logger.info("EV3 enabled")
-
+                else:
+                    key = input() & 0xFF
+                    if self.process_key(key) == -1:
+                        break
         except KeyboardInterrupt:
             logger.info("Interrupted by user")
         except Exception as e:
