@@ -13,7 +13,7 @@ Lightweight tracker for face (or body) tracking using Raspberry Pi camera, OpenC
 ## Installation
 
 ```bash
-git clone <repo-url> piStreamTracker
+git clone https://github.com/lordcoudy/piStreamTracker.git
 cd piStreamTracker
 python -m venv .venv
 source .venv/bin/activate
