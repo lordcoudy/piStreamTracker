@@ -22,10 +22,11 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Edit `config.yaml` (or create one) to list streams, intervals, and log settings.
+Edit `config.yaml` to apply new settings.
 
 ## Usage
 
 ```bash
-python tracker/main.py
+./run.sh # on camera Pi
+./run5.sh # on tracker Pi
 ```
