@@ -1,4 +1,3 @@
-import argparse
 import logging
 import os
 import time
@@ -6,217 +5,35 @@ from datetime import datetime
 
 import cv2
 import numpy as np
+import yaml
+from EV3Controller import EV3Controller
 
-from ev3_usb import EV3_USB
+# Load config
+with open('config.yaml', 'r') as f:
+    config = yaml.safe_load(f)
+tracker_config = config['tracker']
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('tracker.log'),
+        logging.FileHandler(tracker_config['log_file']),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-class EV3Controller:
-    """Controller for EV3 motors to track human position"""
-    def __init__(self, 
-                 deadzone_x=50, deadzone_y=50,
-                 speed_factor=1.0, max_speed=50,
-                 invert_x=False, invert_y=False):
-        self.deadzone_x = deadzone_x
-        self.deadzone_y = deadzone_y
-        self.speed_factor = speed_factor
-        self.max_speed = max_speed
-        self.invert_x = invert_x
-        self.invert_y = invert_y
-
-        self.ev3 = None
-        self.motor_a = None  # Horizontal control
-        self.motor_b = None  # Vertical control
-        self.connected = False
-        self.last_command_time = 0
-        self.command_cooldown = 5  # Minimum time between commands (seconds)
-        self.cam_width = 1280  
-        self.cam_height = 960   
-        self.connect()
-
-    def connect(self):
-        """Connect to EV3 brick via USB"""
-        try:
-            logger.info(f"Connecting to EV3 via USB...")
-
-            # Initialize EV3 connection
-            self.ev3 = EV3_USB()
-
-            # Try to initialize motors with error handling
-            logger.debug("Initializing Motor A (Horizontal)...")
-            self.motor_a = self.ev3.Motor('a') 
-            logger.debug("Initializing Motor B (Vertical)...")
-            self.motor_b = self.ev3.Motor('b')
-
-            self.connected = True
-            logger.info("EV3 connected successfully!")
-            logger.debug("Motor A (Port A): Horizontal control")
-            logger.debug("Motor B (Port B): Vertical control")
-
-            try:
-                self.ev3.Led('green', 'pulse')
-                logger.info("LED set to green")
-            except Exception as e:
-                logger.warning(f"Could not set LED: {e}")
-
-            self.stop_motors()
-
-            return
-
-        except Exception as e:
-            logger.error(f"Failed to connect to EV3: {e}")
-            logger.error("Please check:")
-            logger.error("  1. EV3 is turned on")
-            logger.error("  2. EV3 is connected via USB")
-            logger.error("  3. Motors are connected to ports A and B")
-            self.connected = False
-            self.cleanup_failed_connection()
-
-    def cleanup_failed_connection(self):
-        try:
-            if self.motor_a:
-                self.motor_a = None
-            if self.motor_b:
-                self.motor_b = None
-            if self.ev3:
-                self.ev3 = None
-        except:
-            pass
-
-    def calculate_motor_turn_degree_and_speed(self, shift, deadzone, invert=False, axis='x'):
-        """
-        Calculate motor direction and speed based on shift from center
-        Returns: (direction, speed) where direction is 1 or -1
-        """
-        if abs(shift) < deadzone:
-            return None, 0
-        
-        speed = max(abs(shift) / 100.0 * self.speed_factor, 5)
-        speed = min(speed, self.max_speed)
-        if invert:
-            shift = -shift
-        if axis == 'x':
-            degree_coeff = self.cam_width / 128
-        else:
-            degree_coeff = self.cam_height / 96
-        degree = shift / degree_coeff
-        
-        return int(degree), int(speed)
-
-    def update_motors(self, shift_x, shift_y):
-        """Update motor positions based on human position shift"""
-        if not self.connected or self.ev3 is None:
-            return
-
-        current_time = time.time()
-        if current_time - self.last_command_time < self.command_cooldown:
-            return
-
-        try:
-            degree_a, speed_a = self.calculate_motor_turn_degree_and_speed(
-                shift_x, self.deadzone_x, self.invert_x, axis='x'
-            )
-
-            degree_b, speed_b = self.calculate_motor_turn_degree_and_speed(
-                shift_y, self.deadzone_y, self.invert_y, axis='y'
-            )
-
-            if degree_a is not None and speed_a > 0:
-                try:
-                    self.motor_a.run_to(degrees=degree_a, speed=speed_a)
-                    logger.debug(f"Motor A: degrees={degree_a}, speed={speed_a}, shift_x={shift_x}")
-                except Exception as e:
-                    logger.error(f"Motor A error: {e}")
-            else:
-                try:
-                    self.motor_a.stop()
-                except Exception as e:
-                    logger.debug(f"Motor A stop error: {e}")
-
-            if degree_b is not None and speed_b > 0:
-                try:
-                    self.motor_b.run_to(degrees=degree_b, speed=speed_b)
-                    logger.debug(f"Motor B: degrees={degree_b}, speed={speed_b}, shift_y={shift_y}")
-                except Exception as e:
-                    logger.error(f"Motor B error: {e}")
-            else:
-                try:
-                    self.motor_b.stop()
-                except Exception as e:
-                    logger.debug(f"Motor B stop error: {e}")
-
-            self.last_command_time = current_time
-
-        except Exception as e:
-            logger.error(f"Error updating motors: {e}")
-
-    def stop_motors(self):
-        if not self.connected:
-            return
-
-        try:
-            # logger.debug("Stopping all EV3 motors")
-            if self.motor_a:
-                try:
-                    self.motor_a.stop()
-                except Exception as e:
-                    logger.debug(f"Error stopping motor A: {e}")
-            if self.motor_b:
-                try:
-                    self.motor_b.stop()
-                except Exception as e:
-                    logger.debug(f"Error stopping motor B: {e}")
-        except Exception as e:
-            logger.error(f"Error stopping motors: {e}")
-
-    def disconnect(self):
-        """Disconnect from EV3"""
-        if self.connected:
-            self.stop_motors()
-
-            # Set LED to orange to indicate disconnection
-            try:
-                if self.ev3:
-                    self.ev3.Led('orange', 'static')
-                    logger.info("LED set to orange")
-            except Exception as e:
-                logger.debug(f"Could not set LED on disconnect: {e}")
-
-            # Clean up references
-            try:
-                self.motor_a = None
-                self.motor_b = None
-                self.ev3 = None
-            except:
-                pass
-
-            self.connected = False
-            logger.info("EV3 disconnected")
-
 class Tracker:
-    def __init__(self, stream_url, output_dir="recordings",
-                 detection_type="face", confidence_threshold=0.5,
-                 detection_interval=10, process_scale=0.4,
-                 ev3_deadzone_x=50, ev3_deadzone_y=50,
-                 ev3_speed_factor=1.0, ev3_max_speed=30,
-                 ev3_invert_x=False, ev3_invert_y=False):
-        self.stream_url = stream_url
-        self.output_dir = output_dir
-        self.detection_type = detection_type
-        self.confidence_threshold = confidence_threshold
-        self.detection_interval = detection_interval  # Run detection every N frames
-        self.process_scale = process_scale  # Scale factor for processing
+    def __init__(self):
+        self.stream_url = tracker_config['stream_url']
+        self.output_dir = tracker_config['output_dir']
+        self.detection_type = tracker_config['detection']['type']
+        self.confidence_threshold = tracker_config['detection']['confidence_threshold']
+        self.detection_interval = tracker_config['detection']['interval']
+        self.process_scale = tracker_config['detection']['process_scale']
 
-        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
 
         self.cap = None
         self.is_recording = False
@@ -240,7 +57,7 @@ class Tracker:
 
         # Text file for shift logging
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.shift_log_file = os.path.join(output_dir, f"human_shifts_{timestamp}.txt")
+        self.shift_log_file = os.path.join(self.output_dir, f"{tracker_config['shift_log_prefix']}_{timestamp}.txt")
 
         # Initialize shift log file
         with open(self.shift_log_file, 'w') as f:
@@ -250,24 +67,16 @@ class Tracker:
             f.write("=" * 50 + "\n\n")
 
         # Initialize EV3 controller
-        self.ev3_controller = None
-        self.ev3_controller = EV3Controller(
-                deadzone_x=ev3_deadzone_x,
-                deadzone_y=ev3_deadzone_y,
-                speed_factor=min(ev3_speed_factor, 2),
-                max_speed=min(ev3_max_speed, 100),
-                invert_x=ev3_invert_x,
-                invert_y=ev3_invert_y
-            )
+        self.ev3_controller = EV3Controller()
 
         self.initialize_detection()
         try:
             logger.debug(f"OpenCV version: {cv2.__version__}")
         except Exception:
             pass
-        logger.info(f"Tracker initialized with URL: {stream_url}")
-        logger.debug(f"Detection interval: every {detection_interval} frames")
-        logger.debug(f"Process scale: {process_scale}")
+        logger.info(f"Tracker initialized with URL: {self.stream_url}")
+        logger.debug(f"Detection interval: every {self.detection_interval} frames")
+        logger.debug(f"Process scale: {self.process_scale}")
         logger.debug(f"Shift log file: {self.shift_log_file}")
         if self.ev3_controller and self.ev3_controller.connected:
             logger.info(f"EV3 control enabled")
@@ -746,60 +555,3 @@ class Tracker:
         cv2.destroyAllWindows()
         logger.debug(f"Shift log saved to: {self.shift_log_file}")
         logger.info("Cleanup completed")
-
-def main():
-    parser = argparse.ArgumentParser(description='Human Tracker for Raspberry Pi 5 with EV3 Control')
-    parser.add_argument('--url', default='http://192.168.100.1:8000/stream',
-                        help='Stream URL')
-    parser.add_argument('--output-dir', default='recordings',
-                        help='Output directory for recordings')
-    parser.add_argument('--detection-type', default="face", help='[face, body]')
-    parser.add_argument('--confidence-threshold', type=float, default=0.7,
-                        help='Confidence threshold for human detection')
-    parser.add_argument('--detection-interval', type=int, default=5,
-                        help='Run detection every N frames (higher = faster but less responsive)')
-    parser.add_argument('--process-scale', type=float, default=0.3,
-                        help='Scale factor for detection processing (lower = faster)')
-    parser.add_argument('--no-display', action='store_true',
-                        help='Run without displaying video (saves CPU)')
-    parser.add_argument('--no-auto-record', action='store_true',
-                        help='Do not start recording automatically')
-
-    # EV3 arguments
-    parser.add_argument('--ev3-deadzone-x', type=int, default=90,
-                        help='Horizontal deadzone in pixels (no motor movement within this range)')
-    parser.add_argument('--ev3-deadzone-y', type=int, default=90,
-                        help='Vertical deadzone in pixels (no motor movement within this range)')
-    parser.add_argument('--ev3-speed-factor', type=float, default=1.0,
-                        help='Speed multiplier for motor control (0.1-2.0)')
-    parser.add_argument('--ev3-max-speed', type=int, default=50,
-                        help='Maximum motor speed (1-100)')
-    parser.add_argument('--ev3-invert-x', action='store_true', default=False,
-                        help='Invert horizontal motor direction')
-    parser.add_argument('--ev3-invert-y', action='store_true', default=False,
-                        help='Invert vertical motor direction')
-
-    args = parser.parse_args()
-
-    tracker = Tracker(
-        stream_url=args.url,
-        output_dir=args.output_dir,
-        detection_type=args.detection_type,
-        confidence_threshold=args.confidence_threshold,
-        detection_interval=args.detection_interval,
-        process_scale=args.process_scale,
-        ev3_deadzone_x=args.ev3_deadzone_x,
-        ev3_deadzone_y=args.ev3_deadzone_y,
-        ev3_speed_factor=args.ev3_speed_factor,
-        ev3_max_speed=args.ev3_max_speed,
-        ev3_invert_x=args.ev3_invert_x,
-        ev3_invert_y=args.ev3_invert_y
-    )
-
-    tracker.run(
-        display_video=not args.no_display,
-        auto_record=not args.no_auto_record
-    )
-
-if __name__ == "__main__":
-    main()

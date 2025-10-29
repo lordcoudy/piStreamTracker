@@ -1,0 +1,57 @@
+# config.yaml
+
+# Camera server configuration
+camera_server:
+  host: "192.168.100.1"
+  port: 8000
+  resolution:
+    width: 1280
+    height: 960
+
+# Tracker configuration
+tracker:
+  stream_url: "http://192.168.100.1:8000/stream"
+  output_dir: "recordings"
+  log_file: "tracker.log"
+  shift_log_prefix: "human_shifts"
+  detection:
+    type: "face"
+    confidence_threshold: 0.7
+    interval: 5 # frames
+    process_scale: 0.3
+  display_video: true
+  auto_record: true
+
+# EV3 Controller configuration
+ev3_controller:
+  log_file: "controller.log"
+  deadzone:
+    x: 90
+    y: 90
+  speed_factor: 1.0
+  max_speed: 50
+  invert_x: false
+  invert_y: false
+  command_cooldown: 5 # seconds
+  motors:
+    horizontal: "a"
+    vertical: "b"
+  led:
+    connected: "green"
+    disconnected: "orange"
+  camera:
+    width: 1280
+    height: 960
+    horizontal_fov: 128
+    vertical_fov: 96
+
+# Network configuration for run scripts
+# These are for the shell scripts that set up the network.
+# The tracker pi (run5.sh) should have a different IP.
+network:
+  camera_pi:
+    ip: "192.168.100.1/24"
+    device: "eth0"
+  tracker_pi:
+    ip: "192.168.100.2/24"
+    device: "eth0"
