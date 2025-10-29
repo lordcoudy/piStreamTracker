@@ -204,13 +204,14 @@ class EV3Controller:
 
 class Tracker:
     def __init__(self, stream_url, output_dir="recordings",
-                 confidence_threshold=0.5,
+                 detection_type="face", confidence_threshold=0.5,
                  detection_interval=10, process_scale=0.4,
                  ev3_deadzone_x=50, ev3_deadzone_y=50,
                  ev3_speed_factor=1.0, ev3_max_speed=30,
                  ev3_invert_x=False, ev3_invert_y=False):
         self.stream_url = stream_url
         self.output_dir = output_dir
+        self.detection_type = detection_type
         self.confidence_threshold = confidence_threshold
         self.detection_interval = detection_interval  # Run detection every N frames
         self.process_scale = process_scale  # Scale factor for processing
@@ -274,9 +275,10 @@ class Tracker:
     def initialize_detection(self):
         try:
             # Use frontal face cascade for better performance
-            self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            if self.face_cascade.empty():
-                self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fullbody.xml')
+            if self.detection_type == "face":
+                self.haarcascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            else:
+                self.haarcascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fullbody.xml')
             logger.debug("Haar Cascade initialized successfully")
         except Exception as e:
             logger.error(f"Error initializing detection: {e}")
@@ -317,8 +319,8 @@ class Tracker:
 
         # Prefer APIs that return weights to estimate confidence
         try:
-            if hasattr(self.face_cascade, 'detectMultiScale3'):
-                bodies, rejectLevels, level_weights = self.face_cascade.detectMultiScale3(
+            if hasattr(self.haarcascade, 'detectMultiScale3'):
+                bodies, rejectLevels, level_weights = self.haarcascade.detectMultiScale3(
                     gray,
                     scaleFactor=1.5,
                     minNeighbors=3,
@@ -332,8 +334,8 @@ class Tracker:
 
         if bodies is None:
             try:
-                if hasattr(self.face_cascade, 'detectMultiScale2'):
-                    bodies, level_weights = self.face_cascade.detectMultiScale2(
+                if hasattr(self.haarcascade, 'detectMultiScale2'):
+                    bodies, level_weights = self.haarcascade.detectMultiScale2(
                         gray,
                         scaleFactor=1.5,
                         minNeighbors=3,
@@ -345,7 +347,7 @@ class Tracker:
 
         if bodies is None:
             # Final fallback without weights
-            bodies = self.face_cascade.detectMultiScale(
+            bodies = self.haarcascade.detectMultiScale(
                 gray,
                 scaleFactor=1.1,
                 minNeighbors=4,
@@ -403,11 +405,6 @@ class Tracker:
             logger.error(f"Error writing to shift log file: {e}")
 
     def init_tracker(self, frame, bbox):
-        """Initialize an OpenCV tracker robustly across versions/builds.
-
-        Tries KCF, then MOSSE, then CSRT, MIL, MedianFlow in both legacy and
-        non-legacy namespaces. Also guards against invalid bounding boxes.
-        """
         # Validate bbox inside frame bounds and non-trivial size
         h, w = frame.shape[:2]
         x, y, bw, bh = [int(v) for v in bbox]
@@ -756,6 +753,7 @@ def main():
                         help='Stream URL')
     parser.add_argument('--output-dir', default='recordings',
                         help='Output directory for recordings')
+    parser.add_argument('--detection-type', default="face", help='[face, body]')
     parser.add_argument('--confidence-threshold', type=float, default=0.7,
                         help='Confidence threshold for human detection')
     parser.add_argument('--detection-interval', type=int, default=5,
@@ -786,6 +784,7 @@ def main():
     tracker = Tracker(
         stream_url=args.url,
         output_dir=args.output_dir,
+        detection_type=args.detection_type,
         confidence_threshold=args.confidence_threshold,
         detection_interval=args.detection_interval,
         process_scale=args.process_scale,
