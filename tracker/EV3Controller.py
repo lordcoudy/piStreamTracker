@@ -5,7 +5,7 @@ import yaml
 from ev3_usb import EV3_USB
 
 # Load config
-with open('config.yaml', 'r') as f:
+with open('../config.yaml', 'r') as f:
     config = yaml.safe_load(f)
 ev3_config = config['ev3_controller']
 

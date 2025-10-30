@@ -10,7 +10,7 @@ from picamera2.encoders import JpegEncoder
 from picamera2.outputs import FileOutput
 
 # Load config
-with open('config.yaml', 'r') as f:
+with open('../config.yaml', 'r') as f:
     config = yaml.safe_load(f)
 
 camera_config = config['camera_server']

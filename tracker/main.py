@@ -7,7 +7,7 @@ from tracker.tracker import Tracker
 
 def main():
     # Load config to override argparse defaults
-    with open('config.yaml', 'r') as f:
+    with open('../config.yaml', 'r') as f:
         config = yaml.safe_load(f)
     
     tracker_config = config.get('tracker', {})

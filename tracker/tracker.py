@@ -9,7 +9,7 @@ import yaml
 from EV3Controller import EV3Controller
 
 # Load config
-with open('config.yaml', 'r') as f:
+with open('../config.yaml', 'r') as f:
     config = yaml.safe_load(f)
 tracker_config = config['tracker']
 
