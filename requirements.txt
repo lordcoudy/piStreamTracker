@@ -4,3 +4,4 @@ ev3-dc
 picamera2
 vidgear[asyncio]
 uvloop
+tflite-runtime

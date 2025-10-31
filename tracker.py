@@ -2,7 +2,9 @@ import argparse
 import logging
 import os
 import time
+import urllib.request
 from datetime import datetime
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -204,17 +206,27 @@ class EV3Controller:
 
 class Tracker:
     def __init__(self, stream_url, output_dir="recordings",
-                 detection_type="face", confidence_threshold=0.5,
+                 detection_type="movenet", confidence_threshold=0.5,
                  detection_interval=10, process_scale=0.4,
+                 keypoint_score_threshold=0.3,
+                 movenet_model_path: Optional[str] = None,
+                 movenet_num_threads: Optional[int] = None,
                  ev3_deadzone_x=50, ev3_deadzone_y=50,
                  ev3_speed_factor=1.0, ev3_max_speed=30,
                  ev3_invert_x=False, ev3_invert_y=False):
         self.stream_url = stream_url
         self.output_dir = output_dir
         self.detection_type = detection_type
+        if self.detection_type and self.detection_type.lower() != "movenet":
+            logger.warning("Only MoveNet detection is supported; defaulting to MoveNet Lightning")
+            self.detection_type = "movenet"
         self.confidence_threshold = confidence_threshold
         self.detection_interval = detection_interval  # Run detection every N frames
         self.process_scale = process_scale  # Scale factor for processing
+        self.keypoint_score_threshold = keypoint_score_threshold
+        self.movenet_model_path = movenet_model_path
+        auto_threads = max(1, (os.cpu_count() or 2) // 2)
+        self.movenet_num_threads = movenet_num_threads or auto_threads
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -229,6 +241,10 @@ class Tracker:
         self.tracked_human = None  # Store the tracked human info
         self.tracking_supported = None  # Discover after first attempt
         self._tracker_warned = False    # Log missing support once
+        self.movenet_interpreter = None
+        self.movenet_input_details = None
+        self.movenet_output_details = None
+        self.movenet_input_size = (192, 192)
 
         # Frame counter for detection interval
         self.frame_count = 0
@@ -260,7 +276,7 @@ class Tracker:
                 invert_y=ev3_invert_y
             )
 
-        self.initialize_detection()
+        self.initialize_movenet()
         try:
             logger.debug(f"OpenCV version: {cv2.__version__}")
         except Exception:
@@ -269,19 +285,26 @@ class Tracker:
         logger.debug(f"Detection interval: every {detection_interval} frames")
         logger.debug(f"Process scale: {process_scale}")
         logger.debug(f"Shift log file: {self.shift_log_file}")
+        logger.debug(f"MoveNet threads: {self.movenet_num_threads}")
         if self.ev3_controller and self.ev3_controller.connected:
             logger.info(f"EV3 control enabled")
 
-    def initialize_detection(self):
+    def initialize_movenet(self):
         try:
-            # Use frontal face cascade for better performance
-            if self.detection_type == "face":
-                self.haarcascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            else:
-                self.haarcascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fullbody.xml')
-            logger.debug("Haar Cascade initialized successfully")
+            interpreter = self._create_movenet_interpreter()
+            if interpreter is None:
+                raise RuntimeError("MoveNet interpreter could not be created")
+            interpreter.allocate_tensors()
+            self.movenet_interpreter = interpreter
+            self.movenet_input_details = interpreter.get_input_details()
+            self.movenet_output_details = interpreter.get_output_details()
+            shape = self.movenet_input_details[0]['shape']
+            if len(shape) >= 3:
+                self.movenet_input_size = (int(shape[1]), int(shape[2]))
+            logger.info("MoveNet Lightning model ready")
         except Exception as e:
-            logger.error(f"Error initializing detection: {e}")
+            logger.error(f"Error initializing MoveNet: {e}")
+            self.movenet_interpreter = None
 
     def connect_to_stream(self):
         try:
@@ -309,76 +332,142 @@ class Tracker:
             logger.error(f"Error connecting to stream: {e}")
             return False
 
-    def detect_humans_haarcascade(self, frame):
-        """Detect humans using Haar Cascade - optimized for single detection"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Optimize parameters for speed
-        bodies = None
-        level_weights = None
-
-        # Prefer APIs that return weights to estimate confidence
-        try:
-            if hasattr(self.haarcascade, 'detectMultiScale3'):
-                bodies, rejectLevels, level_weights = self.haarcascade.detectMultiScale3(
-                    gray,
-                    scaleFactor=1.5,
-                    minNeighbors=3,
-                    flags=0,
-                    minSize=(30, 30),
-                    maxSize=()
-                )
-        except Exception:
-            bodies = None
-            level_weights = None
-
-        if bodies is None:
-            try:
-                if hasattr(self.haarcascade, 'detectMultiScale2'):
-                    bodies, level_weights = self.haarcascade.detectMultiScale2(
-                        gray,
-                        scaleFactor=1.5,
-                        minNeighbors=3,
-                        minSize=(30, 30)
-                    )
-            except Exception:
-                bodies = None
-                level_weights = None
-
-        if bodies is None:
-            # Final fallback without weights
-            bodies = self.haarcascade.detectMultiScale(
-                gray,
-                scaleFactor=1.1,
-                minNeighbors=4,
-                minSize=(30, 30)
-            )
-            level_weights = None
-
-        if len(bodies) == 0:
+    def _create_movenet_interpreter(self):
+        model_path = self._ensure_movenet_model()
+        if model_path is None or not os.path.exists(model_path):
+            logger.error("MoveNet model file missing")
             return None
 
-        # Find largest detection (usually most confident)
-        areas = [w * h for (x, y, w, h) in bodies]
-        max_idx = np.argmax(areas)
-        x, y, w, h = bodies[max_idx]
+        interpreter_cls = None
+        try:
+            from tflite_runtime.interpreter import Interpreter  # type: ignore
+            interpreter_cls = Interpreter
+        except ImportError:
+            try:
+                from tensorflow.lite.python.interpreter import \
+                    Interpreter  # type: ignore
+                interpreter_cls = Interpreter
+            except ImportError:
+                logger.error("Neither tflite-runtime nor TensorFlow Lite interpreter is available")
+                return None
 
-        # Compute confidence from available weights; map to [0,1]
-        confidence = 0.75
-        if level_weights is not None and len(level_weights) > 0:
-            lw = np.array(level_weights).reshape(-1)
-            raw_w = float(lw[max_idx])
-            # Convert OpenCV level weight (often >0) to bounded [0,1]
-            confidence = raw_w / (1.0 + abs(raw_w))
+        try:
+            interpreter = interpreter_cls(model_path=model_path, num_threads=self.movenet_num_threads)
+        except TypeError:
+            # Some interpreters don't accept num_threads keyword
+            interpreter = interpreter_cls(model_path=model_path)
+        return interpreter
 
+    def _ensure_movenet_model(self):
+        if self.movenet_model_path and os.path.exists(self.movenet_model_path):
+            return self.movenet_model_path
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        models_dir = os.path.join(base_dir, "models")
+        os.makedirs(models_dir, exist_ok=True)
+        model_path = os.path.join(models_dir, "movenet_lightning.tflite")
+
+        if os.path.exists(model_path):
+            self.movenet_model_path = model_path
+            return model_path
+
+        url = "https://storage.googleapis.com/movenet/SinglePoseLightning.tflite"
+        try:
+            logger.info("Downloading MoveNet Lightning model...")
+            urllib.request.urlretrieve(url, model_path)
+            logger.info(f"MoveNet model downloaded to {model_path}")
+            self.movenet_model_path = model_path
+            return model_path
+        except Exception as e:
+            logger.error(f"Failed to download MoveNet model: {e}")
+            return None
+
+    def detect_human_movenet(self, frame):
+        """Detect a single person using MoveNet Lightning."""
+        if self.movenet_interpreter is None:
+            return None
+
+        input_details = self.movenet_input_details
+        output_details = self.movenet_output_details
+        if not input_details or not output_details:
+            return None
+
+        input_height, input_width = self.movenet_input_size
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb_frame, (input_width, input_height))
+        input_tensor = np.expand_dims(resized, axis=0)
+        input_tensor = self._prepare_input_tensor(input_tensor, input_details[0])
+
+        try:
+            self.movenet_interpreter.set_tensor(input_details[0]['index'], input_tensor)
+            self.movenet_interpreter.invoke()
+            output_data = self.movenet_interpreter.get_tensor(output_details[0]['index'])
+        except Exception as e:
+            logger.error(f"MoveNet inference error: {e}")
+            return None
+
+        output_data = self._dequantize_output(output_data, output_details[0])
+        keypoints = output_data[0, 0, :, :]
+        scores = keypoints[:, 2]
+
+        valid_mask = scores >= self.keypoint_score_threshold
+        if not np.any(valid_mask):
+            return None
+
+        frame_h, frame_w = frame.shape[:2]
+        ys = keypoints[:, 0] * frame_h
+        xs = keypoints[:, 1] * frame_w
+
+        xs_valid = xs[valid_mask]
+        ys_valid = ys[valid_mask]
+
+        x_min = float(np.clip(np.min(xs_valid), 0, frame_w - 1))
+        y_min = float(np.clip(np.min(ys_valid), 0, frame_h - 1))
+        x_max = float(np.clip(np.max(xs_valid), 0, frame_w - 1))
+        y_max = float(np.clip(np.max(ys_valid), 0, frame_h - 1))
+
+        width = max(1.0, x_max - x_min)
+        height = max(1.0, y_max - y_min)
+
+        confidence = float(np.mean(scores[valid_mask]))
         if confidence < self.confidence_threshold:
             return None
 
+        keypoints_pixels = np.stack([xs, ys, scores], axis=-1)
+
         return {
-            'bbox': (int(x), int(y), int(w), int(h)),
+            'bbox': (int(x_min), int(y_min), int(width), int(height)),
             'label': 'human',
-            'confidence': confidence
+            'confidence': min(confidence, 1.0),
+            'keypoints': keypoints_pixels
         }
+
+    @staticmethod
+    def _prepare_input_tensor(tensor, input_detail):
+        dtype = input_detail['dtype']
+        tensor = tensor.astype(dtype, copy=False)
+        quantization = input_detail.get('quantization') or (0.0, 0)
+        scale, zero_point = quantization
+
+        if dtype == np.float32:
+            tensor = tensor.astype(np.float32)
+            tensor /= 255.0
+        elif dtype == np.uint8 and scale > 0:
+            tensor = tensor.astype(np.float32) / 255.0
+            tensor = tensor / scale + zero_point
+            tensor = np.clip(np.round(tensor), 0, 255).astype(np.uint8)
+        else:
+            tensor = tensor.astype(dtype)
+
+        return tensor
+
+    @staticmethod
+    def _dequantize_output(output_data, output_detail):
+        quantization = output_detail.get('quantization') or (0.0, 0)
+        scale, zero_point = quantization
+        if scale and scale > 0:
+            return (output_data.astype(np.float32) - zero_point) * scale
+        return output_data.astype(np.float32)
 
     def calculate_shift_from_center(self, bbox):
         """Calculate the shift of bounding box center from frame center"""
@@ -475,7 +564,8 @@ class Tracker:
                 self.tracked_human = {
                     'bbox': tuple(int(v) for v in bbox),
                     'label': 'human',
-                    'confidence': self.tracked_human['confidence'] 
+                    'confidence': self.tracked_human['confidence'],
+                    'keypoints': self.tracked_human.get('keypoints') if self.tracked_human else None
                 }
                 # Re-detect every N frames or every 2 seconds to correct drift
                 if (self.frame_count % self.detection_interval == 0 or
@@ -493,23 +583,23 @@ class Tracker:
         """Run detection on downscaled frame"""
         self.last_detection_time = time.time()
 
-        # Downscale for detection
-        small_frame = cv2.resize(frame, None, fx=self.process_scale, fy=self.process_scale)
+        scale_factor = self.process_scale if self.process_scale and self.process_scale > 0 else 1.0
+        if scale_factor != 1.0:
+            small_frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
+            scale_inv = 1.0 / scale_factor
+        else:
+            small_frame = frame
+            scale_inv = 1.0
 
-        # Detect human
-        detected_human = self.detect_humans_haarcascade(small_frame)
+        detected_human = self.detect_human_movenet(small_frame)
 
         if detected_human:
-            # Scale bbox back to original size
             dx, dy, dw, dh = detected_human['bbox']
-            scale_inv = 1.0 / self.process_scale
-            # Compute scaled bbox
             x = int(dx * scale_inv)
             y = int(dy * scale_inv)
             w = int(dw * scale_inv)
             h = int(dh * scale_inv)
 
-            # Clip bbox to frame bounds to prevent tracker init errors
             fh, fw = frame.shape[:2]
             x = max(0, min(x, fw - 1))
             y = max(0, min(y, fh - 1))
@@ -517,13 +607,20 @@ class Tracker:
             h = max(1, min(h, fh - y))
             bbox = (x, y, w, h)
 
-            # Reinitialize tracker with new detection if supported
+            keypoints = detected_human.get('keypoints')
+            keypoints_scaled = None
+            if keypoints is not None:
+                keypoints_scaled = keypoints.copy()
+                keypoints_scaled[:, 0] *= scale_inv
+                keypoints_scaled[:, 1] *= scale_inv
+
             tracker_ok = self.tracking_supported is not False and self.init_tracker(frame, bbox)
 
             self.tracked_human = {
                 'bbox': bbox,
                 'label': 'human',
-                'confidence': detected_human['confidence']
+                'confidence': detected_human['confidence'],
+                'keypoints': keypoints_scaled
             }
             if tracker_ok:
                 logger.debug(f"Human detected and tracker initialized: conf={detected_human['confidence']:.2f}")
@@ -544,6 +641,7 @@ class Tracker:
         if self.tracked_human:
             x, y, w, h = self.tracked_human['bbox']
             confidence = self.tracked_human['confidence']
+            keypoints = self.tracked_human.get('keypoints') if isinstance(self.tracked_human, dict) else None
 
             # Calculate shift
             shift_x, shift_y, bbox_center_x, bbox_center_y = self.calculate_shift_from_center((x, y, w, h))
@@ -557,6 +655,11 @@ class Tracker:
             # Draw line from frame center to human center
             cv2.line(frame, (self.frame_center_x, self.frame_center_y),
                      (bbox_center_x, bbox_center_y), (255, 255, 0), 1)
+
+            if keypoints is not None:
+                for kp_x, kp_y, kp_conf in keypoints:
+                    if kp_conf >= self.keypoint_score_threshold:
+                        cv2.circle(frame, (int(kp_x), int(kp_y)), 2, (255, 0, 255), -1)
 
             # Display shift information
             shift_text = f"x={shift_x:+d} y={shift_y:+d}"
@@ -753,13 +856,20 @@ def main():
                         help='Stream URL')
     parser.add_argument('--output-dir', default='recordings',
                         help='Output directory for recordings')
-    parser.add_argument('--detection-type', default="face", help='[face, body]')
+    parser.add_argument('--detection-type', default="movenet",
+                        help='Detection backend (currently only "movenet")')
     parser.add_argument('--confidence-threshold', type=float, default=0.7,
-                        help='Confidence threshold for human detection')
+                        help='Average keypoint confidence required to accept detection')
     parser.add_argument('--detection-interval', type=int, default=5,
                         help='Run detection every N frames (higher = faster but less responsive)')
     parser.add_argument('--process-scale', type=float, default=0.3,
                         help='Scale factor for detection processing (lower = faster)')
+    parser.add_argument('--keypoint-threshold', type=float, default=0.3,
+                        help='Minimum individual keypoint confidence for inclusion in bbox')
+    parser.add_argument('--movenet-model', type=str, default=None,
+                        help='Path to a MoveNet Lightning TFLite file (downloads default if omitted)')
+    parser.add_argument('--movenet-threads', type=int, default=None,
+                        help='Number of inference threads for MoveNet (defaults to half CPU cores)')
     parser.add_argument('--no-display', action='store_true',
                         help='Run without displaying video (saves CPU)')
     parser.add_argument('--no-auto-record', action='store_true',
@@ -788,6 +898,9 @@ def main():
         confidence_threshold=args.confidence_threshold,
         detection_interval=args.detection_interval,
         process_scale=args.process_scale,
+    keypoint_score_threshold=args.keypoint_threshold,
+    movenet_model_path=args.movenet_model,
+    movenet_num_threads=args.movenet_threads,
         ev3_deadzone_x=args.ev3_deadzone_x,
         ev3_deadzone_y=args.ev3_deadzone_y,
         ev3_speed_factor=args.ev3_speed_factor,
