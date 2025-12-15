@@ -1,0 +1,82 @@
+flowchart LR
+  %% ========== Entry ==========
+  A["main()"] --> B["argparse CLI"]
+  B --> C["OptimizedTracker.__init__"]
+  C --> D["OptimizedTracker.run()"]
+
+  %% ========== Core components ==========
+  subgraph T["OptimizedTracker"]
+    D --> E["connect()"]
+    D --> F["main loop"]
+    D --> G["cleanup()"]
+
+    %% connect()
+    E --> VC[ThreadedVideoCapture]
+    E --> EV3S[EV3Controller.set_camera_size]
+    E --> SFB[Pre-allocate scaled frame buffer]
+
+    %% main loop steps
+    F --> R["cap.read() -> latest frame"]
+    R --> PF["process_frame(frame)"]
+    PF -->|annotated frame| DISP["cv2.imshow / headless skip"]
+    PF --> KEY["_handle_key(q/r/s/d/e)"]
+  end
+
+  %% ========== Video capture thread ==========
+  subgraph VCT["ThreadedVideoCapture (background thread)"]
+    VC --> VCSTART["start()"]
+    VCSTART --> LOOP["_capture_loop()"]
+    LOOP -->|cap read| LATEST["latest frame + ret"]
+    R -->|locks + returns reference| LATEST
+  end
+
+  %% ========== Detection + Tracking ==========
+  subgraph DT["Detection & Tracking"]
+    PF --> TRKCHK{"tracker exists?"}
+    TRKCHK -->|yes| TRKUP["_update_tracker()"]
+    TRKCHK -->|no / failed| DETNEED["need_detection=true"]
+
+    TRKUP -->|bbox or None| TRACKED["tracked_human"]
+    DETNEED --> RUNDET["_run_detection()"]
+    RUNDET --> MND["MoveNetDetector.detect()"]
+    RUNDET --> TRKINIT["_init_tracker(bbox)"]
+    TRKINIT --> TRACKED
+  end
+
+  %% ========== MoveNet ==========
+  subgraph MN["MoveNetDetector (TFLite)"]
+    MND --> PRE["resize + BGR→RGB (preallocated buffer)"]
+    PRE --> TIN["fill input tensor (float/uint8/int8)"]
+    TIN --> INF["interpreter.invoke()"]
+    INF --> PARSE["parse keypoints & bbox"]
+    PARSE -->|detection dict| RUNDET
+  end
+
+  %% ========== Overlay + Motor control + Logging ==========
+  subgraph OUT["Overlay + EV3 + Logging"]
+    PF --> DRAW["_draw_overlay(frame, tracked)"]
+    DRAW --> SHIFT["compute shift from frame center"]
+    SHIFT --> LOG["BatchedLogWriter.log()"]
+    SHIFT --> MTR["EV3Controller.update_motors()"]
+  end
+
+  %% ========== EV3 ==========
+  subgraph EV3["EV3Controller"]
+    MTR --> RL{"rate limit cooldown?"}
+    RL -->|ok| CMP["calculate_motor_params x/y"]
+    CMP --> CMD["motor.run_to_rel_pos / stop"]
+    EV3USB["EV3_USB"] -->|USB transport| CMD
+  end
+
+  %% ========== Recording ==========
+  subgraph REC["Recording"]
+    KEY -->|r toggles| RECCTRL["start_recording / stop_recording"]
+    RECCTRL --> VW["cv2.VideoWriter"]
+    PF -->|optionally write frame| VW
+  end
+
+  %% ========== Shutdown ==========
+  G --> STOP1["EV3Controller.disconnect()"]
+  G --> STOP2["ThreadedVideoCapture.stop()"]
+  G --> STOP3["BatchedLogWriter.flush()"]
+  G --> STOP4["cv2.destroyAllWindows()"]

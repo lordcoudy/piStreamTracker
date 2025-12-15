@@ -313,7 +313,7 @@ class Tracker:
                 self.cap = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
 
             if self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                # self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 fps = self.cap.get(cv2.CAP_PROP_FPS) or 60
                 self.ev3_controller.cam_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 self.ev3_controller.cam_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -394,6 +394,7 @@ class Tracker:
 
         input_height, input_width = self.movenet_input_size
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame = cv2.resize(rgb_frame, (rgb_frame.width() * (1 - self.process_scale), rgb_frame.height() * (1 - self.process_scale)))
         resized = cv2.resize(rgb_frame, (input_width, input_height))
         input_tensor = np.expand_dims(resized, axis=0)
         input_tensor = self._prepare_input_tensor(input_tensor, input_details[0])
@@ -569,7 +570,7 @@ class Tracker:
                 }
                 # Re-detect every N frames or every 2 seconds to correct drift
                 if (self.frame_count % self.detection_interval == 0 or
-                    current_time - self.last_detection_time > 2.0):
+                    current_time - self.last_detection_time > 1.0):
                     self.run_detection_update(frame)
                 return self.tracked_human
 
