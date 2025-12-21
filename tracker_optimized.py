@@ -444,16 +444,53 @@ class MoveNetDetector:
             self.model_path = model_path
             return model_path
         
-        url = "https://storage.googleapis.com/movenet/SinglePoseLightning.tflite"
-        try:
-            logger.info("Downloading MoveNet Lightning model...")
-            urllib.request.urlretrieve(url, model_path)
-            self.model_path = model_path
-            logger.info(f"Model downloaded to {model_path}")
-            return model_path
-        except Exception as e:
-            logger.error(f"Model download failed: {e}")
-            return None
+        # Multiple download sources for reliability (TFHub redirects can fail on Pi)
+        urls = [
+            # Direct Kaggle/Google Storage mirror (more reliable)
+            "https://storage.googleapis.com/tfhub-lite-models/google/lite-model/movenet/singlepose/lightning/tflite/float16/4.tflite",
+            # TFHub with explicit format
+            "https://tfhub.dev/google/lite-model/movenet/singlepose/lightning/tflite/float16/4?lite-format=tflite",
+        ]
+        
+        for url in urls:
+            try:
+                logger.info(f"Downloading MoveNet Lightning model from {url[:50]}...")
+                
+                # Create request with headers to handle redirects properly
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (compatible; PiTracker/1.0)',
+                        'Accept': '*/*',
+                    }
+                )
+                
+                # Download with SSL context for Pi compatibility
+                import ssl
+                ctx = ssl.create_default_context()
+                
+                with urllib.request.urlopen(req, context=ctx, timeout=60) as response:
+                    # Check if response is valid TFLite model (starts with specific bytes)
+                    data = response.read()
+                    
+                    if len(data) < 1000:
+                        logger.warning(f"Downloaded file too small ({len(data)} bytes), trying next URL...")
+                        continue
+                    
+                    with open(model_path, 'wb') as f:
+                        f.write(data)
+                
+                self.model_path = model_path
+                logger.info(f"Model downloaded to {model_path} ({len(data) // 1024} KB)")
+                return model_path
+                
+            except Exception as e:
+                logger.warning(f"Download failed from {url[:50]}: {e}")
+                continue
+        
+        logger.error("All model download attempts failed. Please download manually.")
+        logger.error("Visit: https://tfhub.dev/google/lite-model/movenet/singlepose/lightning/4")
+        return None
     
     def detect(self, frame: np.ndarray) -> Optional[Dict[str, Any]]:
         """
