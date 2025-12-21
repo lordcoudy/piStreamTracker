@@ -1,6 +1,7 @@
 # Core dependencies for Raspberry Pi tracker
-opencv-contrib-python  # Includes tracking modules (MOSSE, KCF, CSRT)
-numpy>=1.20.0
+# Pin OpenCV 4.9.x - last version compatible with NumPy 1.x
+opencv-contrib-python>=4.8.0,<4.10.0  # Includes tracking modules (MOSSE, KCF, CSRT)
+numpy>=1.20.0,<2.0.0   # NumPy 2.x breaks tflite-runtime on Pi
 
 # EV3 control
 ev3-dc
