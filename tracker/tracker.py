@@ -1,4 +1,3 @@
-import argparse
 import logging
 import os
 from tabnanny import verbose
@@ -11,8 +10,13 @@ from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+import yaml
+from EV3Controller import EV3Controller
 
-from ev3_usb import EV3_USB
+# Load config
+with open('../config.yaml', 'r') as f:
+    config = yaml.safe_load(f)
+tracker_config = config['tracker']
 
 logging.basicConfig(
     level=logging.INFO,

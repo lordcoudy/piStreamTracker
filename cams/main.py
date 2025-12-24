@@ -4,47 +4,54 @@ import socketserver
 from http import server
 from threading import Condition
 
+import yaml
 from picamera2 import Picamera2
 from picamera2.encoders import JpegEncoder
 from picamera2.outputs import FileOutput
 
+# Load config
+with open('../config.yaml', 'r') as f:
+    config = yaml.safe_load(f)
+
+camera_config = config['camera_server']
+
 # HTML page with video stream
-PAGE = """\
+PAGE = f"""\
 <html>
 <head>
     <title>Raspberry Pi Camera Stream</title>
     <style>
-        body {
+        body {{
             margin: 0;
             padding: 20px;
             background-color: #222;
             color: white;
             font-family: Arial, sans-serif;
             text-align: center;
-        }
-        h1 {
+        }}
+        h1 {{
             color: #4CAF50;
-        }
-        img {
+        }}
+        img {{
             max-width: 100%;
             height: auto;
             border: 2px solid #4CAF50;
-        }
-        .info {
+        }}
+        .info {{
             margin: 20px;
             padding: 10px;
             background-color: #333;
             border-radius: 5px;
-        }
+        }}
     </style>
 </head>
 <body>
     <h1>Raspberry Pi Camera Stream</h1>
     <div class="info">
-        <p>Resolution: 1280 x 960</p>
-        <p>Server IP: 192.168.100.1:8000</p>
+        <p>Resolution: {camera_config['resolution']['width']} x {camera_config['resolution']['height']}</p>
+        <p>Server IP: {camera_config['host']}:{camera_config['port']}</p>
     </div>
-    <img src="stream" width="1280" height="960" />
+    <img src="stream" width="{camera_config['resolution']['width']}" height="{camera_config['resolution']['height']}" />
 </body>
 </html>
 """
@@ -115,20 +122,20 @@ if __name__ == '__main__':
 
     logging.info("Initializing Raspberry Pi Camera...")
     picam2 = Picamera2()
-    picam2.configure(picam2.create_video_configuration(main={"size": (1280, 960)}))
+    picam2.configure(picam2.create_video_configuration(main={"size": (camera_config['resolution']['width'], camera_config['resolution']['height'])}))
     output = StreamingOutput()
     picam2.start_recording(JpegEncoder(), FileOutput(output))
 
     try:
         # Bind to all interfaces (0.0.0.0) so it's accessible from Ethernet
-        address = ('192.168.100.1', 8000)
+        address = (camera_config['host'], camera_config['port'])
         server = StreamingServer(address, StreamingHandler)
 
         logging.info("=" * 60)
         logging.info("Camera Server Started!")
         logging.info("=" * 60)
-        logging.info(f"Stream URL: http://192.168.100.1:8000/stream")
-        logging.info(f"Web Interface: http://192.168.100.1:8000/")
+        logging.info(f"Stream URL: http://{camera_config['host']}:{camera_config['port']}/stream")
+        logging.info(f"Web Interface: http://{camera_config['host']}:{camera_config['port']}/")
         logging.info("Press Ctrl+C to stop")
         logging.info("=" * 60)
 
