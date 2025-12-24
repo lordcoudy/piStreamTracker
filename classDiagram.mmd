@@ -1,0 +1,147 @@
+classDiagram
+direction LR
+
+class ThreadedVideoCapture {
+  -src: str
+  -cap
+  -frame
+  -ret: bool
+  -lock: Lock
+  -stopped: Event
+  -thread: Thread
+  -frame_width: int
+  -frame_height: int
+  -fps: float
+  -buffer_size: int
+  +__init__(src: str, buffer_size: int=2)
+  +start() bool
+  -_capture_loop()
+  +read() Tuple[bool, np.ndarray|None]
+  +read_direct() Tuple[bool, np.ndarray|None]
+  +stop()
+  +isOpened() bool
+  +get(prop) Any
+}
+
+class BatchedLogWriter {
+  -filepath: str
+  -batch_size: int
+  -buffer: deque
+  -lock: Lock
+  +__init__(filepath: str, batch_size: int=50)
+  -_write_header()
+  +log(shift_x: int, shift_y: int)
+  -_flush_buffer()
+  +flush()
+}
+
+class EV3Controller {
+  -deadzone_x: int
+  -deadzone_y: int
+  -speed_factor: float
+  -max_speed: int
+  -invert_x: bool
+  -invert_y: bool
+  -ev3: EV3_USB|None
+  -motor_a
+  -motor_b
+  -connected: bool
+  -last_command_time: float
+  -command_cooldown: float
+  -cam_width: int
+  -cam_height: int
+  -degree_coeff_x: float
+  -degree_coeff_y: float
+  +__init__(...)
+  -_update_coefficients()
+  +set_camera_size(width: int, height: int)
+  +connect() bool
+  -_cleanup()
+  +calculate_motor_params(shift: int, deadzone: int, invert: bool, degree_coeff: float) Tuple[int|None, int]
+  +update_motors(shift_x: int, shift_y: int)
+  +stop_motors()
+  +disconnect()
+}
+
+class MoveNetDetector {
+  <<Detector>>
+  +KEYPOINT_NAMES: list
+  -model_path: str|None
+  -num_threads: int
+  -confidence_threshold: float
+  -keypoint_threshold: float
+  -interpreter
+  -input_details
+  -output_details
+  -input_size: Tuple[int,int]
+  -_input_buffer
+  -_resized_buffer
+  -_float_buffer
+  -_keypoints_buffer: np.ndarray
+  +__init__(model_path: str|None, num_threads: int|None, confidence_threshold: float=0.5, keypoint_threshold: float=0.3)
+  -_initialize()
+  -_ensure_model() str|None
+  +detect(frame: np.ndarray) Dict|None
+  +is_ready bool
+}
+
+class OptimizedTracker {
+  -stream_url: str
+  -output_dir: str
+  -confidence_threshold: float
+  -detection_interval: int
+  -process_scale: float
+  -cap: ThreadedVideoCapture|None
+  -frame_width: int
+  -frame_height: int
+  -frame_center_x: int
+  -frame_center_y: int
+  -is_running: bool
+  -is_recording: bool
+  -video_writer
+  -output_filename: str|None
+  -frame_count: int
+  -tracker
+  -tracked_human: Dict|None
+  -tracking_enabled: bool
+  -_tracker_type: str|None
+  -scale_inv: float
+  -_scaled_frame_buffer
+  -detector: MoveNetDetector
+  -ev3: EV3Controller
+  -shift_logger: BatchedLogWriter
+  +__init__(...)
+  +connect() bool
+  -_init_tracker(frame: np.ndarray, bbox: Tuple[int,int,int,int]) bool
+  -_update_tracker(frame: np.ndarray) Tuple[int,int,int,int]|None
+  -_run_detection(frame: np.ndarray) Dict|None
+  +process_frame(frame: np.ndarray) Tuple[np.ndarray, Dict|None]
+  -_draw_overlay(frame: np.ndarray, tracked: Dict|None) np.ndarray
+  +start_recording()
+  +stop_recording()
+  -_handle_key(key: int, frame: np.ndarray) bool
+  +run(display: bool=True, auto_record: bool=False)
+  +cleanup()
+}
+
+class EV3_USB
+
+%% Relationships / dependencies
+OptimizedTracker *-- ThreadedVideoCapture : cap
+OptimizedTracker *-- MoveNetDetector : detector
+OptimizedTracker *-- EV3Controller : ev3
+OptimizedTracker *-- BatchedLogWriter : shift_logger
+
+EV3Controller --> EV3_USB : uses
+
+%% External libs (implicit)
+
+class CV2_VideoCapture
+class CV2_Tracker
+class CV2_VideoWriter
+class TFLite_Interpreter
+
+ThreadedVideoCapture ..> CV2_VideoCapture : uses
+MoveNetDetector ..> TFLite_Interpreter : uses
+OptimizedTracker ..> CV2_Tracker : uses
+OptimizedTracker ..> CV2_VideoWriter : uses

@@ -67,13 +67,13 @@ class EV3_USB():
 
             return MotorWrapper(motor)
 
-    def Sensor(self,port:int,type:str):
+    def Sensor(self, port: int, sensor_type: str):
         """
         Initializes the requested sensor
 
         Args:
             `port` (int): Port of the sensor -> 1,2,3,4
-            `type` (string): Type of the sensor -> color,touch,ultrasonic,infrared,gyro
+            `sensor_type` (str): Type of the sensor -> color,touch,ultrasonic,infrared,gyro
 
         Returns:
             The sensor object with the provided port and type.
@@ -86,14 +86,14 @@ class EV3_USB():
                 evport = ev3.PORT_2
             case 3:
                 evport = ev3.PORT_3
-            case 3:
+            case 4:
                 evport = ev3.PORT_4
             case _:
                 raise ValueError(f"Invalid sensor port: {port}")
 
         #init the type
         try:
-            match type.lower():
+            match sensor_type.lower():
                 case 'color':
                     color: ev3.Color = ev3.Color(port=evport,protocol=ev3.USB,ev3_obj=self.EV3)
                     return color
@@ -110,43 +110,46 @@ class EV3_USB():
                     gyro: ev3.Gyro = ev3.Gyro(port=evport,protocol=ev3.USB,ev3_obj=self.EV3)
                     return gyro
                 case _:
-                    raise ValueError(f"Invalid sensor type: {type}")
+                    raise ValueError(f"Invalid sensor type: {sensor_type}")
         except Exception as e:
             raise Exception(f"Error: {e}")
 
-    def Led(self,color,type = 'static'):
+    def Led(self, color: str, led_type: str = 'static'):
         """
         Changes the color of the integrated LED
 
         Args:
             `color` (str): name of the desired color -> red,orange,green
-            `type` (str): type of the LED -> flash,pulse,static(means just on),off
+            `led_type` (str): type of the LED -> flash,pulse,static(means just on),off
         """
-        if type == 'off':
+        led = None
+        
+        if led_type == 'off':
             led = ev3.LED_OFF
         elif color == 'red':
-            if type == 'flash':
+            if led_type == 'flash':
                 led = ev3.LED_RED_FLASH
-            if type == 'pulse':
+            elif led_type == 'pulse':
                 led = ev3.LED_RED_PULSE
-            if type == 'static':
+            elif led_type == 'static':
                 led = ev3.LED_RED
         elif color == 'orange':
-            if type == 'flash':
+            if led_type == 'flash':
                 led = ev3.LED_ORANGE_FLASH
-            if type == 'pulse':
+            elif led_type == 'pulse':
                 led = ev3.LED_ORANGE_PULSE
-            if type == 'static':
+            elif led_type == 'static':
                 led = ev3.LED_ORANGE
         elif color == 'green':
-            if type == 'flash':
+            if led_type == 'flash':
                 led = ev3.LED_GREEN_FLASH
-            if type == 'pulse':
+            elif led_type == 'pulse':
                 led = ev3.LED_GREEN_PULSE
-            if type == 'static':
+            elif led_type == 'static':
                 led = ev3.LED_GREEN
-        else:
-            raise ValueError(f"Invalid color: {color} or type: {type}")
+        
+        if led is None:
+            raise ValueError(f"Invalid color: {color} or type: {led_type}")
 
         jk = ev3.Jukebox(protocol=ev3.USB,ev3_obj=self.EV3)
         jk.change_color(led)
@@ -172,9 +175,8 @@ class EV3_USB():
             The initialized Voice object with the right dependencies.
 
         Dependencies:
-            Exsisting `Wifi` connection on the host Pc.
+            Existing `Wifi` connection on the host PC.
         """
-        fs = ev3.FileSystem(protocol=ev3.USB,ev3_obj=self.EV3)
         voice = ev3.Voice(protocol=ev3.USB,ev3_obj=self.EV3)
         return voice
 
