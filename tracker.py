@@ -1,733 +1,983 @@
 import argparse
 import logging
 import os
+from tabnanny import verbose
 import time
 import urllib.request
+from collections import deque
 from datetime import datetime
-from typing import Optional
+from threading import Event, Lock, Thread
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from ev3_usb import EV3_USB
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('tracker.log'),
+        logging.FileHandler('tracker.log', mode='a'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-class EV3Controller:
-    """Controller for EV3 motors to track human position"""
-    def __init__(self, 
-                 deadzone_x=50, deadzone_y=50,
-                 speed_factor=1.0, max_speed=50,
-                 invert_x=False, invert_y=False):
-        self.deadzone_x = deadzone_x
-        self.deadzone_y = deadzone_y
-        self.speed_factor = speed_factor
-        self.max_speed = max_speed
-        self.invert_x = invert_x
-        self.invert_y = invert_y
 
-        self.ev3 = None
-        self.motor_a = None  # Horizontal control
-        self.motor_b = None  # Vertical control
-        self.connected = False
-        self.last_command_time = 0
-        self.command_cooldown = 5  # Minimum time between commands (seconds)
-        self.cam_width = 1280  
-        self.cam_height = 960   
-        self.connect()
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
 
-    def connect(self):
-        """Connect to EV3 brick via USB"""
-        try:
-            logger.info(f"Connecting to EV3 via USB...")
 
-            # Initialize EV3 connection
-            self.ev3 = EV3_USB()
-
-            # Try to initialize motors with error handling
-            logger.debug("Initializing Motor A (Horizontal)...")
-            self.motor_a = self.ev3.Motor('a') 
-            logger.debug("Initializing Motor B (Vertical)...")
-            self.motor_b = self.ev3.Motor('b')
-
-            self.connected = True
-            logger.info("EV3 connected successfully!")
-            logger.debug("Motor A (Port A): Horizontal control")
-            logger.debug("Motor B (Port B): Vertical control")
-
-            try:
-                self.ev3.Led('green', 'pulse')
-                logger.info("LED set to green")
-            except Exception as e:
-                logger.warning(f"Could not set LED: {e}")
-
-            self.stop_motors()
-
-            return
-
-        except Exception as e:
-            logger.error(f"Failed to connect to EV3: {e}")
-            logger.error("Please check:")
-            logger.error("  1. EV3 is turned on")
-            logger.error("  2. EV3 is connected via USB")
-            logger.error("  3. Motors are connected to ports A and B")
-            self.connected = False
-            self.cleanup_failed_connection()
-
-    def cleanup_failed_connection(self):
-        try:
-            if self.motor_a:
-                self.motor_a = None
-            if self.motor_b:
-                self.motor_b = None
-            if self.ev3:
-                self.ev3 = None
-        except:
-            pass
-
-    def calculate_motor_turn_degree_and_speed(self, shift, deadzone, invert=False, axis='x'):
-        """
-        Calculate motor direction and speed based on shift from center
-        Returns: (direction, speed) where direction is 1 or -1
-        """
-        if abs(shift) < deadzone:
-            return None, 0
-        
-        speed = max(abs(shift) / 100.0 * self.speed_factor, 5)
-        speed = min(speed, self.max_speed)
-        if invert:
-            shift = -shift
-        if axis == 'x':
-            degree_coeff = self.cam_width / 128
-        else:
-            degree_coeff = self.cam_height / 96
-        degree = shift / degree_coeff
-        
-        return int(degree), int(speed)
-
-    def update_motors(self, shift_x, shift_y):
-        """Update motor positions based on human position shift"""
-        if not self.connected or self.ev3 is None:
-            return
-
-        current_time = time.time()
-        if current_time - self.last_command_time < self.command_cooldown:
-            return
-
-        try:
-            degree_a, speed_a = self.calculate_motor_turn_degree_and_speed(
-                shift_x, self.deadzone_x, self.invert_x, axis='x'
-            )
-
-            degree_b, speed_b = self.calculate_motor_turn_degree_and_speed(
-                shift_y, self.deadzone_y, self.invert_y, axis='y'
-            )
-
-            if degree_a is not None and speed_a > 0:
-                try:
-                    self.motor_a.run_to(degrees=degree_a, speed=speed_a)
-                    logger.debug(f"Motor A: degrees={degree_a}, speed={speed_a}, shift_x={shift_x}")
-                except Exception as e:
-                    logger.error(f"Motor A error: {e}")
-            else:
-                try:
-                    self.motor_a.stop()
-                except Exception as e:
-                    logger.debug(f"Motor A stop error: {e}")
-
-            if degree_b is not None and speed_b > 0:
-                try:
-                    self.motor_b.run_to(degrees=degree_b, speed=speed_b)
-                    logger.debug(f"Motor B: degrees={degree_b}, speed={speed_b}, shift_y={shift_y}")
-                except Exception as e:
-                    logger.error(f"Motor B error: {e}")
-            else:
-                try:
-                    self.motor_b.stop()
-                except Exception as e:
-                    logger.debug(f"Motor B stop error: {e}")
-
-            self.last_command_time = current_time
-
-        except Exception as e:
-            logger.error(f"Error updating motors: {e}")
-
-    def stop_motors(self):
-        if not self.connected:
-            return
-
-        try:
-            # logger.debug("Stopping all EV3 motors")
-            if self.motor_a:
-                try:
-                    self.motor_a.stop()
-                except Exception as e:
-                    logger.debug(f"Error stopping motor A: {e}")
-            if self.motor_b:
-                try:
-                    self.motor_b.stop()
-                except Exception as e:
-                    logger.debug(f"Error stopping motor B: {e}")
-        except Exception as e:
-            logger.error(f"Error stopping motors: {e}")
-
-    def disconnect(self):
-        """Disconnect from EV3"""
-        if self.connected:
-            self.stop_motors()
-
-            # Set LED to orange to indicate disconnection
-            try:
-                if self.ev3:
-                    self.ev3.Led('orange', 'static')
-                    logger.info("LED set to orange")
-            except Exception as e:
-                logger.debug(f"Could not set LED on disconnect: {e}")
-
-            # Clean up references
-            try:
-                self.motor_a = None
-                self.motor_b = None
-                self.ev3 = None
-            except:
-                pass
-
-            self.connected = False
-            logger.info("EV3 disconnected")
-
-class Tracker:
-    def __init__(self, stream_url, output_dir="recordings",
-                 detection_type="movenet", confidence_threshold=0.5,
-                 detection_interval=10, process_scale=0.4,
-                 keypoint_score_threshold=0.3,
-                 movenet_model_path: Optional[str] = None,
-                 movenet_num_threads: Optional[int] = None,
-                 ev3_deadzone_x=50, ev3_deadzone_y=50,
-                 ev3_speed_factor=1.0, ev3_max_speed=30,
-                 ev3_invert_x=False, ev3_invert_y=False):
-        self.stream_url = stream_url
-        self.output_dir = output_dir
-        self.detection_type = detection_type
-        if self.detection_type and self.detection_type.lower() != "movenet":
-            logger.warning("Only MoveNet detection is supported; defaulting to MoveNet Lightning")
-            self.detection_type = "movenet"
-        self.confidence_threshold = confidence_threshold
-        self.detection_interval = detection_interval  # Run detection every N frames
-        self.process_scale = process_scale  # Scale factor for processing
-        self.keypoint_score_threshold = keypoint_score_threshold
-        self.movenet_model_path = movenet_model_path
-        auto_threads = max(1, (os.cpu_count() or 2) // 2)
-        self.movenet_num_threads = movenet_num_threads or auto_threads
-
-        os.makedirs(output_dir, exist_ok=True)
-
+class ThreadedVideoCapture:
+    
+    def __init__(self, src: str, buffer_size: int = 2):
+        self.src = src
         self.cap = None
-        self.is_recording = False
-        self.is_running = False
-        self.video_writer = None
-        self.output_filename = None
+        self.frame = None
+        self.ret = False
+        self.lock = Lock()
+        self.stopped = Event()
+        self.thread = None
+        self.frame_width = 0
+        self.frame_height = 0
+        self.fps = 30.0
+        self.buffer_size = buffer_size
+        
+    def start(self) -> bool:
+        """Initialize capture and start background thread."""
+        # Try multiple backends for Pi compatibility
+        for backend in [cv2.CAP_V4L2, cv2.CAP_FFMPEG, cv2.CAP_ANY]:
+            try:
+                self.cap = cv2.VideoCapture(self.src, backend)
+                if self.cap.isOpened():
+                    break
+            except:
+                continue
+        
+        if not self.cap or not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(self.src)
+            
+        if not self.cap.isOpened():
+            logger.error(f"Failed to open video source: {self.src}")
+            return False
+        
+        # Optimize buffer settings for low latency
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
+        
+        # Get stream properties
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        
+        # Read initial frame
+        self.ret, self.frame = self.cap.read()
+        if not self.ret:
+            logger.error("Failed to read initial frame")
+            return False
+        
+        # Start capture thread
+        self.stopped.clear()
+        self.thread = Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+        
+        logger.info(f"Capture started: {self.frame_width}x{self.frame_height} @ {self.fps:.1f} FPS")
+        return True
+    
+    def _capture_loop(self):
+        """Background thread for continuous frame capture."""
+        while not self.stopped.is_set():
+            ret, frame = self.cap.read()
+            if ret:
+                with self.lock:
+                    self.ret = ret
+                    self.frame = frame
+            else:
+                self.stopped.wait(timeout=0.001)
+    
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """Get the latest frame (non-blocking).
 
-        # Track only ONE human with highest confidence
-        self.tracker = None
-        self.tracked_human = None  # Store the tracked human info
-        self.tracking_supported = None  # Discover after first attempt
-        self._tracker_warned = False    # Log missing support once
-        self.movenet_interpreter = None
-        self.movenet_input_details = None
-        self.movenet_output_details = None
-        self.movenet_input_size = (192, 192)
+        Returns a reference to the last captured frame to avoid an expensive
+        full-frame copy per read.
+        """
+        with self.lock:
+            return self.ret, self.frame
+    
+    def read_direct(self) -> Tuple[bool, Optional[np.ndarray]]:
+        return self.read()
+    
+    def stop(self):
+        """Stop capture thread and release resources."""
+        self.stopped.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        if self.cap:
+            self.cap.release()
+    
+    def isOpened(self) -> bool:
+        return self.cap is not None and self.cap.isOpened()
+    
+    def __del__(self):
+        """Ensure resources are released on garbage collection."""
+        self.stop()
+    
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return self.frame_width
+        elif prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return self.frame_height
+        elif prop == cv2.CAP_PROP_FPS:
+            return self.fps
+        return self.cap.get(prop) if self.cap else 0
 
-        # Frame counter for detection interval
-        self.frame_count = 0
-        self.last_detection_time = 0
 
-        # Frame center coordinates (will be set when stream connects)
-        self.frame_center_x = 0
-        self.frame_center_y = 0
-
-        # Text file for shift logging
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.shift_log_file = os.path.join(output_dir, f"human_shifts_{timestamp}.txt")
-
-        # Initialize shift log file
-        with open(self.shift_log_file, 'w') as f:
+class BatchedLogWriter:
+    """Batched file writer to reduce I/O overhead."""
+    
+    def __init__(self, filepath: str, batch_size: int = 50):
+        self.filepath = filepath
+        self.batch_size = batch_size
+        self.buffer = deque(maxlen=batch_size * 2)
+        self.lock = Lock()
+        self._write_header()
+    
+    def _write_header(self):
+        with open(self.filepath, 'w') as f:
             f.write("Human Position Shifts from Frame Center\n")
             f.write("=" * 50 + "\n")
             f.write("Format: timestamp | x=<shift> ; y=<shift>\n")
             f.write("=" * 50 + "\n\n")
+    
+    def log(self, shift_x: int, shift_y: int):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"{timestamp} | x={shift_x:+6d} ; y={shift_y:+6d}\n"
+        
+        with self.lock:
+            self.buffer.append(entry)
+            if len(self.buffer) >= self.batch_size:
+                self._flush_buffer()
+    
+    def _flush_buffer(self):
+        if not self.buffer:
+            return
+        try:
+            with open(self.filepath, 'a') as f:
+                f.writelines(self.buffer)
+            self.buffer.clear()
+        except Exception as e:
+            logger.error(f"Log write error: {e}")
+    
+    def flush(self):
+        with self.lock:
+            self._flush_buffer()
 
-        # Initialize EV3 controller
-        self.ev3_controller = None
-        self.ev3_controller = EV3Controller(
-                deadzone_x=ev3_deadzone_x,
-                deadzone_y=ev3_deadzone_y,
-                speed_factor=min(ev3_speed_factor, 2),
-                max_speed=min(ev3_max_speed, 100),
-                invert_x=ev3_invert_x,
-                invert_y=ev3_invert_y
+
+class EV3Controller:
+    """Optimized EV3 motor controller with rate limiting."""
+    
+    def __init__(self, 
+                 deadzone_x: int = 50, 
+                 deadzone_y: int = 50,
+                 speed_factor: float = 1.0, 
+                 max_speed: int = 50,
+                 invert_x: bool = False, 
+                 invert_y: bool = False,
+                 command_cooldown: float = 0.5):
+        
+        self.deadzone_x = deadzone_x
+        self.deadzone_y = deadzone_y
+        self.speed_factor = min(speed_factor, 2.0)
+        self.max_speed = min(max_speed, 100)
+        self.invert_x = invert_x
+        self.invert_y = invert_y
+        
+        self.ev3 = None
+        self.motor_a = None
+        self.motor_b = None
+        self.connected = False
+        self.last_command_time = 0.0
+        self.command_cooldown = command_cooldown
+        self.cam_width = 1280
+        self.cam_height = 960
+        
+        # Pre-calculate coefficients
+        self._update_coefficients()
+        self.connect()
+    
+    def _update_coefficients(self):
+        """Pre-calculate degree coefficients for motor control."""
+        # Based on camera FOV (OV5647)
+        self.degree_coeff_x = self.cam_width / 128.0
+        self.degree_coeff_y = self.cam_height / 96.0
+    
+    def set_camera_size(self, width: int, height: int):
+        """Update camera dimensions and recalculate coefficients."""
+        self.cam_width = width
+        self.cam_height = height
+        self._update_coefficients()
+    
+    def connect(self) -> bool:
+        try:
+            logger.info("Connecting to EV3 via USB...")
+            self.ev3 = EV3_USB()
+            self.motor_a = self.ev3.Motor('a')
+            self.motor_b = self.ev3.Motor('b')
+            self.connected = True
+            
+            try:
+                self.ev3.Led('green', 'pulse')
+            except:
+                pass
+            
+            self.stop_motors()
+            logger.info("EV3 connected successfully!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"EV3 connection failed: {e}")
+            self.connected = False
+            self._cleanup()
+            return False
+    
+    def _cleanup(self):
+        self.motor_a = None
+        self.motor_b = None
+        self.ev3 = None
+    
+    def calculate_motor_params(self, shift: int, deadzone: int, 
+                                invert: bool, degree_coeff: float) -> Tuple[Optional[int], int]:
+        """Calculate motor degree and speed. Returns (degree, speed) or (None, 0)."""
+        if abs(shift) < deadzone:
+            return None, 0
+        
+        speed = int(min(abs(shift) / 100.0 * self.speed_factor * 10 + 5, self.max_speed))
+        degree = int((-shift if invert else shift) / degree_coeff)
+        
+        return degree, speed
+    
+    def update_motors(self, shift_x: int, shift_y: int):
+        """Update motors with rate limiting."""
+        if not self.connected:
+            return
+        
+        current_time = time.monotonic()
+        if current_time - self.last_command_time < self.command_cooldown:
+            return
+        
+        try:
+            degree_a, speed_a = self.calculate_motor_params(
+                shift_x, self.deadzone_x, self.invert_x, self.degree_coeff_x
+            )
+            degree_b, speed_b = self.calculate_motor_params(
+                shift_y, self.deadzone_y, self.invert_y, self.degree_coeff_y
+            )
+            
+            if degree_a is not None and speed_a > 0:
+                self.motor_a.run_to(degrees=degree_a, speed=speed_a)
+            else:
+                try:
+                    self.motor_a.stop()
+                except:
+                    pass
+            
+            if degree_b is not None and speed_b > 0:
+                self.motor_b.run_to(degrees=degree_b, speed=speed_b)
+            else:
+                try:
+                    self.motor_b.stop()
+                except:
+                    pass
+            
+            self.last_command_time = current_time
+            
+        except Exception as e:
+            logger.debug(f"Motor update error: {e}")
+    
+    def stop_motors(self):
+        if not self.connected:
+            return
+        try:
+            if self.motor_a:
+                self.motor_a.stop()
+        except:
+            pass
+        try:
+            if self.motor_b:
+                self.motor_b.stop()
+        except:
+            pass
+    
+    def disconnect(self):
+        if self.connected:
+            self.stop_motors()
+            try:
+                if self.ev3:
+                    self.ev3.Led('orange', 'static')
+            except:
+                pass
+            self._cleanup()
+            self.connected = False
+            logger.info("EV3 disconnected")
+    
+    def __del__(self):
+        """Ensure motors stop on garbage collection."""
+        self.disconnect()
+
+
+class MoveNetDetector:
+    """
+    Optimized MoveNet Lightning detector for Raspberry Pi.
+    """
+    
+    # MoveNet Lightning keypoint names
+    KEYPOINT_NAMES = [
+        'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+        'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+        'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+        'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
+    ]
+    
+    def __init__(self, 
+                 model_path: Optional[str] = None,
+                 num_threads: Optional[int] = None,
+                 confidence_threshold: float = 0.5,
+                 keypoint_threshold: float = 0.3):
+        
+        self.model_path = model_path
+        self.num_threads = num_threads or max(1, (os.cpu_count() or 2) // 2)
+        self.confidence_threshold = confidence_threshold
+        self.keypoint_threshold = keypoint_threshold
+        
+        self.interpreter = None
+        self.input_details = None
+        self.output_details = None
+        self.input_size = (192, 192)
+        
+        self._input_buffer = None
+        self._resized_buffer = None
+        self._keypoints_buffer = np.empty((17, 3), dtype=np.float32)
+        
+        self._initialize()
+    
+    def _initialize(self):
+        """Initialize the TFLite interpreter."""
+        try:
+            model_path = self._ensure_model()
+            if not model_path:
+                raise RuntimeError("Model not available")
+            
+            # Try tflite-runtime first (faster on Pi)
+            interpreter_cls = None
+            try:
+                from tflite_runtime.interpreter import Interpreter
+                interpreter_cls = Interpreter
+                logger.info("Using tflite-runtime interpreter")
+            except ImportError:
+                try:
+                    from tensorflow.lite.python.interpreter import Interpreter
+                    interpreter_cls = Interpreter
+                    logger.info("Using TensorFlow Lite interpreter")
+                except ImportError:
+                    raise RuntimeError("No TFLite interpreter available")
+            
+            # Create interpreter with optimized settings
+            try:
+                self.interpreter = interpreter_cls(
+                    model_path=model_path, 
+                    num_threads=self.num_threads
+                )
+            except TypeError:
+                self.interpreter = interpreter_cls(model_path=model_path)
+            
+            self.interpreter.allocate_tensors()
+            self.input_details = self.interpreter.get_input_details()
+            self.output_details = self.interpreter.get_output_details()
+            
+            # Get input size from model
+            shape = self.input_details[0]['shape']
+            if len(shape) >= 3:
+                # Model shape is typically [1, height, width, 3]
+                self.input_size = (int(shape[1]), int(shape[2]))
+
+            input_h, input_w = self.input_size
+            
+            # Pre-allocate input buffer
+            dtype = self.input_details[0]['dtype']
+            self._input_buffer = np.zeros(
+                (1, input_h, input_w, 3),
+                dtype=dtype
             )
 
-        self.initialize_movenet()
-        try:
-            logger.debug(f"OpenCV version: {cv2.__version__}")
-        except Exception:
-            pass
-        logger.info(f"Tracker initialized with URL: {stream_url}")
-        logger.debug(f"Detection interval: every {detection_interval} frames")
-        logger.debug(f"Process scale: {process_scale}")
-        logger.debug(f"Shift log file: {self.shift_log_file}")
-        logger.debug(f"MoveNet threads: {self.movenet_num_threads}")
-        if self.ev3_controller and self.ev3_controller.connected:
-            logger.info(f"EV3 control enabled")
+            # Pre-allocate resized RGB buffer (uint8) for a single resize + color conversion.
+            self._resized_buffer = np.empty((input_h, input_w, 3), dtype=np.uint8)
 
-    def initialize_movenet(self):
-        try:
-            interpreter = self._create_movenet_interpreter()
-            if interpreter is None:
-                raise RuntimeError("MoveNet interpreter could not be created")
-            interpreter.allocate_tensors()
-            self.movenet_interpreter = interpreter
-            self.movenet_input_details = interpreter.get_input_details()
-            self.movenet_output_details = interpreter.get_output_details()
-            shape = self.movenet_input_details[0]['shape']
-            if len(shape) >= 3:
-                self.movenet_input_size = (int(shape[1]), int(shape[2]))
-            logger.info("MoveNet Lightning model ready")
+            # Optional float workspace for quantized models (allocated once).
+            self._float_buffer = None
+            quant = self.input_details[0].get('quantization', (0.0, 0))
+            if dtype in (np.uint8, np.int8) and quant and quant[0] and quant[0] > 0:
+                self._float_buffer = np.empty((input_h, input_w, 3), dtype=np.float32)
+            
+            logger.info(f"MoveNet initialized: input={self.input_size}, threads={self.num_threads}")
+            
         except Exception as e:
-            logger.error(f"Error initializing MoveNet: {e}")
-            self.movenet_interpreter = None
-
-    def connect_to_stream(self):
-        try:
-            self.cap = cv2.VideoCapture(self.stream_url)
-            if not self.cap.isOpened():
-                self.cap = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
-
-            if self.cap.isOpened():
-                # self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                fps = self.cap.get(cv2.CAP_PROP_FPS) or 60
-                self.ev3_controller.cam_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                self.ev3_controller.cam_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-                # Calculate frame center
-                self.frame_center_x = self.ev3_controller.cam_width // 2
-                self.frame_center_y = self.ev3_controller.cam_height // 2
-
-                logger.info(f"Connected to stream: {self.ev3_controller.cam_width}x{self.ev3_controller.cam_height} @ {fps} FPS")
-                logger.debug(f"Frame center: ({self.frame_center_x}, {self.frame_center_y})")
-                return True
-            else:
-                logger.error("Failed to connect to stream")
-                return False
-        except Exception as e:
-            logger.error(f"Error connecting to stream: {e}")
-            return False
-
-    def _create_movenet_interpreter(self):
-        model_path = self._ensure_movenet_model()
-        if model_path is None or not os.path.exists(model_path):
-            logger.error("MoveNet model file missing")
-            return None
-
-        interpreter_cls = None
-        try:
-            from tflite_runtime.interpreter import Interpreter  # type: ignore
-            interpreter_cls = Interpreter
-        except ImportError:
-            try:
-                from tensorflow.lite.python.interpreter import \
-                    Interpreter  # type: ignore
-                interpreter_cls = Interpreter
-            except ImportError:
-                logger.error("Neither tflite-runtime nor TensorFlow Lite interpreter is available")
-                return None
-
-        try:
-            interpreter = interpreter_cls(model_path=model_path, num_threads=self.movenet_num_threads)
-        except TypeError:
-            # Some interpreters don't accept num_threads keyword
-            interpreter = interpreter_cls(model_path=model_path)
-        return interpreter
-
-    def _ensure_movenet_model(self):
-        if self.movenet_model_path and os.path.exists(self.movenet_model_path):
-            return self.movenet_model_path
-
+            logger.error(f"MoveNet initialization failed: {e}")
+            self.interpreter = None
+    
+    def _ensure_model(self) -> Optional[str]:
+        """Ensure model file exists, download if needed."""
+        if self.model_path and os.path.exists(self.model_path):
+            return self.model_path
+        
         base_dir = os.path.dirname(os.path.abspath(__file__))
         models_dir = os.path.join(base_dir, "models")
         os.makedirs(models_dir, exist_ok=True)
         model_path = os.path.join(models_dir, "movenet_lightning.tflite")
-
+        
         if os.path.exists(model_path):
-            self.movenet_model_path = model_path
+            self.model_path = model_path
             return model_path
+        
+        urls = [
+            # Direct Kaggle/Google Storage mirror (more reliable)
+            "https://storage.googleapis.com/tfhub-lite-models/google/lite-model/movenet/singlepose/lightning/tflite/float16/4.tflite",
+            # TFHub with explicit format
+            "https://tfhub.dev/google/lite-model/movenet/singlepose/lightning/tflite/float16/4?lite-format=tflite",
+        ]
+        
+        for url in urls:
+            try:
+                logger.info(f"Downloading MoveNet Lightning model from {url[:50]}...")
+                
+                # Create request with headers to handle redirects properly
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (compatible; PiTracker/1.0)',
+                        'Accept': '*/*',
+                    }
+                )
+                
+                # Download with SSL context for Pi compatibility
+                import ssl
+                ctx = ssl.create_default_context()
+                
+                with urllib.request.urlopen(req, context=ctx, timeout=60) as response:
+                    # Check if response is valid TFLite model (starts with specific bytes)
+                    data = response.read()
+                    
+                    if len(data) < 1000:
+                        logger.warning(f"Downloaded file too small ({len(data)} bytes), trying next URL...")
+                        continue
+                    
+                    with open(model_path, 'wb') as f:
+                        f.write(data)
+                
+                self.model_path = model_path
+                logger.info(f"Model downloaded to {model_path} ({len(data) // 1024} KB)")
+                return model_path
+                
+            except Exception as e:
+                logger.warning(f"Download failed from {url[:50]}: {e}")
+                continue
+        
+        logger.error("All model download attempts failed. Please download manually.")
+        logger.error("Visit: https://tfhub.dev/google/lite-model/movenet/singlepose/lightning/4")
+        return None
+    
+    def detect(self, frame: np.ndarray) -> Optional[Dict[str, Any]]:
+        """
+        Detect single person in frame.
+        
+        Args:
+            frame: BGR image (already scaled for processing)
+        
+        Returns:
+            Detection dict with 'bbox', 'confidence', 'keypoints' or None
+        """
+        if self.interpreter is None:
+            return None
+        
+        frame_h, frame_w = frame.shape[:2]
 
-        url = "https://storage.googleapis.com/movenet/SinglePoseLightning.tflite"
+        input_h, input_w = self.input_size
+
+        # Resize to model input (OpenCV expects dsize=(width, height)).
+        cv2.resize(
+            frame,
+            (input_w, input_h),
+            dst=self._resized_buffer,
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+        # Convert BGR->RGB in-place (keeps a single buffer alive across frames)
+        resized = self._resized_buffer
+        cv2.cvtColor(resized, cv2.COLOR_BGR2RGB, resized)
+        
+        # Prepare input tensor
+        input_detail = self.input_details[0]
+        dtype = input_detail['dtype']
+
+        input_tensor = self._input_buffer
+        input_view = input_tensor[0]
+
+        if dtype == np.float32:
+            # Normalize to [0, 1] without per-frame allocations.
+            input_view[...] = resized
+            input_view *= (1.0 / 255.0)
+        elif dtype == np.uint8:
+            scale, zero_point = input_detail.get('quantization', (0.0, 0))
+            if scale and scale > 0:
+                # Quantize: q = x/255/scale + zero_point
+                float_buf = self._float_buffer
+                if float_buf is None:
+                    float_buf = resized.astype(np.float32)
+                else:
+                    float_buf[...] = resized
+                float_buf *= (1.0 / 255.0)
+                float_buf /= scale
+                float_buf += zero_point
+                np.clip(float_buf, 0, 255, out=float_buf)
+                input_view[...] = float_buf
+            else:
+                input_view[...] = resized
+        elif dtype == np.int8:
+            scale, zero_point = input_detail.get('quantization', (0.0, 0))
+            if scale and scale > 0:
+                float_buf = self._float_buffer
+                if float_buf is None:
+                    float_buf = resized.astype(np.float32)
+                else:
+                    float_buf[...] = resized
+                float_buf *= (1.0 / 255.0)
+                float_buf /= scale
+                float_buf += zero_point
+                np.clip(float_buf, -128, 127, out=float_buf)
+                input_view[...] = float_buf
+            else:
+                # Fallback: common convention is symmetric int8 with zero_point=-128.
+                # Map uint8 [0,255] -> int8 [-128,127] without wraparound.
+                if self._float_buffer is not None:
+                    self._float_buffer[...] = resized
+                    self._float_buffer -= 128.0
+                    input_view[...] = self._float_buffer
+                else:
+                    input_view[...] = resized.astype(np.int16) - 128
+        else:
+            input_view[...] = resized
+        
+        # Run inference
         try:
-            logger.info("Downloading MoveNet Lightning model...")
-            urllib.request.urlretrieve(url, model_path)
-            logger.info(f"MoveNet model downloaded to {model_path}")
-            self.movenet_model_path = model_path
-            return model_path
+            self.interpreter.set_tensor(input_detail['index'], input_tensor)
+            self.interpreter.invoke()
+            output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
         except Exception as e:
-            logger.error(f"Failed to download MoveNet model: {e}")
+            logger.debug(f"Inference error: {e}")
             return None
-
-    def detect_human_movenet(self, frame):
-        """Detect a single person using MoveNet Lightning."""
-        if self.movenet_interpreter is None:
-            return None
-
-        input_details = self.movenet_input_details
-        output_details = self.movenet_output_details
-        if not input_details or not output_details:
-            return None
-
-        input_height, input_width = self.movenet_input_size
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb_frame = cv2.resize(rgb_frame, (rgb_frame.width() * (1 - self.process_scale), rgb_frame.height() * (1 - self.process_scale)))
-        resized = cv2.resize(rgb_frame, (input_width, input_height))
-        input_tensor = np.expand_dims(resized, axis=0)
-        input_tensor = self._prepare_input_tensor(input_tensor, input_details[0])
-
-        try:
-            self.movenet_interpreter.set_tensor(input_details[0]['index'], input_tensor)
-            self.movenet_interpreter.invoke()
-            output_data = self.movenet_interpreter.get_tensor(output_details[0]['index'])
-        except Exception as e:
-            logger.error(f"MoveNet inference error: {e}")
-            return None
-
-        output_data = self._dequantize_output(output_data, output_details[0])
-        keypoints = output_data[0, 0, :, :]
-        scores = keypoints[:, 2]
-
-        valid_mask = scores >= self.keypoint_score_threshold
+        
+        # Dequantize output if needed
+        output_detail = self.output_details[0]
+        quant = output_detail.get('quantization', (0.0, 0))
+        scale, zero_point = quant
+        if scale and scale > 0:
+            output_data = (output_data.astype(np.float32) - zero_point) * scale
+        else:
+            output_data = output_data.astype(np.float32)
+        
+        # Parse keypoints [1, 1, 17, 3] -> [17, 3] (y, x, confidence)
+        raw_keypoints = output_data[0, 0, :, :]
+        scores = raw_keypoints[:, 2]
+        
+        # Filter valid keypoints
+        valid_mask = scores >= self.keypoint_threshold
         if not np.any(valid_mask):
             return None
-
-        frame_h, frame_w = frame.shape[:2]
-        ys = keypoints[:, 0] * frame_h
-        xs = keypoints[:, 1] * frame_w
-
-        xs_valid = xs[valid_mask]
-        ys_valid = ys[valid_mask]
-
-        x_min = float(np.clip(np.min(xs_valid), 0, frame_w - 1))
-        y_min = float(np.clip(np.min(ys_valid), 0, frame_h - 1))
-        x_max = float(np.clip(np.max(xs_valid), 0, frame_w - 1))
-        y_max = float(np.clip(np.max(ys_valid), 0, frame_h - 1))
-
-        width = max(1.0, x_max - x_min)
-        height = max(1.0, y_max - y_min)
-
+        
+        # Scale and swap keypoints into pre-allocated buffer: [y, x, conf] -> [x, y, conf]
+        keypoints = self._keypoints_buffer
+        keypoints[:, 0] = raw_keypoints[:, 1] * frame_w  # x
+        keypoints[:, 1] = raw_keypoints[:, 0] * frame_h  # y
+        keypoints[:, 2] = scores  # confidence
+        
+        # Get bounding box from valid keypoints
+        xs_valid = keypoints[valid_mask, 0]
+        ys_valid = keypoints[valid_mask, 1]
+        
+        x_min = max(0, int(np.min(xs_valid)))
+        y_min = max(0, int(np.min(ys_valid)))
+        x_max = min(frame_w - 1, int(np.max(xs_valid)))
+        y_max = min(frame_h - 1, int(np.max(ys_valid)))
+        
+        width = max(1, x_max - x_min)
+        height = max(1, y_max - y_min)
+        
+        # Calculate mean confidence of valid keypoints
         confidence = float(np.mean(scores[valid_mask]))
         if confidence < self.confidence_threshold:
             return None
-
-        keypoints_pixels = np.stack([xs, ys, scores], axis=-1)
-
+        
+        # Return detection with keypoints copy (buffer is reused across frames)
         return {
-            'bbox': (int(x_min), int(y_min), int(width), int(height)),
-            'label': 'human',
+            'bbox': (x_min, y_min, width, height),
             'confidence': min(confidence, 1.0),
-            'keypoints': keypoints_pixels
+            'keypoints': keypoints.copy()
         }
+    
+    @property
+    def is_ready(self) -> bool:
+        return self.interpreter is not None
 
-    @staticmethod
-    def _prepare_input_tensor(tensor, input_detail):
-        dtype = input_detail['dtype']
-        tensor = tensor.astype(dtype, copy=False)
-        quantization = input_detail.get('quantization') or (0.0, 0)
-        scale, zero_point = quantization
 
-        if dtype == np.float32:
-            tensor = tensor.astype(np.float32)
-            tensor /= 255.0
-        elif dtype == np.uint8 and scale > 0:
-            tensor = tensor.astype(np.float32) / 255.0
-            tensor = tensor / scale + zero_point
-            tensor = np.clip(np.round(tensor), 0, 255).astype(np.uint8)
-        else:
-            tensor = tensor.astype(dtype)
-
-        return tensor
-
-    @staticmethod
-    def _dequantize_output(output_data, output_detail):
-        quantization = output_detail.get('quantization') or (0.0, 0)
-        scale, zero_point = quantization
-        if scale and scale > 0:
-            return (output_data.astype(np.float32) - zero_point) * scale
-        return output_data.astype(np.float32)
-
-    def calculate_shift_from_center(self, bbox):
-        """Calculate the shift of bounding box center from frame center"""
-        x, y, w, h = bbox
-        # Calculate center of bounding box
-        bbox_center_x = x + w // 2
-        bbox_center_y = y + h // 2
-
-        # Calculate shift from frame center
-        shift_x = bbox_center_x - self.frame_center_x
-        shift_y = bbox_center_y - self.frame_center_y
-
-        return shift_x, shift_y, bbox_center_x, bbox_center_y
-
-    def log_shift_to_file(self, shift_x, shift_y):
-        """Log the shift values to text file"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        log_entry = f"{timestamp} | x={shift_x:+6d} ; y={shift_y:+6d}\n"
-
-        try:
-            with open(self.shift_log_file, 'a') as f:
-                f.write(log_entry)
-        except Exception as e:
-            logger.error(f"Error writing to shift log file: {e}")
-
-    def init_tracker(self, frame, bbox):
-        # Validate bbox inside frame bounds and non-trivial size
-        h, w = frame.shape[:2]
-        x, y, bw, bh = [int(v) for v in bbox]
-        # Clip to frame
-        x = max(0, min(x, w - 1))
-        y = max(0, min(y, h - 1))
-        bw = max(1, min(bw, w - x))
-        bh = max(1, min(bh, h - y))
-        if bw < 5 or bh < 5:
-            logger.debug("Skipped tracker init: bbox too small after clipping")
-            return False
-
-        def _factory(name):
-            try:
-                if hasattr(cv2, 'legacy'):
-                    ctor = getattr(cv2.legacy, f'Tracker{name}_create', None)
-                    if callable(ctor):
-                        return ctor()
-            except Exception:
-                pass
-            try:
-                ctor = getattr(cv2, f'Tracker{name}_create', None)
-                if callable(ctor):
-                    return ctor()
-            except Exception:
-                pass
-            return None
-
-        # Preference order: KCF (fast/accurate), MOSSE (fast), CSRT (accurate), MIL/MedianFlow (fallbacks)
-        for name in ("KCF", "MOSSE", "CSRT", "MIL", "MedianFlow"):
-            try:
-                tracker = _factory(name)
-                if tracker is None:
-                    continue
-                ok = tracker.init(frame, (x, y, bw, bh))
-                # Some OpenCV versions return bool; others raise on failure
-                if ok is False:
-                    continue
-                self.tracker = tracker
-                self.tracking_supported = True
-                logger.debug(f"Initialized {name} tracker with bbox {(x, y, bw, bh)}")
-                return True
-            except Exception:
-                # Try next tracker type
-                continue
-
-        # None of the trackers are available/initialized
+class OptimizedTracker:
+    
+    def __init__(self,
+                 stream_url: str,
+                 output_dir: str = "recordings",
+                 verbose: bool = False,
+                 confidence_threshold: float = 0.5,
+                 detection_interval: int = 8,
+                 process_scale: float = 0.5,
+                 keypoint_threshold: float = 0.3,
+                 movenet_model_path: Optional[str] = None,
+                 movenet_threads: Optional[int] = None,
+                 ev3_deadzone_x: int = 50,
+                 ev3_deadzone_y: int = 50,
+                 ev3_speed_factor: float = 1.0,
+                 ev3_max_speed: int = 50,
+                 ev3_invert_x: bool = False,
+                 ev3_invert_y: bool = False,
+                 ev3_command_cooldown: float = 0.5):
+        
+        self.stream_url = stream_url
+        self.output_dir = output_dir
+        self.confidence_threshold = confidence_threshold
+        self.detection_interval = max(1, detection_interval)
+        self.process_scale = max(0.2, min(1.0, process_scale))
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Video capture
+        self.cap = None
+        self.frame_width = 0
+        self.frame_height = 0
+        self.frame_center_x = 0
+        self.frame_center_y = 0
+        
+        # State
+        self.is_running = False
+        self.is_recording = False
+        self.video_writer = None
+        self.output_filename = None
+        self.frame_count = 0
+        
+        # Tracking state
         self.tracker = None
-        if self.tracking_supported is None:
-            self.tracking_supported = False
-        if not self._tracker_warned:
-            self._tracker_warned = True
-            logger.warning(
-                "OpenCV tracking APIs not available or failed to initialize. "
-                "Continuing in detection-only mode. If desired, install a build "
-                "with tracking modules (e.g., opencv-contrib-python)."
-            )
+        self.tracked_human = None
+        self.tracking_enabled = True
+        self._tracker_type = None
+        
+        # Pre-calculate inverse scale
+        self.scale_inv = 1.0 / self.process_scale
+        
+        # Pre-allocated buffer for scaled detection frame (set after connect)
+        self._scaled_frame_buffer = None
+        
+        # Initialize detector
+        self.detector = MoveNetDetector(
+            model_path=movenet_model_path,
+            num_threads=movenet_threads,
+            confidence_threshold=confidence_threshold,
+            keypoint_threshold=keypoint_threshold
+        )
+        
+        # Initialize EV3 controller
+        self.ev3 = EV3Controller(
+            deadzone_x=ev3_deadzone_x,
+            deadzone_y=ev3_deadzone_y,
+            speed_factor=ev3_speed_factor,
+            max_speed=ev3_max_speed,
+            invert_x=ev3_invert_x,
+            invert_y=ev3_invert_y,
+            command_cooldown=ev3_command_cooldown
+        )
+        
+        # Shift logging
+        if verbose:
+            logger.setLevel(logging.DEBUG)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = os.path.join(output_dir, f"human_shifts_{timestamp}.txt")
+            self.shift_logger = BatchedLogWriter(log_path, batch_size=30)
+        
+        # FPS tracking
+        self._fps_frames = 0
+        self._fps_start = time.monotonic()
+        self._current_fps = 0.0
+        
+        logger.info(f"Tracker initialized: scale={self.process_scale}, interval={self.detection_interval}")
+    
+    def connect(self) -> bool:
+        """Connect to video stream."""
+        self.cap = ThreadedVideoCapture(self.stream_url, buffer_size=2)
+        
+        if not self.cap.start():
+            logger.error("Failed to connect to stream")
+            return False
+        
+        self.frame_width = self.cap.frame_width
+        self.frame_height = self.cap.frame_height
+        self.frame_center_x = self.frame_width // 2
+        self.frame_center_y = self.frame_height // 2
+        
+        # Update EV3 with camera dimensions
+        self.ev3.set_camera_size(self.frame_width, self.frame_height)
+        
+        # Pre-allocate scaled frame buffer for detection
+        if self.process_scale < 1.0:
+            scaled_h = int(self.frame_height * self.process_scale)
+            scaled_w = int(self.frame_width * self.process_scale)
+            self._scaled_frame_buffer = np.empty((scaled_h, scaled_w, 3), dtype=np.uint8)
+        
+        logger.info(f"Connected: {self.frame_width}x{self.frame_height}, center=({self.frame_center_x}, {self.frame_center_y})")
+        return True
+    
+    def _init_tracker(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> bool:
+        """Initialize OpenCV tracker with fastest available type."""
+        x, y, w, h = bbox
+        
+        # Validate bbox
+        if w < 10 or h < 10:
+            return False
+        
+        # Clip to frame bounds
+        fh, fw = frame.shape[:2]
+        x = max(0, min(x, fw - 1))
+        y = max(0, min(y, fh - 1))
+        w = min(w, fw - x)
+        h = min(h, fh - y)
+        
+        # Try trackers in order of speed (MOSSE is fastest)
+        tracker_types = ["MOSSE", "KCF", "CSRT"]
+        
+        for tracker_name in tracker_types:
+            try:
+                # Try legacy API first (OpenCV 4.5+)
+                if hasattr(cv2, 'legacy'):
+                    create_fn = getattr(cv2.legacy, f'Tracker{tracker_name}_create', None)
+                    if callable(create_fn):
+                        tracker = create_fn()
+                        if tracker.init(frame, (x, y, w, h)):
+                            self.tracker = tracker
+                            self._tracker_type = tracker_name
+                            return True
+                
+                # Try standard API
+                create_fn = getattr(cv2, f'Tracker{tracker_name}_create', None)
+                if callable(create_fn):
+                    tracker = create_fn()
+                    if tracker.init(frame, (x, y, w, h)):
+                        self.tracker = tracker
+                        self._tracker_type = tracker_name
+                        return True
+                        
+            except Exception:
+                continue
+        
+        self.tracker = None
+        self.tracking_enabled = False
         return False
-
-    def update_tracking(self, frame):
-        """Update tracker and run detection periodically"""
-        current_time = time.time()
-
-        # Try to update existing tracker
-        if self.tracker is not None:
+    
+    def _update_tracker(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        """Update tracker and return bbox if successful."""
+        if self.tracker is None:
+            return None
+        
+        try:
             success, bbox = self.tracker.update(frame)
             if success:
-                self.tracked_human = {
-                    'bbox': tuple(int(v) for v in bbox),
-                    'label': 'human',
-                    'confidence': self.tracked_human['confidence'],
-                    'keypoints': self.tracked_human.get('keypoints') if self.tracked_human else None
-                }
-                # Re-detect every N frames or every 2 seconds to correct drift
-                if (self.frame_count % self.detection_interval == 0 or
-                    current_time - self.last_detection_time > 1.0):
-                    self.run_detection_update(frame)
-                return self.tracked_human
-
-        # No tracker or tracking failed - run detection
-        if self.frame_count % max(1, self.detection_interval // 2) == 0:
-            return self.run_detection_update(frame)
-
+                return tuple(int(v) for v in bbox)
+        except Exception:
+            pass
+        
+        self.tracker = None
         return None
-
-    def run_detection_update(self, frame):
-        """Run detection on downscaled frame"""
-        self.last_detection_time = time.time()
-
-        scale_factor = self.process_scale if self.process_scale and self.process_scale > 0 else 1.0
-        if scale_factor != 1.0:
-            small_frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
-            scale_inv = 1.0 / scale_factor
+    
+    def _run_detection(self, frame: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Run detection on scaled frame and return result in original coordinates."""
+        # Scale down for faster detection (INTER_AREA is optimal for downscaling)
+        if self.process_scale < 1.0 and self._scaled_frame_buffer is not None:
+            cv2.resize(frame, (self._scaled_frame_buffer.shape[1], self._scaled_frame_buffer.shape[0]),
+                       dst=self._scaled_frame_buffer, interpolation=cv2.INTER_AREA)
+            small_frame = self._scaled_frame_buffer
         else:
             small_frame = frame
-            scale_inv = 1.0
-
-        detected_human = self.detect_human_movenet(small_frame)
-
-        if detected_human:
-            dx, dy, dw, dh = detected_human['bbox']
-            x = int(dx * scale_inv)
-            y = int(dy * scale_inv)
-            w = int(dw * scale_inv)
-            h = int(dh * scale_inv)
-
-            fh, fw = frame.shape[:2]
-            x = max(0, min(x, fw - 1))
-            y = max(0, min(y, fh - 1))
-            w = max(1, min(w, fw - x))
-            h = max(1, min(h, fh - y))
-            bbox = (x, y, w, h)
-
-            keypoints = detected_human.get('keypoints')
-            keypoints_scaled = None
-            if keypoints is not None:
-                keypoints_scaled = keypoints.copy()
-                keypoints_scaled[:, 0] *= scale_inv
-                keypoints_scaled[:, 1] *= scale_inv
-
-            tracker_ok = self.tracking_supported is not False and self.init_tracker(frame, bbox)
-
-            self.tracked_human = {
-                'bbox': bbox,
-                'label': 'human',
-                'confidence': detected_human['confidence'],
-                'keypoints': keypoints_scaled
-            }
-            if tracker_ok:
-                logger.debug(f"Human detected and tracker initialized: conf={detected_human['confidence']:.2f}")
+        
+        # Run detection
+        detection = self.detector.detect(small_frame)
+        
+        if detection is None:
+            return None
+        
+        # Scale bbox back to original coordinates
+        x, y, w, h = detection['bbox']
+        x = int(x * self.scale_inv)
+        y = int(y * self.scale_inv)
+        w = int(w * self.scale_inv)
+        h = int(h * self.scale_inv)
+        
+        # Clip to frame bounds
+        x = max(0, min(x, self.frame_width - 1))
+        y = max(0, min(y, self.frame_height - 1))
+        w = min(w, self.frame_width - x)
+        h = min(h, self.frame_height - y)
+        
+        # Scale keypoints (modify in-place since detect() returns fresh array)
+        keypoints = detection['keypoints']
+        if keypoints is not None:
+            keypoints[:, :2] *= self.scale_inv  # Scale x and y together
+        
+        return {
+            'bbox': (x, y, w, h),
+            'confidence': detection['confidence'],
+            'keypoints': keypoints
+        }
+    
+    def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, Optional[Dict]]:
+        """Process single frame with tracking and detection."""
+        self.frame_count += 1
+        
+        tracked = None
+        need_detection = False
+        
+        # Try tracker update first (fast path)
+        if self.tracker is not None:
+            bbox = self._update_tracker(frame)
+            if bbox is not None:
+                tracked = {
+                    'bbox': bbox,
+                    'confidence': self.tracked_human.get('confidence', 0.5) if self.tracked_human else 0.5,
+                    'keypoints': self.tracked_human.get('keypoints') if self.tracked_human else None
+                }
+                # Periodic re-detection to correct drift
+                if self.frame_count % self.detection_interval == 0:
+                    need_detection = True
             else:
-                logger.debug(f"Human detected (detection-only mode): conf={detected_human['confidence']:.2f}")
-            return self.tracked_human
-
-        return None
-
-    def draw_tracking(self, frame):
-        """Draw minimal tracking visualization for performance"""
-        # Draw small frame center crosshair
-        cv2.line(frame, (self.frame_center_x - 5, self.frame_center_y),
-                 (self.frame_center_x + 5, self.frame_center_y), (255, 0, 0), 1)
-        cv2.line(frame, (self.frame_center_x, self.frame_center_y - 5),
-                 (self.frame_center_x, self.frame_center_y + 5), (255, 0, 0), 1)
-
-        if self.tracked_human:
-            x, y, w, h = self.tracked_human['bbox']
-            confidence = self.tracked_human['confidence']
-            keypoints = self.tracked_human.get('keypoints') if isinstance(self.tracked_human, dict) else None
-
-            # Calculate shift
-            shift_x, shift_y, bbox_center_x, bbox_center_y = self.calculate_shift_from_center((x, y, w, h))
-
+                need_detection = True
+        else:
+            need_detection = True
+        
+        # Run detection if needed
+        if need_detection:
+            detection = self._run_detection(frame)
+            if detection is not None:
+                tracked = detection
+                # Re-initialize tracker with new detection
+                if self.tracking_enabled:
+                    self._init_tracker(frame, detection['bbox'])
+        
+        self.tracked_human = tracked
+        
+        # Draw visualization and update motors
+        annotated = self._draw_overlay(frame, tracked)
+        
+        return annotated, tracked
+    
+    def _draw_overlay(self, frame: np.ndarray, tracked: Optional[Dict]) -> np.ndarray:
+        """Draw tracking overlay on frame."""
+        # Draw center crosshair
+        cv2.line(frame, (self.frame_center_x - 8, self.frame_center_y),
+                 (self.frame_center_x + 8, self.frame_center_y), (255, 0, 0), 1)
+        cv2.line(frame, (self.frame_center_x, self.frame_center_y - 8),
+                 (self.frame_center_x, self.frame_center_y + 8), (255, 0, 0), 1)
+        
+        if tracked:
+            x, y, w, h = tracked['bbox']
+            
+            # Calculate center and shift
+            bbox_cx = x + w // 2
+            bbox_cy = y + h // 2
+            shift_x = bbox_cx - self.frame_center_x
+            shift_y = bbox_cy - self.frame_center_y
+            
             # Draw bounding box
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
+            
             # Draw center point
-            cv2.circle(frame, (bbox_center_x, bbox_center_y), 3, (0, 0, 255), -1)
-
-            # Draw line from frame center to human center
+            cv2.circle(frame, (bbox_cx, bbox_cy), 4, (0, 0, 255), -1)
+            
+            # Draw line to center
             cv2.line(frame, (self.frame_center_x, self.frame_center_y),
-                     (bbox_center_x, bbox_center_y), (255, 255, 0), 1)
-
+                    (bbox_cx, bbox_cy), (255, 255, 0), 1)
+            
+            # Draw keypoints if available
+            keypoints = tracked.get('keypoints')
             if keypoints is not None:
                 for kp_x, kp_y, kp_conf in keypoints:
-                    if kp_conf >= self.keypoint_score_threshold:
-                        cv2.circle(frame, (int(kp_x), int(kp_y)), 2, (255, 0, 255), -1)
-
-            # Display shift information
+                    if kp_conf >= self.detector.keypoint_threshold:
+                        cv2.circle(frame, (int(kp_x), int(kp_y)), 3, (255, 0, 255), -1)
+            
+            # Display shift text
             shift_text = f"x={shift_x:+d} y={shift_y:+d}"
-            cv2.putText(frame, shift_text, (x, y - 10),
+            cv2.putText(frame, shift_text, (x, y - 8),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-            # Log shift to file
-            self.log_shift_to_file(shift_x, shift_y)
-
-            # Update EV3 motors
-            if self.ev3_controller and self.ev3_controller.connected:
-                self.ev3_controller.update_motors(shift_x, shift_y)
+            
+            # Log shift and update motors
+            if self.verbose: self.shift_logger.log(shift_x, shift_y)
+            self.ev3.update_motors(shift_x, shift_y)
         else:
-            # No human detected - stop motors
-            if self.ev3_controller and self.ev3_controller.connected:
-                self.ev3_controller.stop_motors()
-
+            self.ev3.stop_motors()
+        
         return frame
-
+    
     def start_recording(self):
-        """Start recording with Raspberry Pi compatible codecs"""
-        if not self.is_recording and self.cap is not None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            fps = self.cap.get(cv2.CAP_PROP_FPS) or 60
-            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-            # Try multiple codec options for Raspberry Pi compatibility
-            codec_options = [
-                ('MJPG', '.avi', 'MJPEG'),  # Most compatible
-                ('mp4v', '.mp4', 'MP4V'),   # MP4 fallback
-                ('XVID', '.avi', 'XVID'),   # AVI fallback
-                ('H264', '.mp4', 'H264'),   # Try H264 as last resort
-            ]
-
-            for fourcc_str, extension, name in codec_options:
-                try:
-                    self.output_filename = os.path.join(self.output_dir, f"recording_{timestamp}{extension}")
-                    fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-                    self.video_writer = cv2.VideoWriter(self.output_filename, fourcc, fps, (width, height))
-
-                    if self.video_writer.isOpened():
-                        self.is_recording = True
-                        logger.info(f"Started recording with {name} codec: {self.output_filename}")
-                        logger.debug(f"Recording at {width}x{height} @ {fps} FPS")
-                        return
-                    else:
-                        logger.warning(f"Failed to initialize {name} codec, trying next...")
-                        self.video_writer = None
-                except Exception as e:
-                    logger.warning(f"Error with {name} codec: {e}")
-                    self.video_writer = None
-                    continue
-
-            logger.error("Failed to initialize video writer with any codec")
-            logger.info("Recording disabled - tracking will continue without recording")
-
+        """Start video recording."""
+        if self.is_recording or self.cap is None:
+            return
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fps = min(self.cap.fps, 30.0)  # Cap at 30 FPS for recording
+        
+        # Try codecs in order of compatibility
+        codecs = [
+            ('MJPG', '.avi'),
+            ('mp4v', '.mp4'),
+            ('XVID', '.avi'),
+        ]
+        
+        for fourcc_str, ext in codecs:
+            try:
+                self.output_filename = os.path.join(self.output_dir, f"rec_{timestamp}{ext}")
+                fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+                self.video_writer = cv2.VideoWriter(
+                    self.output_filename, fourcc, fps,
+                    (self.frame_width, self.frame_height)
+                )
+                if self.video_writer.isOpened():
+                    self.is_recording = True
+                    logger.info(f"Recording started: {self.output_filename}")
+                    return
+            except Exception:
+                continue
+        
+        logger.error("Failed to initialize video recording")
+    
     def stop_recording(self):
-        if self.is_recording and self.video_writer is not None:
+        """Stop video recording."""
+        if not self.is_recording:
+            return
+        
+        if self.video_writer:
             self.video_writer.release()
             self.video_writer = None
-            self.is_recording = False
-            logger.info(f"Stopped recording: {self.output_filename}")
-
-    def process_key(self, key, frame):
+        
+        self.is_recording = False
+        logger.info(f"Recording stopped: {self.output_filename}")
+    
+    def _handle_key(self, key: int, frame: np.ndarray) -> bool:
+        """Handle keyboard input. Returns True to quit."""
         if key == ord('q'):
-            return -1
+            return True
         elif key == ord('r'):
             if self.is_recording:
                 self.stop_recording()
@@ -735,185 +985,179 @@ class Tracker:
                 self.start_recording()
         elif key == ord('s'):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            screenshot_path = os.path.join(self.output_dir, f"screenshot_{timestamp}.jpg")
-            cv2.imwrite(screenshot_path, frame)
-            logger.info(f"Screenshot saved: {screenshot_path}")
+            path = os.path.join(self.output_dir, f"screenshot_{timestamp}.jpg")
+            cv2.imwrite(path, frame)
+            logger.info(f"Screenshot: {path}")
         elif key == ord('d'):
-            # Force detection
-            logger.info("Forcing detection...")
             self.tracker = None
             self.tracked_human = None
+            logger.info("Detection reset")
         elif key == ord('e'):
-            # Toggle EV3 connection
-            if self.ev3_controller:
-                if self.ev3_controller.connected:
-                    self.ev3_controller.disconnect()
-                    logger.info("EV3 disabled")
-                else:
-                    self.ev3_controller.connect()
-                    logger.info("EV3 enabled")
-        return 0
-
-
-    def process_frame(self, frame):
-        """Process frame with optimized tracking"""
-        self.frame_count += 1
-
-        # Update tracking
-        tracked_human = self.update_tracking(frame)
-
-        # Draw visualization
-        annotated_frame = self.draw_tracking(frame)
-
-        if self.is_recording and self.video_writer is not None:
-            self.video_writer.write(annotated_frame)
-
-        return annotated_frame, tracked_human
-
-    def run(self, display_video=True, auto_record=False):
-        if not self.connect_to_stream():
-            logger.error("Failed to connect to stream")
+            if self.ev3.connected:
+                self.ev3.disconnect()
+            else:
+                self.ev3.connect()
+        return False
+    
+    def run(self, display: bool = True, auto_record: bool = False):
+        """Main processing loop."""
+        if not self.connect():
             return
-
+        
         self.is_running = True
+        
         if auto_record:
             self.start_recording()
-
-        logger.info("Starting human tracking...")
-        logger.info("Press 'q' to quit, 'r' to toggle recording, 's' to take screenshot, 'd' to force detection, 'e' to toggle EV3")
-
-        fps_start_time = time.time()
-        fps_frame_count = 0
-        current_fps = 0.0
-
+        
+        logger.info("Tracking started. Keys: q=quit, r=record, s=screenshot, d=reset, e=EV3")
+        
         try:
             while self.is_running:
                 ret, frame = self.cap.read()
-                if not ret:
-                    logger.warning("Failed to read frame from stream")
-                    time.sleep(0.1)
+                if not ret or frame is None:
+                    time.sleep(0.01)
                     continue
-
-                annotated_frame, tracked_human = self.process_frame(frame)
-
-                # Calculate and display FPS
-                fps_frame_count += 1
-                if fps_frame_count >= 30:
-                    fps_end_time = time.time()
-                    current_fps = fps_frame_count / (fps_end_time - fps_start_time)
-                    logger.info(f"FPS: {current_fps:.2f}")
-                    fps_start_time = fps_end_time
-                    fps_frame_count = 0
-
-                if display_video:
-                    # Show FPS on frame
-                    cv2.putText(annotated_frame, f"FPS: {current_fps:.1f}",
+                
+                # Process frame
+                annotated, _ = self.process_frame(frame)
+                
+                # Update FPS counter
+                self._fps_frames += 1
+                now = time.monotonic()
+                elapsed = now - self._fps_start
+                if elapsed >= 1.0:
+                    self._current_fps = self._fps_frames / elapsed
+                    self._fps_frames = 0
+                    self._fps_start = now
+                
+                # Record if enabled
+                if self.is_recording and self.video_writer:
+                    self.video_writer.write(annotated)
+                
+                if display:
+                    # Draw FPS and status
+                    cv2.putText(annotated, f"FPS: {self._current_fps:.1f}",
                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-                    # Show EV3 status
-                    if self.ev3_controller and self.ev3_controller.connected:
-                        cv2.putText(annotated_frame, "EV3: ON",
-                                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    elif self.ev3_controller:
-                        cv2.putText(annotated_frame, "EV3: OFF",
-                                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-                    cv2.imshow('Human Tracker', annotated_frame)
+                    
+                    ev3_status = "EV3: ON" if self.ev3.connected else "EV3: OFF"
+                    ev3_color = (0, 255, 0) if self.ev3.connected else (0, 0, 255)
+                    cv2.putText(annotated, ev3_status, (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, ev3_color, 2)
+                    
+                    if self._tracker_type:
+                        cv2.putText(annotated, f"Tracker: {self._tracker_type}",
+                                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    
+                    cv2.imshow('Human Tracker', annotated)
+                    
                     key = cv2.waitKey(1) & 0xFF
-                    if self.process_key(key, annotated_frame) == -1:
+                    if self._handle_key(key, annotated):
                         break
-                else:
-                    key = int(input()) & 0xFF
-                    if self.process_key(key, annotated_frame) == -1:
-                        break
+                        
         except KeyboardInterrupt:
-            logger.info("Interrupted by user")
+            logger.info("Interrupted")
         except Exception as e:
-            logger.error(f"Error in main loop: {e}")
+            logger.error(f"Error: {e}")
             import traceback
             traceback.print_exc()
         finally:
             self.cleanup()
-
+    
     def cleanup(self):
+        """Release all resources."""
         logger.info("Cleaning up...")
         self.is_running = False
-
-        # Stop EV3 motors
-        if self.ev3_controller:
-            self.ev3_controller.disconnect()
-
+        
+        self.ev3.disconnect()
+        
         if self.is_recording:
             self.stop_recording()
-        if self.cap is not None:
-            self.cap.release()
+        
+        if self.cap:
+            self.cap.stop()
+        
+        if self.verbose: self.shift_logger.flush()
         cv2.destroyAllWindows()
-        logger.debug(f"Shift log saved to: {self.shift_log_file}")
-        logger.info("Cleanup completed")
+        
+        logger.info("Cleanup complete")
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Human Tracker for Raspberry Pi 5 with EV3 Control')
+    parser = argparse.ArgumentParser(
+        description='Optimized Human Tracker for Raspberry Pi 3B/5'
+    )
+    
+    # Stream settings
     parser.add_argument('--url', default='http://192.168.100.1:8000/stream',
-                        help='Stream URL')
+                        help='Video stream URL')
     parser.add_argument('--output-dir', default='recordings',
-                        help='Output directory for recordings')
-    parser.add_argument('--detection-type', default="movenet",
-                        help='Detection backend (currently only "movenet")')
-    parser.add_argument('--confidence-threshold', type=float, default=0.7,
-                        help='Average keypoint confidence required to accept detection')
-    parser.add_argument('--detection-interval', type=int, default=5,
-                        help='Run detection every N frames (higher = faster but less responsive)')
-    parser.add_argument('--process-scale', type=float, default=0.3,
-                        help='Scale factor for detection processing (lower = faster)')
+                        help='Output directory')
+    parser.add_argument('--verbose', default='False', action='store_true',
+                        help='Enable verbose logging')
+    # Detection settings
+    parser.add_argument('--confidence-threshold', type=float, default=0.5,
+                        help='Detection confidence threshold (0.0-1.0)')
+    parser.add_argument('--detection-interval', type=int, default=8,
+                        help='Run detection every N frames (higher=faster)')
+    parser.add_argument('--process-scale', type=float, default=0.5,
+                        help='Frame scale for detection (0.2-1.0, lower=faster)')
     parser.add_argument('--keypoint-threshold', type=float, default=0.3,
-                        help='Minimum individual keypoint confidence for inclusion in bbox')
+                        help='Keypoint confidence threshold')
+    
+    # MoveNet settings
     parser.add_argument('--movenet-model', type=str, default=None,
-                        help='Path to a MoveNet Lightning TFLite file (downloads default if omitted)')
+                        help='Path to MoveNet TFLite model')
     parser.add_argument('--movenet-threads', type=int, default=None,
-                        help='Number of inference threads for MoveNet (defaults to half CPU cores)')
+                        help='Inference threads (default: half CPU cores)')
+    
+    # Display settings
     parser.add_argument('--no-display', action='store_true',
-                        help='Run without displaying video (saves CPU)')
+                        help='Run headless (no video display)')
     parser.add_argument('--no-auto-record', action='store_true',
-                        help='Do not start recording automatically')
-
-    # EV3 arguments
+                        help='Disable auto-recording on start')
+    
+    # EV3 settings
     parser.add_argument('--ev3-deadzone-x', type=int, default=90,
-                        help='Horizontal deadzone in pixels (no motor movement within this range)')
+                        help='Horizontal deadzone in pixels')
     parser.add_argument('--ev3-deadzone-y', type=int, default=90,
-                        help='Vertical deadzone in pixels (no motor movement within this range)')
+                        help='Vertical deadzone in pixels')
     parser.add_argument('--ev3-speed-factor', type=float, default=1.0,
-                        help='Speed multiplier for motor control (0.1-2.0)')
+                        help='Motor speed multiplier (0.1-2.0)')
     parser.add_argument('--ev3-max-speed', type=int, default=50,
                         help='Maximum motor speed (1-100)')
-    parser.add_argument('--ev3-invert-x', action='store_true', default=False,
-                        help='Invert horizontal motor direction')
-    parser.add_argument('--ev3-invert-y', action='store_true', default=False,
-                        help='Invert vertical motor direction')
-
+    parser.add_argument('--ev3-invert-x', action='store_true',
+                        help='Invert horizontal direction')
+    parser.add_argument('--ev3-invert-y', action='store_true',
+                        help='Invert vertical direction')
+    parser.add_argument('--ev3-cooldown', type=float, default=0.5,
+                        help='Motor command cooldown in seconds')
+    
     args = parser.parse_args()
-
-    tracker = Tracker(
+    
+    tracker = OptimizedTracker(
         stream_url=args.url,
         output_dir=args.output_dir,
-        detection_type=args.detection_type,
+        verbose=args.verbose,
         confidence_threshold=args.confidence_threshold,
         detection_interval=args.detection_interval,
         process_scale=args.process_scale,
-    keypoint_score_threshold=args.keypoint_threshold,
-    movenet_model_path=args.movenet_model,
-    movenet_num_threads=args.movenet_threads,
+        keypoint_threshold=args.keypoint_threshold,
+        movenet_model_path=args.movenet_model,
+        movenet_threads=args.movenet_threads,
         ev3_deadzone_x=args.ev3_deadzone_x,
         ev3_deadzone_y=args.ev3_deadzone_y,
         ev3_speed_factor=args.ev3_speed_factor,
         ev3_max_speed=args.ev3_max_speed,
         ev3_invert_x=args.ev3_invert_x,
-        ev3_invert_y=args.ev3_invert_y
+        ev3_invert_y=args.ev3_invert_y,
+        ev3_command_cooldown=args.ev3_cooldown
     )
-
+    
     tracker.run(
-        display_video=not args.no_display,
+        display=not args.no_display,
         auto_record=not args.no_auto_record
     )
+
 
 if __name__ == "__main__":
     main()

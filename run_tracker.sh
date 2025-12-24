@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# Optimized Human Tracker for Raspberry Pi
 # Usage: ./run_tracker.sh [options]
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run as root (e.g.,: sudo $0)" >&2
+  exit 1
+fi
+
+ip addr flush dev eth0
+ip addr add 192.168.100.2/24 dev eth0
+ip link set eth0 up
 
 set -e
 
@@ -25,7 +33,6 @@ if [[ $EUID -eq 0 ]] && command -v cpufreq-set &> /dev/null; then
     done
 fi
 
-# Default settings optimized for Pi 3B (use --pi5 for better settings)
 PI_VERSION=""
 DETECTION_INTERVAL=10
 PROCESS_SCALE=0.4
@@ -64,8 +71,8 @@ echo "Process scale: $PROCESS_SCALE"
 echo "Threads: $MOVENET_THREADS"
 echo "==================================="
 
-# Run the optimized tracker
-exec python3 tracker_optimized.py \
+echo "Starting tracker application..."
+exec python3 tracker.py \
     --detection-interval "$DETECTION_INTERVAL" \
     --process-scale "$PROCESS_SCALE" \
     --movenet-threads "$MOVENET_THREADS" \
