@@ -252,7 +252,7 @@ class EV3Controller:
         if abs(shift) < deadzone:
             return None, 0
         
-        speed = int(min(abs(shift) / 100.0 * self.speed_factor * 10 + 5, self.max_speed))
+        speed = int(min(abs(shift) / 100.0 * self.speed_factor, self.max_speed))
         degree = int((-shift if invert else shift) / degree_coeff)
         
         return degree, speed
