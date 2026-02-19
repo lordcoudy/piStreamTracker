@@ -100,7 +100,11 @@ install_system_deps() {
 
     # Camera dependencies (if available)
     if [[ "$1" == "camera" ]] || [[ "$1" == "full" ]]; then
-        sudo apt-get install -y -qq libcamera-apps python3-picamera2 || true
+        sudo apt-get install -y -qq \
+            libcamera-apps \
+            libcamera-dev \
+            python3-libcamera \
+            python3-picamera2 || true
     fi
 
     print_step "System dependencies installed"
@@ -111,7 +115,8 @@ setup_venv() {
     print_step "Setting up Python virtual environment..."
 
     if [[ ! -d "venv" ]]; then
-        python3 -m venv venv
+        # Use --system-site-packages to access libcamera and picamera2
+        python3 -m venv --system-site-packages venv
     fi
 
     source venv/bin/activate
@@ -124,7 +129,8 @@ setup_venv() {
 install_camera_deps() {
     print_step "Installing Camera Pi dependencies..."
 
-    pip install -q pyyaml picamera2
+    # Install pyyaml only - picamera2 and libcamera come from system packages
+    pip install -q pyyaml
 
     print_step "Camera dependencies installed"
 }

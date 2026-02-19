@@ -16,7 +16,8 @@ ev3-dc>=0.9.6
 tflite-runtime; platform_machine == "aarch64" or platform_machine == "armv7l"
 
 # Camera Server (Pi only)
-picamera2; platform_machine == "aarch64" or platform_machine == "armv7l"
+# Note: picamera2 and libcamera must be installed via system packages (apt)
+# Use venv with --system-site-packages to access them
 
 # Web Interface
 flask>=2.0.0
