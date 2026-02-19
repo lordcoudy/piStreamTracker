@@ -774,9 +774,9 @@ class HumanTracker:
             self._fps_count = 0
             self._fps_time = now
 
-    def write_frame(self, frame: np.ndarray):
-        """Feed the latest frame to the recording thread (non-blocking)."""
-        if self.recording and self._rec_thread:
+    def write_frame(self, frame: Optional[np.ndarray]):
+        """Feed the latest clean (un-annotated) frame to the recording thread."""
+        if frame is not None and self.recording and self._rec_thread:
             self._rec_thread.update_frame(frame)
 
     def run(self, display: bool = True, auto_record: bool = False):
@@ -798,9 +798,10 @@ class HumanTracker:
                     time.sleep(0.01)
                     continue
 
+                rec_frame = frame.copy() if self.recording else None
                 annotated, _ = self.process_frame(frame)
                 self.update_fps()
-                self.write_frame(annotated)
+                self.write_frame(rec_frame)
 
                 if display:
                     # Status overlay
