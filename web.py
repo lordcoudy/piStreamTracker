@@ -5,13 +5,17 @@ Simple Flask-based control panel for the tracking system
 """
 
 import logging
+import os
 import time
+from datetime import datetime
+from pathlib import Path
 from threading import Lock, Thread
 from typing import Optional
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import (Flask, Response, jsonify, render_template_string, request,
+                   send_from_directory)
 
 # Import tracker components
 from tracker import HumanTracker, load_config
@@ -101,10 +105,13 @@ HTML_TEMPLATE = """
             border-radius: 8px;
             overflow: hidden;
             position: relative;
+            max-width: var(--stream-width, 1280px);
+            aspect-ratio: var(--stream-aspect, 4/3);
         }
         .video-container img {
             width: 100%;
-            height: auto;
+            height: 100%;
+            object-fit: contain;
             display: block;
         }
         .video-overlay {
@@ -258,6 +265,83 @@ HTML_TEMPLATE = """
         }
         .log-output .log-line.error { color: #f87171; }
         .log-output .log-line.success { color: #4ade80; }
+
+        /* Recordings panel */
+        .recordings-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+        }
+        .recordings-header h3 { margin-bottom: 0; }
+        .recordings-toggle {
+            font-size: 0.8rem;
+            color: #94a3b8;
+            transition: transform 0.2s;
+        }
+        .recordings-toggle.open { transform: rotate(180deg); }
+        .recordings-body {
+            max-height: 0;
+            overflow: hidden;
+            transition: max-height 0.3s ease;
+        }
+        .recordings-body.open {
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        .rec-list {
+            margin-top: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .rec-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: #1e293b;
+            padding: 8px 10px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            gap: 8px;
+        }
+        .rec-item .rec-info {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+        }
+        .rec-item .rec-name {
+            color: #e2e8f0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .rec-item .rec-meta {
+            color: #64748b;
+            font-size: 0.7rem;
+        }
+        .rec-item .rec-thumb {
+            width: 48px;
+            height: 36px;
+            object-fit: cover;
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+        .rec-actions {
+            display: flex;
+            gap: 4px;
+            flex-shrink: 0;
+        }
+        .rec-actions button {
+            padding: 4px 8px;
+            font-size: 0.7rem;
+        }
+        .rec-empty {
+            color: #64748b;
+            font-size: 0.8rem;
+            text-align: center;
+            padding: 15px 0;
+        }
     </style>
 </head>
 <body>
@@ -375,6 +459,21 @@ HTML_TEMPLATE = """
                     <h3>Log</h3>
                     <div class="log-output" id="log-output"></div>
                 </div>
+
+                <div class="panel">
+                    <div class="recordings-header" onclick="toggleRecordingsPanel()">
+                        <h3>Recordings</h3>
+                        <span class="recordings-toggle" id="rec-toggle">&#9660;</span>
+                    </div>
+                    <div class="recordings-body" id="rec-body">
+                        <div style="margin-top:10px">
+                            <button class="secondary" onclick="loadRecordings()" style="padding:6px 12px;font-size:0.8rem">Refresh</button>
+                        </div>
+                        <div class="rec-list" id="rec-list">
+                            <div class="rec-empty">Click Refresh to load</div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -488,9 +587,97 @@ HTML_TEMPLATE = """
             }
         }
 
+        // --- Recordings ---
+        function toggleRecordingsPanel() {
+            const body = document.getElementById('rec-body');
+            const toggle = document.getElementById('rec-toggle');
+            body.classList.toggle('open');
+            toggle.classList.toggle('open');
+            if (body.classList.contains('open') && document.getElementById('rec-list').querySelector('.rec-empty')) {
+                loadRecordings();
+            }
+        }
+
+        async function loadRecordings() {
+            const res = await api('recordings');
+            const list = document.getElementById('rec-list');
+            if (!res || !res.files || res.files.length === 0) {
+                list.innerHTML = '<div class="rec-empty">No recordings found</div>';
+                return;
+            }
+            list.innerHTML = '';
+            res.files.forEach(f => {
+                const item = document.createElement('div');
+                item.className = 'rec-item';
+                const isImg = f.name.toLowerCase().endsWith('.jpg') || f.name.toLowerCase().endsWith('.png');
+                const thumbHtml = isImg
+                    ? '<img class="rec-thumb" src="/api/recordings/' + encodeURIComponent(f.name) + '" alt="thumb">'
+                    : '';
+                item.innerHTML = thumbHtml +
+                    '<div class="rec-info">' +
+                        '<div class="rec-name" title="' + f.name + '">' + f.name + '</div>' +
+                        '<div class="rec-meta">' + f.size + ' &middot; ' + f.date + '</div>' +
+                    '</div>' +
+                    '<div class="rec-actions">' +
+                        '<a href="/api/recordings/' + encodeURIComponent(f.name) + '" download style="text-decoration:none">' +
+                            '<button class="secondary">&#8595;</button>' +
+                        '</a>' +
+                        '<button class="danger" onclick="deleteRecording(\'' + f.name.replace(/'/g, "\\'") + '\')">&#10005;</button>' +
+                    '</div>';
+                list.appendChild(item);
+            });
+        }
+
+        async function deleteRecording(name) {
+            if (!confirm('Delete ' + name + '?')) return;
+            const res = await fetch('/api/recordings/' + encodeURIComponent(name), { method: 'DELETE' });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                log('Deleted ' + name, 'success');
+                loadRecordings();
+            } else {
+                log('Delete failed: ' + (data.message || 'unknown error'), 'error');
+            }
+        }
+
+        // --- Stream dimensions ---
+        async function loadConfig() {
+            const res = await api('config');
+            if (res && res.width && res.height) {
+                const root = document.documentElement;
+                root.style.setProperty('--stream-width', res.width + 'px');
+                root.style.setProperty('--stream-aspect', res.width + '/' + res.height);
+                // Adapt grid: for wider streams use more space
+                const ratio = res.width / res.height;
+                const grid = document.querySelector('.main-grid');
+                if (ratio >= 1.6) {
+                    grid.style.gridTemplateColumns = '1fr 280px';
+                } else {
+                    grid.style.gridTemplateColumns = '1fr 300px';
+                }
+            }
+        }
+
+        // --- Auto-refresh recordings after actions ---
+        const _origToggleRecording = toggleRecording;
+        toggleRecording = async function() {
+            await _origToggleRecording();
+            if (!isRecording && document.getElementById('rec-body').classList.contains('open')) {
+                setTimeout(loadRecordings, 500);
+            }
+        };
+        const _origTakeScreenshot = takeScreenshot;
+        takeScreenshot = async function() {
+            await _origTakeScreenshot();
+            if (document.getElementById('rec-body').classList.contains('open')) {
+                setTimeout(loadRecordings, 500);
+            }
+        };
+
         // Poll status every second
         setInterval(updateStatus, 1000);
         updateStatus();
+        loadConfig();
         log('Web interface loaded');
     </script>
 </body>
@@ -663,6 +850,88 @@ def api_settings():
         _tracker.detection_interval = int(data['interval'])
 
     return jsonify({'status': 'ok'})
+
+
+@app.route('/api/config')
+def api_config():
+    """Return camera resolution for frontend layout adaptation."""
+    cam = _config.get('camera', {})
+    res = cam.get('resolution', {})
+    return jsonify({
+        'width': res.get('width', 1280),
+        'height': res.get('height', 960)
+    })
+
+
+@app.route('/api/recordings')
+def api_recordings():
+    """List recording files."""
+    output_dir = _config.get('tracker', {}).get('output_dir', 'recordings')
+    rec_path = Path(output_dir)
+    if not rec_path.exists():
+        return jsonify({'files': []})
+
+    files = []
+    for f in sorted(rec_path.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if f.is_file() and f.suffix.lower() in ('.avi', '.jpg', '.png', '.txt'):
+            stat = f.stat()
+            size = stat.st_size
+            if size < 1024:
+                size_str = f"{size} B"
+            elif size < 1024 * 1024:
+                size_str = f"{size / 1024:.1f} KB"
+            else:
+                size_str = f"{size / (1024 * 1024):.1f} MB"
+            date_str = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
+            files.append({
+                'name': f.name,
+                'size': size_str,
+                'bytes': stat.st_size,
+                'date': date_str,
+                'type': f.suffix.lower().lstrip('.')
+            })
+
+    return jsonify({'files': files})
+
+
+@app.route('/api/recordings/<path:filename>')
+def api_recordings_download(filename):
+    """Download or view a recording file."""
+    output_dir = _config.get('tracker', {}).get('output_dir', 'recordings')
+    rec_path = Path(output_dir).resolve()
+    file_path = (rec_path / filename).resolve()
+
+    # Prevent path traversal
+    if not str(file_path).startswith(str(rec_path)):
+        return jsonify({'status': 'error', 'message': 'Invalid path'}), 403
+
+    if not file_path.exists():
+        return jsonify({'status': 'error', 'message': 'File not found'}), 404
+
+    # Images served inline, everything else as attachment
+    as_attachment = file_path.suffix.lower() not in ('.jpg', '.png')
+    return send_from_directory(str(rec_path), filename, as_attachment=as_attachment)
+
+
+@app.route('/api/recordings/<path:filename>', methods=['DELETE'])
+def api_recordings_delete(filename):
+    """Delete a recording file."""
+    output_dir = _config.get('tracker', {}).get('output_dir', 'recordings')
+    rec_path = Path(output_dir).resolve()
+    file_path = (rec_path / filename).resolve()
+
+    # Prevent path traversal
+    if not str(file_path).startswith(str(rec_path)):
+        return jsonify({'status': 'error', 'message': 'Invalid path'}), 403
+
+    if not file_path.exists():
+        return jsonify({'status': 'error', 'message': 'File not found'}), 404
+
+    try:
+        file_path.unlink()
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 # =============================================================================
