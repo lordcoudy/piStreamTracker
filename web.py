@@ -609,21 +609,51 @@ HTML_TEMPLATE = """
             res.files.forEach(f => {
                 const item = document.createElement('div');
                 item.className = 'rec-item';
-                const isImg = f.name.toLowerCase().endsWith('.jpg') || f.name.toLowerCase().endsWith('.png');
-                const thumbHtml = isImg
-                    ? '<img class="rec-thumb" src="/api/recordings/' + encodeURIComponent(f.name) + '" alt="thumb">'
-                    : '';
-                item.innerHTML = thumbHtml +
-                    '<div class="rec-info">' +
-                        '<div class="rec-name" title="' + f.name + '">' + f.name + '</div>' +
-                        '<div class="rec-meta">' + f.size + ' &middot; ' + f.date + '</div>' +
-                    '</div>' +
-                    '<div class="rec-actions">' +
-                        '<a href="/api/recordings/' + encodeURIComponent(f.name) + '" download style="text-decoration:none">' +
-                            '<button class="secondary">&#8595;</button>' +
-                        '</a>' +
-                        '<button class="danger" onclick="deleteRecording(\'' + f.name.replace(/'/g, "\\'") + '\')">&#10005;</button>' +
-                    '</div>';
+
+                if (f.name.toLowerCase().endsWith('.jpg') || f.name.toLowerCase().endsWith('.png')) {
+                    const thumb = document.createElement('img');
+                    thumb.className = 'rec-thumb';
+                    thumb.src = '/api/recordings/' + encodeURIComponent(f.name);
+                    thumb.alt = 'thumb';
+                    item.appendChild(thumb);
+                }
+
+                const info = document.createElement('div');
+                info.className = 'rec-info';
+                const nameEl = document.createElement('div');
+                nameEl.className = 'rec-name';
+                nameEl.title = f.name;
+                nameEl.textContent = f.name;
+                const metaEl = document.createElement('div');
+                metaEl.className = 'rec-meta';
+                metaEl.textContent = f.size + ' · ' + f.date;
+                info.appendChild(nameEl);
+                info.appendChild(metaEl);
+                item.appendChild(info);
+
+                const actions = document.createElement('div');
+                actions.className = 'rec-actions';
+
+                const dlLink = document.createElement('a');
+                dlLink.href = '/api/recordings/' + encodeURIComponent(f.name);
+                dlLink.download = f.name;
+                dlLink.style.textDecoration = 'none';
+                const dlBtn = document.createElement('button');
+                dlBtn.className = 'secondary';
+                dlBtn.textContent = '↓';
+                dlLink.appendChild(dlBtn);
+                actions.appendChild(dlLink);
+
+                const delBtn = document.createElement('button');
+                delBtn.className = 'danger';
+                delBtn.textContent = '✕';
+                delBtn.dataset.filename = f.name;
+                delBtn.addEventListener('click', function() {
+                    deleteRecording(this.dataset.filename);
+                });
+                actions.appendChild(delBtn);
+
+                item.appendChild(actions);
                 list.appendChild(item);
             });
         }
