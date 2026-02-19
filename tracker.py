@@ -498,6 +498,60 @@ class ObjectTracker:
 
 
 # =============================================================================
+# Recording Thread
+# =============================================================================
+
+class _RecordingThread:
+    """Writes frames to a VideoWriter at a fixed, stable framerate.
+
+    Runs in its own thread, ticking at exactly ``1/fps`` intervals.
+    If the main loop is slower than the target FPS the last available frame
+    is repeated so the output file always has a constant frame rate.
+    If the main loop is faster, extra frames are simply dropped.
+    """
+
+    def __init__(self, writer: cv2.VideoWriter, fps: float):
+        self._writer = writer
+        self._interval = 1.0 / max(fps, 1.0)
+        self._frame: Optional[np.ndarray] = None
+        self._lock = Lock()
+        self._stop = Event()
+        self._thread: Optional[Thread] = None
+
+    def update_frame(self, frame: np.ndarray):
+        """Feed the latest annotated frame (non-blocking)."""
+        with self._lock:
+            self._frame = frame
+
+    def start(self):
+        """Start the recording thread."""
+        self._stop.clear()
+        self._thread = Thread(target=self._run, daemon=True, name="RecordingThread")
+        self._thread.start()
+
+    def stop(self):
+        """Stop the recording thread and flush the writer."""
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=max(self._interval * 4, 1.0))
+        self._writer.release()
+
+    def _run(self):
+        next_tick = time.monotonic()
+        while not self._stop.is_set():
+            now = time.monotonic()
+            sleep_for = next_tick - now
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            next_tick += self._interval
+
+            with self._lock:
+                frame = self._frame
+            if frame is not None:
+                self._writer.write(frame)
+
+
+# =============================================================================
 # Main Tracker Application
 # =============================================================================
 
@@ -522,6 +576,7 @@ class HumanTracker:
         self.process_scale = det['scale']
         self.output_dir = Path(tracker_cfg['output_dir'])
         self.output_dir.mkdir(exist_ok=True)
+        self.recording_fps: float = float(tracker_cfg.get('recording_fps', 30))
 
         # Components
         self.capture = None
@@ -540,6 +595,7 @@ class HumanTracker:
         self.current_detection = None
         self.frame_count = 0
         self._video_writer = None
+        self._rec_thread: Optional[_RecordingThread] = None
         self._fps_count = 0
         self._fps_time = time.monotonic()
         self._fps = 0.0
@@ -669,7 +725,7 @@ class HumanTracker:
         return frame
 
     def start_recording(self):
-        """Start video recording."""
+        """Start video recording at a fixed, stable framerate."""
         if self.recording:
             return
 
@@ -677,21 +733,24 @@ class HumanTracker:
         path = self.output_dir / f"rec_{ts}.avi"
         fourcc = cv2.VideoWriter_fourcc(*'MJPG')
         self._video_writer = cv2.VideoWriter(
-            str(path), fourcc, min(self.capture.fps, 30.0),
+            str(path), fourcc, self.recording_fps,
             (self.capture.width, self.capture.height)
         )
         if self._video_writer.isOpened():
+            self._rec_thread = _RecordingThread(self._video_writer, self.recording_fps)
+            self._rec_thread.start()
             self.recording = True
-            logger.info(f"Recording: {path}")
+            logger.info(f"Recording: {path}  ({self.recording_fps:.0f} fps)")
 
     def stop_recording(self):
         """Stop video recording."""
         if not self.recording:
             return
-        if self._video_writer:
-            self._video_writer.release()
-            self._video_writer = None
         self.recording = False
+        if self._rec_thread:
+            self._rec_thread.stop()   # flushes & releases VideoWriter
+            self._rec_thread = None
+        self._video_writer = None
         logger.info("Recording stopped")
 
     def screenshot(self, frame: np.ndarray):
@@ -716,9 +775,9 @@ class HumanTracker:
             self._fps_time = now
 
     def write_frame(self, frame: np.ndarray):
-        """Write frame to active recording, if any."""
-        if self.recording and self._video_writer:
-            self._video_writer.write(frame)
+        """Feed the latest frame to the recording thread (non-blocking)."""
+        if self.recording and self._rec_thread:
+            self._rec_thread.update_frame(frame)
 
     def run(self, display: bool = True, auto_record: bool = False):
         """Main processing loop."""
