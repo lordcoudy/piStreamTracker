@@ -163,7 +163,14 @@ class PoseDetector:
         'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
     ]
 
-    MODEL_URL = "https://storage.googleapis.com/tfhub-lite-models/google/lite-model/movenet/singlepose/lightning/tflite/float16/4.tflite"
+    # Primary: TFHub redirect (follows 302 to the actual GCS object)
+    # Fallback: original GCS direct path (kept in case it is restored)
+    MODEL_URLS = [
+        "https://tfhub.dev/google/lite-model/movenet/singlepose/lightning/tflite/float16/4?lite-format=tflite",
+        "https://storage.googleapis.com/tfhub-lite-models/google/lite-model/movenet/singlepose/lightning/tflite/float16/4.tflite",
+    ]
+    # Minimum expected size for a valid MoveNet Lightning float16 model (~1.8 MB)
+    MODEL_MIN_BYTES = 1_500_000
 
     def __init__(self, model_path: Optional[str] = None, threads: Optional[int] = None,
                  confidence: float = 0.5, keypoint_threshold: float = 0.3):
@@ -218,22 +225,32 @@ class PoseDetector:
         models_dir.mkdir(exist_ok=True)
         path = models_dir / "movenet_lightning.tflite"
 
+        # Validate any cached file before trusting it
         if path.exists():
-            return str(path)
+            if path.stat().st_size >= self.MODEL_MIN_BYTES:
+                return str(path)
+            logger.warning(
+                f"Cached model too small ({path.stat().st_size} B < {self.MODEL_MIN_BYTES} B) — "
+                "deleting and re-downloading"
+            )
+            path.unlink()
 
-        logger.info("Downloading MoveNet model...")
-        try:
-            req = urllib.request.Request(self.MODEL_URL, headers={'User-Agent': 'PiTracker/1.0'})
-            ctx = ssl.create_default_context()
-            with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
-                data = resp.read()
-                if len(data) > 1000:
+        ctx = ssl.create_default_context()
+        for url in self.MODEL_URLS:
+            logger.info(f"Downloading MoveNet model from {url} ...")
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'PiTracker/1.0'})
+                with urllib.request.urlopen(req, context=ctx, timeout=90) as resp:
+                    data = resp.read()
+                if len(data) >= self.MODEL_MIN_BYTES:
                     path.write_bytes(data)
                     logger.info(f"Model saved: {path} ({len(data) // 1024} KB)")
                     return str(path)
-        except Exception as e:
-            logger.error(f"Download failed: {e}")
+                logger.warning(f"Download from {url} returned only {len(data)} B — skipping")
+            except Exception as e:
+                logger.warning(f"Download failed ({url}): {e}")
 
+        logger.error("All model download URLs failed")
         return None
 
     def detect(self, frame: np.ndarray) -> Optional[dict]:
