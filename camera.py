@@ -1,7 +1,14 @@
+#!/usr/bin/env python3
+"""
+Camera Streaming Server for piStreamTracker
+Streams MJPEG video from Raspberry Pi Camera to network
+"""
+
 import io
 import logging
 import socketserver
 from http import server
+from pathlib import Path
 from threading import Condition
 
 import yaml
@@ -9,55 +16,83 @@ from picamera2 import Picamera2
 from picamera2.encoders import JpegEncoder
 from picamera2.outputs import FileOutput
 
-# Load config
-with open('../config.yaml', 'r') as f:
-    config = yaml.safe_load(f)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-camera_config = config['camera_server']
 
-# HTML page with video stream
-PAGE = f"""\
+def load_config(path: str = "config.yaml") -> dict:
+    """Load configuration from file."""
+    config_file = Path(path)
+    if config_file.exists():
+        with open(config_file) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+# Load configuration
+config = load_config()
+camera_cfg = config.get('camera', {})
+network_cfg = config.get('network', {})
+
+# Settings with defaults
+HOST = camera_cfg.get('host', '0.0.0.0')
+PORT = camera_cfg.get('port', 8000)
+WIDTH = camera_cfg.get('resolution', {}).get('width', 1280)
+HEIGHT = camera_cfg.get('resolution', {}).get('height', 960)
+CAMERA_IP = network_cfg.get('camera_ip', '192.168.100.1')
+
+
+# HTML page template
+HTML_PAGE = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Raspberry Pi Camera Stream</title>
+    <title>Pi Camera Stream</title>
     <style>
         body {{
             margin: 0;
             padding: 20px;
-            background-color: #222;
-            color: white;
-            font-family: Arial, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
             text-align: center;
         }}
-        h1 {{
-            color: #4CAF50;
+        h1 {{ color: #4ade80; margin-bottom: 10px; }}
+        .info {{
+            background: #16213e;
+            padding: 15px;
+            border-radius: 8px;
+            display: inline-block;
+            margin-bottom: 20px;
         }}
+        .info p {{ margin: 5px 0; font-size: 14px; color: #94a3b8; }}
         img {{
             max-width: 100%;
             height: auto;
-            border: 2px solid #4CAF50;
-        }}
-        .info {{
-            margin: 20px;
-            padding: 10px;
-            background-color: #333;
-            border-radius: 5px;
+            border: 2px solid #4ade80;
+            border-radius: 8px;
         }}
     </style>
 </head>
 <body>
-    <h1>Raspberry Pi Camera Stream</h1>
+    <h1>Pi Camera Stream</h1>
     <div class="info">
-        <p>Resolution: {camera_config['resolution']['width']} x {camera_config['resolution']['height']}</p>
-        <p>Server IP: {camera_config['host']}:{camera_config['port']}</p>
+        <p>Resolution: {WIDTH} x {HEIGHT}</p>
+        <p>Stream: http://{CAMERA_IP}:{PORT}/stream</p>
     </div>
-    <img src="stream" width="{camera_config['resolution']['width']}" height="{camera_config['resolution']['height']}" />
+    <br>
+    <img src="stream" width="{WIDTH}" height="{HEIGHT}" alt="Camera Stream">
 </body>
 </html>
 """
 
 
 class StreamingOutput(io.BufferedIOBase):
+    """Thread-safe streaming output buffer."""
+
     def __init__(self):
         self.frame = None
         self.condition = Condition()
@@ -69,18 +104,27 @@ class StreamingOutput(io.BufferedIOBase):
 
 
 class StreamingHandler(server.BaseHTTPRequestHandler):
+    """HTTP request handler for camera stream."""
+
+    output = None  # Set by main
+
+    def log_message(self, format, *args):
+        logger.debug(format % args)
+
     def do_GET(self):
         if self.path == '/':
             self.send_response(301)
             self.send_header('Location', '/index.html')
             self.end_headers()
+
         elif self.path == '/index.html':
-            content = PAGE.encode('utf-8')
+            content = HTML_PAGE.encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
             self.send_header('Content-Length', len(content))
             self.end_headers()
             self.wfile.write(content)
+
         elif self.path == '/stream':
             self.send_response(200)
             self.send_header('Age', 0)
@@ -88,60 +132,69 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_header('Pragma', 'no-cache')
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
             self.end_headers()
+
             try:
                 while True:
-                    with output.condition:
-                        output.condition.wait()
-                        frame = output.frame
+                    with self.output.condition:
+                        self.output.condition.wait()
+                        frame = self.output.frame
+
                     self.wfile.write(b'--FRAME\r\n')
                     self.send_header('Content-Type', 'image/jpeg')
                     self.send_header('Content-Length', len(frame))
                     self.end_headers()
                     self.wfile.write(frame)
                     self.wfile.write(b'\r\n')
+
             except Exception as e:
-                logging.warning(
-                    'Removed streaming client %s: %s',
-                    self.client_address, str(e))
+                logger.debug(f'Client disconnected: {self.client_address} - {e}')
+
         else:
             self.send_error(404)
             self.end_headers()
 
 
 class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
+    """Threaded HTTP server."""
     allow_reuse_address = True
     daemon_threads = True
 
 
-if __name__ == '__main__':
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
+def main():
+    logger.info("Initializing Raspberry Pi Camera...")
 
-    logging.info("Initializing Raspberry Pi Camera...")
+    # Initialize camera
     picam2 = Picamera2()
-    picam2.configure(picam2.create_video_configuration(main={"size": (camera_config['resolution']['width'], camera_config['resolution']['height'])}))
+    picam2.configure(picam2.create_video_configuration(
+        main={"size": (WIDTH, HEIGHT)}
+    ))
+
+    # Setup streaming
     output = StreamingOutput()
+    StreamingHandler.output = output
     picam2.start_recording(JpegEncoder(), FileOutput(output))
 
     try:
-        # Bind to all interfaces (0.0.0.0) so it's accessible from Ethernet
-        address = (camera_config['host'], camera_config['port'])
-        server = StreamingServer(address, StreamingHandler)
+        server = StreamingServer((HOST, PORT), StreamingHandler)
 
-        logging.info("=" * 60)
-        logging.info("Camera Server Started!")
-        logging.info("=" * 60)
-        logging.info(f"Stream URL: http://{camera_config['host']}:{camera_config['port']}/stream")
-        logging.info(f"Web Interface: http://{camera_config['host']}:{camera_config['port']}/")
-        logging.info("Press Ctrl+C to stop")
-        logging.info("=" * 60)
+        logger.info("=" * 50)
+        logger.info("Camera Server Started!")
+        logger.info("=" * 50)
+        logger.info(f"Resolution:    {WIDTH}x{HEIGHT}")
+        logger.info(f"Stream URL:    http://{CAMERA_IP}:{PORT}/stream")
+        logger.info(f"Web Interface: http://{CAMERA_IP}:{PORT}/")
+        logger.info("Press Ctrl+C to stop")
+        logger.info("=" * 50)
 
         server.serve_forever()
+
     except KeyboardInterrupt:
-        logging.info("\nShutting down camera server...")
+        logger.info("\nShutting down...")
+
     finally:
         picam2.stop_recording()
-        logging.info("Camera server stopped.")
+        logger.info("Camera server stopped")
+
+
+if __name__ == '__main__':
+    main()

@@ -1,361 +1,186 @@
+#!/usr/bin/env python3
+"""
+EV3 USB Communication Wrapper
+Simplified interface for controlling EV3 motors and sensors via USB
+"""
+
 import ev3_dc as ev3
 
+# Port mappings
+MOTOR_PORTS = {'a': ev3.PORT_A, 'b': ev3.PORT_B, 'c': ev3.PORT_C, 'd': ev3.PORT_D}
+SENSOR_PORTS = {1: ev3.PORT_1, 2: ev3.PORT_2, 3: ev3.PORT_3, 4: ev3.PORT_4}
 
-class EV3_USB():
+# LED colors and modes
+LED_MODES = {
+    ('off', None): ev3.LED_OFF,
+    ('red', 'static'): ev3.LED_RED,
+    ('red', 'flash'): ev3.LED_RED_FLASH,
+    ('red', 'pulse'): ev3.LED_RED_PULSE,
+    ('orange', 'static'): ev3.LED_ORANGE,
+    ('orange', 'flash'): ev3.LED_ORANGE_FLASH,
+    ('orange', 'pulse'): ev3.LED_ORANGE_PULSE,
+    ('green', 'static'): ev3.LED_GREEN,
+    ('green', 'flash'): ev3.LED_GREEN_FLASH,
+    ('green', 'pulse'): ev3.LED_GREEN_PULSE,
+}
+
+
+class Motor:
+    """Simple motor wrapper with intuitive interface."""
+
+    def __init__(self, motor):
+        self._motor = motor
+
+    def run(self, direction: int = 1, speed: int = 80):
+        """Run motor continuously at given speed."""
+        if not self._motor.busy:
+            self._motor.start_move(direction=direction, speed=speed)
+
+    def run_to(self, degrees: int, speed: int = 80):
+        """Rotate motor to specified degrees."""
+        if not self._motor.busy:
+            self._motor.start_move_by(degrees, speed=speed)
+
+    def stop(self):
+        """Stop the motor."""
+        if self._motor.busy:
+            self._motor.stop()
+
+    @property
+    def position(self) -> int:
+        """Get current motor position in degrees."""
+        return self._motor.position
+
+    @property
+    def busy(self) -> bool:
+        """Check if motor is currently moving."""
+        return self._motor.busy
+
+
+class EV3_USB:
+    """EV3 USB connection manager."""
+
     def __init__(self):
-        self.EV3 = ev3.EV3(protocol=ev3.USB)
+        self._ev3 = ev3.EV3(protocol=ev3.USB)
 
-    def Motor(self,port:str):
-            """
-            Initializes the requested Motor
+    def Motor(self, port: str) -> Motor:
+        """
+        Get motor on specified port.
 
-            Args:
-                `port` (str): Port of the motor -> a,b,c,d
+        Args:
+            port: Motor port ('a', 'b', 'c', or 'd')
 
-            Returns:
-                The Motor object with the provided port.
-            """
-            match port.lower():
-                case 'a':
-                    evport = ev3.PORT_A
-                case 'b':
-                    evport = ev3.PORT_B
-                case 'c':
-                    evport = ev3.PORT_C
-                case 'd':
-                    evport = ev3.PORT_D
-                case _:
-                    raise ValueError(f"Invalid motor port: {port}")
-            try:
-                motor = ev3.Motor(evport,protocol=ev3.USB,ev3_obj=self.EV3)
-            except Exception as e:
-                raise Exception(f"Error: {e}")
+        Returns:
+            Motor wrapper object
+        """
+        port = port.lower()
+        if port not in MOTOR_PORTS:
+            raise ValueError(f"Invalid motor port: {port}. Use 'a', 'b', 'c', or 'd'")
 
-            #create subclass for each motor
-            class MotorWrapper:
-                def __init__(self,motor):
-                    self.motor = motor
-
-                def run(self,direction = 1,speed = 80):
-                    """
-                    Starts motor with given propertys till its stoped
-
-                    Args:
-                        `direction` (int): direction of the wheels to spin -> 1,-1
-                        `speed` (int): speed of the motor to go -> 0-100
-                    """
-                    if  not self.motor.busy:
-                        self.motor.start_move(direction = direction,speed= speed)
-
-                def run_to(self,degrees,speed = 80):
-                    """
-                    Starts motor with given propertys till set angle is reached
-
-                    Args:
-                        `degrees` (int): number of degrees the wheel should turn
-                        `speed` (int): speed of the motor to go -> 0-100
-                    """
-                    if  not self.motor.busy:
-                        self.motor.start_move_by(degrees,speed= speed)
-
-                def stop(self):
-                    """
-                    Stops the motor -> (opposite of `run()`)
-                    """
-                    if self.motor.busy:
-                        self.motor.stop()
-
-            return MotorWrapper(motor)
+        motor = ev3.Motor(MOTOR_PORTS[port], protocol=ev3.USB, ev3_obj=self._ev3)
+        return Motor(motor)
 
     def Sensor(self, port: int, sensor_type: str):
         """
-        Initializes the requested sensor
+        Get sensor on specified port.
 
         Args:
-            `port` (int): Port of the sensor -> 1,2,3,4
-            `sensor_type` (str): Type of the sensor -> color,touch,ultrasonic,infrared,gyro
+            port: Sensor port (1, 2, 3, or 4)
+            sensor_type: Type of sensor ('color', 'touch', 'ultrasonic', 'infrared', 'gyro')
 
         Returns:
-            The sensor object with the provided port and type.
+            Sensor object
         """
-        #check the port
-        match port:
-            case 1:
-                evport = ev3.PORT_1
-            case 2:
-                evport = ev3.PORT_2
-            case 3:
-                evport = ev3.PORT_3
-            case 4:
-                evport = ev3.PORT_4
-            case _:
-                raise ValueError(f"Invalid sensor port: {port}")
+        if port not in SENSOR_PORTS:
+            raise ValueError(f"Invalid sensor port: {port}. Use 1, 2, 3, or 4")
 
-        #init the type
-        try:
-            match sensor_type.lower():
-                case 'color':
-                    color: ev3.Color = ev3.Color(port=evport,protocol=ev3.USB,ev3_obj=self.EV3)
-                    return color
-                case 'touch':
-                    touch: ev3.Touch = ev3.Touch(port=evport,protocol=ev3.USB,ev3_obj=self.EV3)
-                    return touch
-                case 'ultrasonic':
-                    ultrasonic: ev3.Ultrasonic = ev3.Ultrasonic(port=evport,protocol=ev3.USB,ev3_obj=self.EV3)
-                    return ultrasonic
-                case 'infrared':
-                    infrared: ev3.Infrared = ev3.Infrared(port=evport,protocol=ev3.USB,ev3_obj=self.EV3)
-                    return infrared
-                case 'gyro':
-                    gyro: ev3.Gyro = ev3.Gyro(port=evport,protocol=ev3.USB,ev3_obj=self.EV3)
-                    return gyro
-                case _:
-                    raise ValueError(f"Invalid sensor type: {sensor_type}")
-        except Exception as e:
-            raise Exception(f"Error: {e}")
+        ev_port = SENSOR_PORTS[port]
+        sensor_classes = {
+            'color': ev3.Color,
+            'touch': ev3.Touch,
+            'ultrasonic': ev3.Ultrasonic,
+            'infrared': ev3.Infrared,
+            'gyro': ev3.Gyro
+        }
 
-    def Led(self, color: str, led_type: str = 'static'):
+        sensor_type = sensor_type.lower()
+        if sensor_type not in sensor_classes:
+            raise ValueError(f"Invalid sensor type: {sensor_type}. Use: {', '.join(sensor_classes.keys())}")
+
+        return sensor_classes[sensor_type](port=ev_port, protocol=ev3.USB, ev3_obj=self._ev3)
+
+    def Led(self, color: str, mode: str = 'static'):
         """
-        Changes the color of the integrated LED
+        Set EV3 brick LED color and mode.
 
         Args:
-            `color` (str): name of the desired color -> red,orange,green
-            `led_type` (str): type of the LED -> flash,pulse,static(means just on),off
+            color: LED color ('red', 'orange', 'green', or 'off')
+            mode: LED mode ('static', 'flash', 'pulse')
         """
-        led = None
-        
-        if led_type == 'off':
-            led = ev3.LED_OFF
-        elif color == 'red':
-            if led_type == 'flash':
-                led = ev3.LED_RED_FLASH
-            elif led_type == 'pulse':
-                led = ev3.LED_RED_PULSE
-            elif led_type == 'static':
-                led = ev3.LED_RED
-        elif color == 'orange':
-            if led_type == 'flash':
-                led = ev3.LED_ORANGE_FLASH
-            elif led_type == 'pulse':
-                led = ev3.LED_ORANGE_PULSE
-            elif led_type == 'static':
-                led = ev3.LED_ORANGE
-        elif color == 'green':
-            if led_type == 'flash':
-                led = ev3.LED_GREEN_FLASH
-            elif led_type == 'pulse':
-                led = ev3.LED_GREEN_PULSE
-            elif led_type == 'static':
-                led = ev3.LED_GREEN
-        
-        if led is None:
-            raise ValueError(f"Invalid color: {color} or type: {led_type}")
+        if color == 'off':
+            led = LED_MODES[('off', None)]
+        else:
+            key = (color.lower(), mode.lower())
+            if key not in LED_MODES:
+                raise ValueError(f"Invalid LED color/mode: {color}/{mode}")
+            led = LED_MODES[key]
 
-        jk = ev3.Jukebox(protocol=ev3.USB,ev3_obj=self.EV3)
-        jk.change_color(led)
+        jukebox = ev3.Jukebox(protocol=ev3.USB, ev3_obj=self._ev3)
+        jukebox.change_color(led)
 
-    def Sound(self,volume=80):
+    def Sound(self, volume: int = 80):
         """
-        Initializes the Sound method
+        Get sound interface.
 
         Args:
-            `volume` (int): volume of the sound -> 0-100
+            volume: Sound volume (0-100)
 
         Returns:
-            The Sound object with the provided volume.
+            Jukebox object for playing sounds
         """
-        jk = ev3.Jukebox(protocol=ev3.USB,ev3_obj=self.EV3,volume=volume)
-        return jk
+        return ev3.Jukebox(protocol=ev3.USB, ev3_obj=self._ev3, volume=volume)
 
     def Voice(self):
         """
-        Initializes the Voice methods
+        Get text-to-speech interface.
+
+        Note: Requires WiFi connection on host PC.
 
         Returns:
-            The initialized Voice object with the right dependencies.
-
-        Dependencies:
-            Existing `Wifi` connection on the host PC.
+            Voice object for text-to-speech
         """
-        voice = ev3.Voice(protocol=ev3.USB,ev3_obj=self.EV3)
-        return voice
+        return ev3.Voice(protocol=ev3.USB, ev3_obj=self._ev3)
 
-    def Status(self):
+    def get_status(self) -> dict:
         """
-        Initializes the Status methods
+        Get status of all connected sensors and motors.
 
         Returns:
-            The initialized Status object with the right dependencies.
+            Dictionary with sensor/motor information
         """
-        class StatusWrapper:
-            def __init__(self,EV3,sensor,motor):
-                self.EV3 = EV3
-                self.sensor = sensor
-                self.motor = motor
-                self.types = {7: 'large_motor', 8: 'medium_motor', 16: 'touch', 29: 'color', 30: 'ultrasonic', 32: 'gyro', 33: 'infrared',124:'none',125:'none'}
+        self._ev3._physical_ev3.introspection(self._ev3._verbosity)
+        sensors = self._ev3._physical_ev3._introspection["sensors"]
 
-            @property
-            def sensors(self):
-                '''
-                all connected sensors and motors at all ports (as named tuple Sensors)
+        type_names = {
+            7: 'large_motor', 8: 'medium_motor',
+            16: 'touch', 29: 'color', 30: 'ultrasonic', 32: 'gyro', 33: 'infrared',
+            124: 'none', 125: 'none'
+        }
 
-                You can address a single one by e.g.:
-                ev3_dc.EV3.sensors.Port_3 or
-                ev3_dc.EV3.sensors.Port_C
-                '''
-                self.EV3._physical_ev3.introspection(self.EV3._verbosity)
-                return (
-                    self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_1]["type"],
-                    self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_2]["type"],
-                    self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_3]["type"],
-                    self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_4]["type"],
-                    self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_A_SENSOR]["type"],
-                    self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_B_SENSOR]["type"],
-                    self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_C_SENSOR]["type"],
-                    self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_D_SENSOR]["type"]
-                )
+        def get_type(type_id):
+            return type_names.get(type_id, f'unknown({type_id})' if type_id else None)
 
-            @property
-            def sensors_as_dict(self):
-                '''
-                all connected sensors and motors at all ports (as dict)
-
-                You can address a single one by e.g.:
-                ev3_dc.EV3.sensors_as_dict[ev3_dc.PORT_1] or
-                ev3_dc.EV3.sensors_as_dict[ev3_dc.PORT_A_SENSOR]
-                '''
-                self.EV3._physical_ev3.introspection(self.EV3._verbosity)
-                return {
-                    key: sensor["type"]
-                    for key, sensor in self.EV3._physical_ev3._introspection["sensors"].items()
-                }
-
-            @property
-            def get_only_sensors(self):
-                self.EV3._physical_ev3.introspection(self.EV3._verbosity)
-                return {
-                    'port_1':self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_1]["type"],
-                    'port_2':self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_2]["type"],
-                    'port_3':self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_3]["type"],
-                    'port_4':self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_4]["type"],
-                }
-
-            @property
-            def get_only_motors(self):
-                self.EV3._physical_ev3.introspection(self.EV3._verbosity)
-                return {
-                    'port_a':self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_A_SENSOR]["type"],
-                    'port_b':self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_B_SENSOR]["type"],
-                    'port_c':self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_C_SENSOR]["type"],
-                    'port_d':self.EV3._physical_ev3._introspection["sensors"][ev3.PORT_D_SENSOR]["type"]
-                }
-
-            def translate(self,dict):
-                try:
-                    r = {}
-                    for k, v in dict.items():
-                        if v != None:
-                            if v in self.types:
-                                r[k] = self.types[v]
-                            else:
-                                r[k] = v
-                        else:
-                            r[k] = v
-                    return r
-                except Exception as e:
-                    print(e)
-
-            def get_number_from_name_or_char(self,name):
-                char = False
-                val = name.split('_')[1]
-                if val.isalpha() and len(val) == 1:
-                    char = True
-                return val , char
-
-            def get_value_from_instance(self,name,port_name):
-                try:
-                    match name.lower():
-                        case 'color':
-                            sen = getattr(self, port_name)
-                            return self.translate_color(int(sen.color))
-                        case 'touch':
-                            sen = getattr(self, port_name)
-                            return sen.touched
-                        case 'ultrasonic':
-                            sen = getattr(self, port_name)
-                            return sen.distance
-                        case 'infrared':
-                            sen = getattr(self, port_name)
-                            return sen.distance
-                        case 'gyro':
-                            sen = getattr(self, port_name)
-                            return sen.angle
-                        case 'large_motor':
-                            sen = getattr(self, port_name)
-                            return sen.motor.position
-                        case 'medium_motor':
-                            sen = getattr(self, port_name)
-                            return sen.motor.position
-                        case _:
-                            raise ValueError(f"Invalid sensor type: {type}")
-                except Exception as e:
-                    raise Exception(f"Error: {e}")
-
-            def make_instance_get_value(self,dict):
-                try:
-                    r = {}
-                    for k, v in dict.items():
-                        digit , ischar = self.get_number_from_name_or_char(k)
-                        if v != None:
-                            if ischar:
-                                setattr(self,k,self.motor(str(digit)))
-                            else:
-                                setattr(self, k, self.sensor(int(digit),str(v)))
-                            r['data_'+str(digit)] = self.get_value_from_instance(str(v),k)
-                        else:
-                            r['data_'+str(digit)] = v
-                    return r
-                except Exception as e:
-                    print(e)
-
-            def translate_color(self,num):
-                match num:
-                    case 0:
-                        return 'nothing'
-                    case 1:
-                        return 'black'
-                    case 2:
-                        return 'blue'
-                    case 3:
-                        return 'green'
-                    case 4:
-                        return 'yellow'
-                    case 5:
-                        return 'red'
-                    case 6:
-                        return 'white'
-                    case 7:
-                        return 'brown'
-                    case _:
-                        return 'none'
-
-            @property
-            def get_sensor_data(self):
-                a = self.translate(self.get_only_sensors)
-                r = self.make_instance_get_value(a)
-                try:
-                    r = {**a,**r}
-                except Exception as e:
-                    print(e)
-                return r
-            @property
-            def get_motor_data(self):
-                a = self.translate(self.get_only_motors)
-                r = self.make_instance_get_value(a)
-                try:
-                    r = {**a,**r}
-                except Exception as e:
-                    print(e)
-                return r
-
-        return StatusWrapper(self.EV3,self.Sensor,self.Motor)
+        return {
+            'sensors': {
+                'port_1': get_type(sensors[ev3.PORT_1]["type"]),
+                'port_2': get_type(sensors[ev3.PORT_2]["type"]),
+                'port_3': get_type(sensors[ev3.PORT_3]["type"]),
+                'port_4': get_type(sensors[ev3.PORT_4]["type"]),
+            },
+            'motors': {
+                'port_a': get_type(sensors[ev3.PORT_A_SENSOR]["type"]),
+                'port_b': get_type(sensors[ev3.PORT_B_SENSOR]["type"]),
+                'port_c': get_type(sensors[ev3.PORT_C_SENSOR]["type"]),
+                'port_d': get_type(sensors[ev3.PORT_D_SENSOR]["type"]),
+            }
+        }

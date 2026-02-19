@@ -1,114 +1,137 @@
 # piStreamTracker
 
-Real-time human tracking using MoveNet pose estimation with EV3 motor control, optimized for Raspberry Pi 3B and 5.
+Real-time human tracking with MoveNet pose detection and EV3 motor control.
 
-## Architecture
+## Hardware Setup
 
-The system consists of two Raspberry Pi devices connected via Ethernet:
-- **Camera Pi** (`192.168.100.1`): Streams MJPEG video via HTTP
-- **Tracker Pi** (`192.168.100.2`): Processes stream, runs pose detection, controls EV3 motors
+| Device | Role | IP Address |
+|--------|------|------------|
+| **Raspberry Pi 3B+** | Camera streaming | 192.168.100.1 |
+| **Raspberry Pi 5** | Detection + EV3 control | 192.168.100.2 |
+| **EV3 Brick** | Motor control (USB to Pi 5) | - |
 
-## Performance Targets
+Connect the two Pis via Ethernet cable (direct connection or switch).
 
-| Device | Target FPS | Detection Scale | Detection Interval |
-|--------|-----------|-----------------|-------------------|
-| Pi 3B  | 20-24 FPS | 0.35            | 12 frames         |
-| Pi 5   | 30+ FPS   | 0.5             | 6 frames          |
+## Features
 
+- **MoveNet Lightning** pose detection on Pi 5
+- **EV3 motor control** for pan/tilt camera tracking
+- **Web interface** for remote control and monitoring
+- **MJPEG streaming** from Pi 3B+ to Pi 5
+- **One-command setup** with automatic configuration
 
-## Installation
+## Quick Start
 
-### Requirements
+### Setup
 
-- Python 3.12+
-- Raspberry Pi 3B/5 (aarch64 or armv7l)
-
-### Tracker Pi Setup
-
+**On Pi 3B+ (Camera):**
 ```bash
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install --upgrade pip
-pip install -r requirements.txt
+git clone https://github.com/yourusername/piStreamTracker.git
+cd piStreamTracker
+./setup.sh --camera
 ```
 
-### Camera Pi Setup
-
+**On Pi 5 (Tracker):**
 ```bash
-# Create virtual environment
-python3 -m venv venv
-source venv/activate
-
-# Install picamera2 (Pi camera library)
-pip install picamera2
+git clone https://github.com/yourusername/piStreamTracker.git
+cd piStreamTracker
+./setup.sh --tracker
 ```
 
-### MoveNet Model
+### Run
 
-The model downloads automatically on first run from TensorFlow Hub. Manual download:
-
+**1. Start Camera (Pi 3B+):**
 ```bash
-mkdir -p models
-wget -O models/movenet_lightning.tflite \
-    "https://storage.googleapis.com/tfhub-lite-models/google/lite-model/movenet/singlepose/lightning/tflite/float16/4.tflite"
-```
-
-## Usage
-
-### Camera Pi (Streaming)
-
-```bash
-# Start MJPEG stream server (requires root for network setup)
 sudo ./run_cam.sh
 ```
 
-The camera streams at `http://192.168.100.1:8000/stream` (1280x960 resolution).
-
-### Tracker Pi (Detection & Control)
-
+**2. Start Tracker (Pi 5):**
 ```bash
-# Raspberry Pi 3B (optimized for lower resources)
-sudo ./run_tracker.sh --pi3
-
-# Raspberry Pi 5 (higher quality detection)
+# With display
 sudo ./run_tracker.sh --pi5
 
-# Custom settings
-sudo python3 tracker.py --url http://192.168.100.1:8000/stream
+# Or with web interface (headless)
+sudo ./run_tracker.sh --web
 ```
 
-> **Note**: Root privileges are required to configure the network interface.
+## Architecture
 
-### Command-Line Options
+```
+┌─────────────────┐  Ethernet   ┌─────────────────┐
+│  Pi 3B+ Camera  │   MJPEG     │    Pi 5         │
+│  192.168.100.1  │────────────►│  192.168.100.2  │
+│                 │             │                 │
+│  • Pi Camera    │             │  • MoveNet      │
+│  • Stream Server│             │  • OpenCV       │
+└─────────────────┘             │  • Web UI       │
+                                └────────┬────────┘
+                                         │ USB
+                                ┌────────▼────────┐
+                                │    EV3 Brick    │
+                                │  Port A: Pan    │
+                                │  Port B: Tilt   │
+                                └─────────────────┘
+```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--url` | `http://192.168.100.1:8000/stream` | Video stream URL |
-| `--output-dir` | `recordings` | Output directory for recordings |
-| `--detection-interval` | `8` | Run detection every N frames (higher=faster) |
-| `--process-scale` | `0.5` | Frame scale for detection (0.2-1.0) |
-| `--confidence-threshold` | `0.5` | Detection confidence threshold |
-| `--keypoint-threshold` | `0.3` | Keypoint visibility threshold |
-| `--movenet-model` | auto | Path to MoveNet TFLite model |
-| `--movenet-threads` | auto | Inference threads (default: half CPU cores) |
-| `--no-display` | false | Headless mode (no video window) |
-| `--no-auto-record` | false | Disable auto-recording on start |
-| `--verbose` | false | Enable verbose logging |
+## Configuration
 
-### EV3 Motor Control Options
+All settings in `config.yaml`:
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--ev3-deadzone-x` | `90` | Horizontal deadzone (pixels) |
-| `--ev3-deadzone-y` | `90` | Vertical deadzone (pixels) |
-| `--ev3-speed-factor` | `1.0` | Motor speed multiplier (0.1-2.0) |
-| `--ev3-max-speed` | `50` | Maximum motor speed (1-100) |
-| `--ev3-invert-x` | false | Invert horizontal direction |
-| `--ev3-invert-y` | false | Invert vertical direction |
-| `--ev3-cooldown` | `0.5` | Motor command cooldown (seconds) |
+```yaml
+network:
+  camera_ip: "192.168.100.1"
+  tracker_ip: "192.168.100.2"
+
+camera:
+  port: 8000
+  resolution: {width: 1280, height: 960}
+
+tracker:
+  detection:
+    interval: 8         # Frames between detections
+    scale: 0.5          # Processing scale (lower = faster)
+    confidence: 0.5     # Detection threshold
+
+ev3:
+  enabled: true
+  deadzone: {x: 90, y: 90}
+  max_speed: 50
+  ports: {pan: "a", tilt: "b"}
+
+web:
+  port: 5000
+```
+
+## Web Interface
+
+Access at `http://192.168.100.2:5000`
+
+- Live video stream with overlay
+- Start/stop tracking
+- Recording controls
+- EV3 motor adjustments
+- Detection tuning
+
+## Command-Line Options
+
+```bash
+python tracker.py [OPTIONS]
+
+# Stream
+--url URL              Video stream URL
+--config FILE          Config file path
+
+# Detection
+--detection-interval N   Frames between detections (default: 8)
+--process-scale N        Scale factor 0.2-1.0 (default: 0.5)
+--confidence N           Confidence threshold (default: 0.5)
+--movenet-threads N      Inference threads
+
+# Display
+--no-display            Headless mode
+--auto-record           Auto-start recording
+--no-ev3                Disable EV3
+```
 
 ## Keyboard Controls
 
@@ -116,76 +139,58 @@ sudo python3 tracker.py --url http://192.168.100.1:8000/stream
 |-----|--------|
 | `q` | Quit |
 | `r` | Toggle recording |
-| `s` | Take screenshot |
-| `d` | Force detection reset |
-| `e` | Toggle EV3 connection |
+| `s` | Screenshot |
+| `d` | Reset detection |
+| `e` | Toggle EV3 |
 
-## Performance Tuning
+## Performance Tuning (Pi 5)
 
-### For Higher FPS (less accurate tracking)
-
+**Default (balanced):**
 ```bash
-python3 tracker.py \
-    --detection-interval 15 \
-    --process-scale 0.3 \
-    --keypoint-threshold 0.4
+sudo ./run_tracker.sh
 ```
 
-### For Better Accuracy (lower FPS)
-
+**Fast mode (higher FPS):**
 ```bash
-python3 tracker.py \
-    --detection-interval 4 \
-    --process-scale 0.6 \
-    --confidence-threshold 0.6
+sudo ./run_tracker.sh --fast
 ```
 
-### Headless Mode (Maximum FPS)
-
+**Quality mode (better accuracy):**
 ```bash
-python3 tracker.py --no-display --no-auto-record
+sudo ./run_tracker.sh --quality
 ```
 
-## EV3 Motor Setup
-
-Motors should be connected to the EV3 brick:
-- **Port A**: Horizontal (pan) motor
-- **Port B**: Vertical (tilt) motor
-
-The EV3 brick connects to the Tracker Pi via USB.
+**Headless (maximum FPS):**
+```bash
+python tracker.py --no-display
+```
 
 ## Troubleshooting
 
-### Low FPS
+**Low FPS:** Reduce `--process-scale` or increase `--detection-interval`
 
-1. Reduce `--process-scale` (try 0.3)
-2. Increase `--detection-interval` (try 15)
-3. Run with `--no-display` to check if display is bottleneck
-4. Ensure CPU governor is set to `performance`:
-   ```bash
-   sudo cpufreq-set -g performance
-   ```
+**No detection:** Lower `--confidence` threshold
 
-### Detection Not Working
+**EV3 not connecting:** Check USB connection, ensure `ev3-dc` is installed
 
-1. Ensure MoveNet model exists in `models/` directory (auto-downloads on first run)
-2. Lower `--confidence-threshold` (try 0.4)
-3. Verify stream URL is accessible: `curl http://192.168.100.1:8000/stream`
+**Network issues:** Verify IPs with `ping 192.168.100.1`
 
-### EV3 Not Connecting
+## Project Structure
 
-1. Check USB connection between EV3 and Tracker Pi
-2. Ensure EV3 is powered on
-3. Verify `ev3-dc` is installed: `pip show ev3-dc`
-4. Check motor ports (A=horizontal, B=vertical)
+```
+piStreamTracker/
+├── config.yaml       # All settings
+├── tracker.py        # Main tracking application
+├── camera.py         # Camera streaming server
+├── web.py            # Web interface
+├── ev3_usb.py        # EV3 communication wrapper
+├── setup.sh          # One-command setup
+├── run_tracker.sh    # Run tracker
+├── run_cam.sh        # Run camera server
+├── requirements.txt  # Python dependencies
+└── models/           # MoveNet model (auto-downloads)
+```
 
-### Network Issues
+## License
 
-1. Verify both Pis are on the same network segment
-2. Check IP assignments: Camera Pi should be `192.168.100.1`, Tracker Pi should be `192.168.100.2`
-3. Test connectivity: `ping 192.168.100.1` from Tracker Pi
-
-## Logging
-
-The tracker logs to both console and `tracker.log` file. Position shifts are logged to a separate file with batched writes for performance.
-
+MIT

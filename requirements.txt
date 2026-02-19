@@ -1,18 +1,25 @@
-# Core dependencies for Raspberry Pi tracker
-# Pin OpenCV 4.9.x - last version compatible with NumPy 1.x
-opencv-contrib-python>=4.8.0,<4.10.0  # Includes tracking modules (MOSSE, KCF, CSRT)
-numpy>=1.20.0,<2.0.0   # NumPy 2.x breaks tflite-runtime on Pi
+# piStreamTracker Dependencies
+# Install with: pip install -r requirements.txt
 
-# EV3 control
-ev3-dc
+# Core
+pyyaml>=6.0
 
-# Camera (Pi only)
-picamera2; platform_machine == "aarch64" or platform_machine == "armv7l"
+# Computer Vision (pin OpenCV 4.9.x - last version compatible with NumPy 1.x)
+opencv-contrib-python>=4.8.0,<4.10.0
+numpy>=1.20.0,<2.0.0
 
-# TFLite runtime (faster than full TensorFlow on Pi)
-# For Raspberry Pi, install via: pip install tflite-runtime
-# Or for x86: pip install tflite-runtime-cpu
+# EV3 Motor Control
+ev3-dc>=0.9.6
+
+# TFLite Runtime (faster than full TensorFlow on Pi)
+# Auto-installs based on platform
 tflite-runtime; platform_machine == "aarch64" or platform_machine == "armv7l"
 
-# Optional: for local development on x86
-# tensorflow; platform_machine == "x86_64"
+# Camera Server (Pi only)
+picamera2; platform_machine == "aarch64" or platform_machine == "armv7l"
+
+# Web Interface
+flask>=2.0.0
+
+# Optional: Full TensorFlow for development on x86
+# tensorflow>=2.10.0; platform_machine == "x86_64"
