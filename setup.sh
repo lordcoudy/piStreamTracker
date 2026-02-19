@@ -90,11 +90,11 @@ install_system_deps() {
     # Common dependencies
     sudo apt-get install -y -qq \
         python3 python3-pip python3-venv \
-        libatlas-base-dev libhdf5-dev libhdf5-serial-dev \
+        libopenblas-dev libhdf5-dev libhdf5-serial-dev \
         libjpeg-dev libpng-dev libtiff-dev \
         libavcodec-dev libavformat-dev libswscale-dev \
         libv4l-dev libxvidcore-dev libx264-dev \
-        libfontconfig1-dev libcairo2-dev libgdk-pixbuf2.0-dev \
+        libfontconfig1-dev libcairo2-dev libgdk-pixbuf-2.0-dev \
         libpango1.0-dev libgtk-3-dev libopenblas-dev \
         python3-dev
 
