@@ -650,7 +650,7 @@ class HumanTracker:
             }
 
         self.current_detection = detection
-        annotated = self._draw(frame, detection)
+        annotated = self._draw(frame.copy(), detection)
 
         return annotated, detection
 
