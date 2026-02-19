@@ -799,9 +799,9 @@ class HumanTracker:
                     continue
 
                 rec_frame = frame.copy() if self.recording else None
+                self.write_frame(rec_frame)
                 annotated, _ = self.process_frame(frame)
                 self.update_fps()
-                self.write_frame(rec_frame)
 
                 if display:
                     # Status overlay
