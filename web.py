@@ -987,13 +987,14 @@ def _run_tracker_loop():
                 time.sleep(0.01)
                 continue
 
+            rec_frame = frame.copy() if _tracker.recording else None
             annotated, _ = _tracker.process_frame(frame)
 
             with _frame_lock:
                 _latest_frame = annotated.copy()
 
             _tracker.update_fps()
-            _tracker.write_frame(annotated)
+            _tracker.write_frame(rec_frame)
 
     except Exception as e:
         logger.error(f"Tracker loop error: {e}")
