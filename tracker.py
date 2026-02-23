@@ -7,7 +7,9 @@ Optimized MoveNet pose detection with EV3 motor control
 import argparse
 import logging
 import os
+import shutil
 import ssl
+import subprocess
 import time
 import urllib.request
 from collections import deque
@@ -498,28 +500,115 @@ class ObjectTracker:
 
 
 # =============================================================================
-# Recording Thread
+# Recording — ffmpeg pipe with hardware-accelerated H.264
 # =============================================================================
 
-class _RecordingThread:
-    """Writes frames to a VideoWriter at a fixed, stable framerate.
+def _probe_encoder() -> str:
+    """Return the best available ffmpeg H.264 encoder.
 
-    Runs in its own thread, ticking at exactly ``1/fps`` intervals.
-    If the main loop is slower than the target FPS the last available frame
-    is repeated so the output file always has a constant frame rate.
-    If the main loop is faster, extra frames are simply dropped.
+    Preference order:
+      1. h264_v4l2m2m  — Pi hardware encoder (near-zero CPU)
+      2. libx264       — CPU-based but vastly more efficient than MJPG
+
+    Returns the encoder name or '' if ffmpeg is not available.
+    """
+    if not shutil.which('ffmpeg'):
+        return ''
+
+    for enc in ('h264_v4l2m2m', 'libx264'):
+        try:
+            r = subprocess.run(
+                ['ffmpeg', '-hide_banner', '-encoders'],
+                capture_output=True, text=True, timeout=5,
+            )
+            if enc in r.stdout:
+                logger.info(f"Detected ffmpeg encoder: {enc}")
+                return enc
+        except Exception:
+            continue
+    return ''
+
+
+class _RecordingThread:
+    """Writes frames at a fixed framerate via an ffmpeg subprocess pipe.
+
+    Uses hardware-accelerated H.264 when available (h264_v4l2m2m on Pi 5),
+    falling back to software libx264 ultrafast, then to the legacy OpenCV
+    MJPG writer as a last resort.
+
+    The thread ticks at exactly ``1/fps`` intervals.  If the main loop is
+    slower than the target FPS the last available frame is repeated so the
+    output file always has a constant frame rate.
     """
 
-    def __init__(self, writer: cv2.VideoWriter, fps: float):
-        self._writer = writer
+    def __init__(self, path: str, width: int, height: int, fps: float,
+                 encoder: str = 'auto'):
         self._interval = 1.0 / max(fps, 1.0)
         self._frame: Optional[np.ndarray] = None
         self._lock = Lock()
         self._stop = Event()
         self._thread: Optional[Thread] = None
+        self._proc: Optional[subprocess.Popen] = None
+        self._cv_writer: Optional[cv2.VideoWriter] = None
+        self._width = width
+        self._height = height
+
+        self._init_writer(path, width, height, fps, encoder)
+
+    # ---- writer init with fallback chain -----------------------------
+
+    def _init_writer(self, path: str, w: int, h: int, fps: float,
+                     encoder: str):
+        """Try ffmpeg pipe first, fall back to OpenCV MJPG."""
+        if encoder == 'auto':
+            encoder = _probe_encoder()
+
+        if encoder:
+            try:
+                self._start_ffmpeg(path, w, h, fps, encoder)
+                return
+            except Exception as e:
+                logger.warning(f"ffmpeg ({encoder}) failed: {e} — falling back")
+
+        # Fallback: OpenCV MJPG
+        logger.info("Using fallback OpenCV MJPG recorder")
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+        fallback_path = path.rsplit('.', 1)[0] + '.avi'
+        self._cv_writer = cv2.VideoWriter(fallback_path, fourcc, fps, (w, h))
+
+    def _start_ffmpeg(self, path: str, w: int, h: int, fps: float,
+                      encoder: str):
+        """Launch ffmpeg as a subprocess accepting raw BGR frames on stdin."""
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{w}x{h}',
+            '-r', str(fps),
+            '-i', 'pipe:0',
+            '-c:v', encoder,
+        ]
+        if encoder == 'libx264':
+            cmd += ['-preset', 'ultrafast', '-crf', '23']
+        elif encoder == 'h264_v4l2m2m':
+            cmd += ['-b:v', '4M']
+
+        cmd += [
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            path,
+        ]
+
+        logger.info(f"Recording via ffmpeg [{encoder}]: {path}")
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+
+    # ---- public API --------------------------------------------------
 
     def update_frame(self, frame: np.ndarray):
-        """Feed the latest annotated frame (non-blocking)."""
+        """Feed the latest frame (non-blocking)."""
         with self._lock:
             self._frame = frame
 
@@ -530,11 +619,34 @@ class _RecordingThread:
         self._thread.start()
 
     def stop(self):
-        """Stop the recording thread and flush the writer."""
+        """Stop the recording thread and flush/close the writer."""
         self._stop.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=max(self._interval * 4, 1.0))
-        self._writer.release()
+            self._thread.join(timeout=max(self._interval * 4, 2.0))
+
+        if self._proc and self._proc.stdin:
+            try:
+                self._proc.stdin.close()
+                self._proc.wait(timeout=10)
+            except Exception as e:
+                logger.debug(f"ffmpeg close: {e}")
+                self._proc.kill()
+
+        if self._cv_writer:
+            self._cv_writer.release()
+
+    # ---- internal ----------------------------------------------------
+
+    def _write(self, frame: np.ndarray):
+        """Write one frame to whichever backend is active."""
+        if self._proc and self._proc.stdin:
+            try:
+                self._proc.stdin.write(frame.tobytes())
+            except BrokenPipeError:
+                logger.warning("ffmpeg pipe broken — stopping recording")
+                self._stop.set()
+        elif self._cv_writer:
+            self._cv_writer.write(frame)
 
     def _run(self):
         next_tick = time.monotonic()
@@ -548,7 +660,7 @@ class _RecordingThread:
             with self._lock:
                 frame = self._frame
             if frame is not None:
-                self._writer.write(frame)
+                self._write(frame)
 
 
 # =============================================================================
@@ -594,11 +706,14 @@ class HumanTracker:
         self.recording = False
         self.current_detection = None
         self.frame_count = 0
-        self._video_writer = None
         self._rec_thread: Optional[_RecordingThread] = None
         self._fps_count = 0
         self._fps_time = time.monotonic()
         self._fps = 0.0
+
+        # Recording mode: 'local' (Pi 5) or 'camera' (Pi 3B+)
+        self.recording_mode = tracker_cfg.get('recording_mode', 'local')
+        self._camera_base_url = f"http://{net['camera_ip']}:{cam['port']}"
 
         # Frame buffers
         self._scale_inv = 1.0 / self.process_scale
@@ -725,32 +840,69 @@ class HumanTracker:
         return frame
 
     def start_recording(self):
-        """Start video recording at a fixed, stable framerate."""
+        """Start video recording.
+
+        In 'local' mode: records on Pi 5 via ffmpeg with hardware H.264
+        encoding when available, falling back to software H.264 / MJPG.
+
+        In 'camera' mode: triggers hardware H.264 recording on Pi 3B+
+        via HTTP API — zero CPU cost on the tracker Pi.
+        """
         if self.recording:
             return
 
+        if self.recording_mode == 'camera':
+            try:
+                req = urllib.request.Request(
+                    f"{self._camera_base_url}/record/start",
+                    method='POST', data=b'',
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    import json
+                    info = json.loads(resp.read())
+                self.recording = True
+                logger.info(f"Camera-side recording started: {info.get('file')}")
+            except Exception as e:
+                logger.error(f"Failed to start camera recording: {e}")
+                logger.info("Falling back to local recording")
+                self._start_local_recording()
+        else:
+            self._start_local_recording()
+
+    def _start_local_recording(self):
+        """Start local ffmpeg-based recording on tracker Pi."""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = self.output_dir / f"rec_{ts}.avi"
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        self._video_writer = cv2.VideoWriter(
-            str(path), fourcc, self.recording_fps,
-            (self.capture.width, self.capture.height)
+        path = self.output_dir / f"rec_{ts}.mp4"
+        encoder = self.config['tracker'].get('recording_encoder', 'auto')
+
+        self._rec_thread = _RecordingThread(
+            str(path), self.capture.width, self.capture.height,
+            self.recording_fps, encoder=encoder,
         )
-        if self._video_writer.isOpened():
-            self._rec_thread = _RecordingThread(self._video_writer, self.recording_fps)
-            self._rec_thread.start()
-            self.recording = True
-            logger.info(f"Recording: {path}  ({self.recording_fps:.0f} fps)")
+        self._rec_thread.start()
+        self.recording = True
+        logger.info(f"Recording: {path}  ({self.recording_fps:.0f} fps)")
 
     def stop_recording(self):
         """Stop video recording."""
         if not self.recording:
             return
         self.recording = False
+
+        if self.recording_mode == 'camera':
+            try:
+                req = urllib.request.Request(
+                    f"{self._camera_base_url}/record/stop",
+                    method='POST', data=b'',
+                )
+                urllib.request.urlopen(req, timeout=5)
+                logger.info("Camera-side recording stopped")
+            except Exception as e:
+                logger.warning(f"Failed to stop camera recording: {e}")
+
         if self._rec_thread:
-            self._rec_thread.stop()   # flushes & releases VideoWriter
+            self._rec_thread.stop()
             self._rec_thread = None
-        self._video_writer = None
         logger.info("Recording stopped")
 
     def screenshot(self, frame: np.ndarray):

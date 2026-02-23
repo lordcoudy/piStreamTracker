@@ -16,6 +16,7 @@ network:
 camera:
   host: "0.0.0.0"
   port: 8000
+  recording_dir: "recordings"   # Server-side recording output (used when recording_mode: camera)
   resolution:
     width: 1280
     height: 960
@@ -25,6 +26,19 @@ tracker:
   stream_url: null  # Auto: http://192.168.100.1:8000/stream
   output_dir: "recordings"
   recording_fps: 30  # Fixed output framerate for recordings (stable regardless of processing speed)
+
+  # Recording encoder — controls CPU vs hardware encoding
+  #   "auto"            — auto-detect best encoder (recommended)
+  #   "h264_v4l2m2m"    — Pi hardware H.264 (near-zero CPU, requires ffmpeg)
+  #   "libx264"         — Software H.264 ultrafast (low CPU, requires ffmpeg)
+  #   "mjpg"            — Legacy OpenCV MJPG (high CPU, no ffmpeg needed)
+  recording_encoder: "auto"
+
+  # Recording mode — where encoding happens
+  #   "local"   — record on tracker Pi 5 (default, uses recording_encoder above)
+  #   "camera"  — offload to camera Pi 3B+ via HTTP API (zero tracker CPU cost,
+  #               uses Pi's hardware H.264 encoder, saves files on the camera Pi)
+  recording_mode: "local"
 
   # Detection settings (Pi 5 can handle higher quality)
   detection:

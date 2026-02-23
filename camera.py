@@ -5,16 +5,19 @@ Streams MJPEG video from Raspberry Pi Camera to network
 """
 
 import io
+import json
 import logging
 import socketserver
+import time
+from datetime import datetime
 from http import server
 from pathlib import Path
-from threading import Condition
+from threading import Condition, Lock
 
 import yaml
 from picamera2 import Picamera2
-from picamera2.encoders import JpegEncoder
-from picamera2.outputs import FileOutput
+from picamera2.encoders import H264Encoder, JpegEncoder
+from picamera2.outputs import FfmpegOutput, FileOutput
 
 # Configure logging
 logging.basicConfig(
@@ -44,6 +47,8 @@ PORT = camera_cfg.get('port', 8000)
 WIDTH = camera_cfg.get('resolution', {}).get('width', 1280)
 HEIGHT = camera_cfg.get('resolution', {}).get('height', 960)
 CAMERA_IP = network_cfg.get('camera_ip', '192.168.100.1')
+OUTPUT_DIR = Path(camera_cfg.get('recording_dir', 'recordings'))
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 # HTML page template
@@ -103,10 +108,57 @@ class StreamingOutput(io.BufferedIOBase):
             self.condition.notify_all()
 
 
+class CameraRecorder:
+    """Server-side H.264 recording using picamera2's hardware encoder.
+
+    This offloads recording entirely from the tracker Pi.  The Pi 3B+
+    camera hardware encodes H.264 at near-zero CPU cost.
+    """
+
+    def __init__(self, picam2: Picamera2, output_dir: Path):
+        self._picam2 = picam2
+        self._output_dir = output_dir
+        self._encoder: H264Encoder | None = None
+        self._output: FfmpegOutput | None = None
+        self._lock = Lock()
+        self.recording = False
+        self.current_file: str | None = None
+
+    def start(self, fps: int = 30, bitrate: int = 4_000_000) -> str:
+        """Start H.264 recording.  Returns the filename."""
+        with self._lock:
+            if self.recording:
+                return self.current_file
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = self._output_dir / f"cam_rec_{ts}.mp4"
+            self._encoder = H264Encoder(bitrate=bitrate)
+            self._output = FfmpegOutput(str(path))
+            self._picam2.start_encoder(self._encoder, self._output)
+            self.recording = True
+            self.current_file = str(path)
+            logger.info(f"Camera recording started: {path}")
+            return self.current_file
+
+    def stop(self) -> None:
+        """Stop recording."""
+        with self._lock:
+            if not self.recording:
+                return
+            try:
+                self._picam2.stop_encoder(self._encoder)
+            except Exception as e:
+                logger.warning(f"Stop encoder error: {e}")
+            self.recording = False
+            logger.info(f"Camera recording stopped: {self.current_file}")
+            self.current_file = None
+
+
 class StreamingHandler(server.BaseHTTPRequestHandler):
-    """HTTP request handler for camera stream."""
+    """HTTP request handler for camera stream and recording control."""
 
     output = None  # Set by main
+    recorder = None  # Set by main
 
     def log_message(self, format, *args):
         logger.debug(format % args)
@@ -149,9 +201,42 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             except Exception as e:
                 logger.debug(f'Client disconnected: {self.client_address} - {e}')
 
+        elif self.path == '/record/status':
+            self._json_response({
+                'recording': self.recorder.recording if self.recorder else False,
+                'file': self.recorder.current_file if self.recorder else None,
+            })
+
         else:
             self.send_error(404)
             self.end_headers()
+
+    def do_POST(self):
+        if self.path == '/record/start':
+            if not self.recorder:
+                self._json_response({'error': 'recorder not available'}, 500)
+                return
+            fname = self.recorder.start()
+            self._json_response({'recording': True, 'file': fname})
+
+        elif self.path == '/record/stop':
+            if not self.recorder:
+                self._json_response({'error': 'recorder not available'}, 500)
+                return
+            self.recorder.stop()
+            self._json_response({'recording': False})
+
+        else:
+            self.send_error(404)
+            self.end_headers()
+
+    def _json_response(self, data: dict, code: int = 200):
+        body = json.dumps(data).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(body))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
@@ -174,8 +259,12 @@ def main():
     StreamingHandler.output = output
     picam2.start_recording(JpegEncoder(), FileOutput(output))
 
+    # Setup server-side recorder (hardware H.264)
+    recorder = CameraRecorder(picam2, OUTPUT_DIR)
+    StreamingHandler.recorder = recorder
+
     try:
-        server = StreamingServer((HOST, PORT), StreamingHandler)
+        srv = StreamingServer((HOST, PORT), StreamingHandler)
 
         logger.info("=" * 50)
         logger.info("Camera Server Started!")
@@ -183,15 +272,18 @@ def main():
         logger.info(f"Resolution:    {WIDTH}x{HEIGHT}")
         logger.info(f"Stream URL:    http://{CAMERA_IP}:{PORT}/stream")
         logger.info(f"Web Interface: http://{CAMERA_IP}:{PORT}/")
+        logger.info(f"Record API:    POST /record/start  POST /record/stop")
+        logger.info(f"Recordings:    {OUTPUT_DIR}/")
         logger.info("Press Ctrl+C to stop")
         logger.info("=" * 50)
 
-        server.serve_forever()
+        srv.serve_forever()
 
     except KeyboardInterrupt:
         logger.info("\nShutting down...")
 
     finally:
+        recorder.stop()
         picam2.stop_recording()
         logger.info("Camera server stopped")
 
