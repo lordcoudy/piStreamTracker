@@ -63,6 +63,16 @@ class EV3_USB:
     def __init__(self):
         self._ev3 = ev3.EV3(protocol=ev3.USB)
 
+    def close(self):
+        """Properly close the USB connection to the EV3 brick."""
+        if self._ev3 is None:
+            return
+        try:
+            self._ev3.__del__()
+        except Exception:
+            pass
+        self._ev3 = None
+
     def Motor(self, port: str) -> Motor:
         """
         Get motor on specified port.

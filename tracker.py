@@ -42,7 +42,7 @@ def load_config(config_path: str = "config.yaml") -> dict:
         'camera': {'port': 8000},
         'tracker': {
             'output_dir': 'recordings',
-            'detection': {'interval': 8, 'scale': 0.5, 'confidence': 0.5, 'keypoint_threshold': 0.3},
+            'detection': {'interval': 10, 'scale': 0.4, 'confidence': 0.5, 'keypoint_threshold': 0.3},
             'movenet': {'model_path': None, 'threads': None}
         },
         'ev3': {
@@ -315,6 +315,140 @@ class PoseDetector:
 
 
 # =============================================================================
+# Async Detection Thread
+# =============================================================================
+
+class AsyncDetector:
+    """Runs pose detection in a background thread so the main loop never blocks.
+
+    The main loop submits frames via :meth:`submit` (non-blocking) and polls
+    for results via :meth:`get_result` (also non-blocking).  The heavy
+    MoveNet inference happens entirely inside the worker thread.
+    """
+
+    def __init__(self, detector: PoseDetector, process_scale: float,
+                 frame_width: int, frame_height: int):
+        self._detector = detector
+        self._process_scale = process_scale
+        self._scale_inv = 1.0 / process_scale
+        self._frame_w = frame_width
+        self._frame_h = frame_height
+
+        # Inter-thread communication
+        self._submit_lock = Lock()
+        self._result_lock = Lock()
+        self._pending_frame: Optional[np.ndarray] = None
+        self._result: Optional[dict] = None
+        self._new_result = False
+        self._busy = False
+
+        self._stop = Event()
+        self._has_frame = Event()
+        self._thread = Thread(target=self._run, daemon=True,
+                              name="AsyncDetector")
+
+        # Pre-allocate scaled buffer once
+        if process_scale < 1.0:
+            sh = int(frame_height * process_scale)
+            sw = int(frame_width * process_scale)
+            self._scaled_buf = np.empty((sh, sw, 3), dtype=np.uint8)
+        else:
+            self._scaled_buf = None
+
+    # -- public API (called from main thread) --------------------------------
+
+    def start(self):
+        self._stop.clear()
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._has_frame.set()  # unblock the worker if waiting
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def submit(self, frame: np.ndarray):
+        """Submit a frame for background detection (non-blocking).
+
+        The frame is **copied** internally so the caller can reuse its buffer.
+        If the detector is already busy, the new frame silently replaces the
+        pending one (latest-wins).
+        """
+        with self._submit_lock:
+            self._pending_frame = frame.copy()
+        self._has_frame.set()
+
+    def get_result(self) -> Optional[dict]:
+        """Return the latest detection result, or *None* if nothing new."""
+        with self._result_lock:
+            if self._new_result:
+                self._new_result = False
+                return self._result
+        return None
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    # -- worker thread -------------------------------------------------------
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._has_frame.wait(timeout=0.5)
+            if self._stop.is_set():
+                break
+            self._has_frame.clear()
+
+            with self._submit_lock:
+                frame = self._pending_frame
+                self._pending_frame = None
+            if frame is None:
+                continue
+
+            self._busy = True
+            result = self._detect(frame)
+            self._busy = False
+
+            with self._result_lock:
+                self._result = result
+                self._new_result = True
+
+    def _detect(self, frame: np.ndarray) -> Optional[dict]:
+        """Run detection (called inside worker thread)."""
+        if self._process_scale < 1.0 and self._scaled_buf is not None:
+            cv2.resize(frame,
+                       (self._scaled_buf.shape[1], self._scaled_buf.shape[0]),
+                       dst=self._scaled_buf,
+                       interpolation=cv2.INTER_AREA)
+            small = self._scaled_buf
+        else:
+            small = frame
+
+        det = self._detector.detect(small)
+        if det is None:
+            return None
+
+        # Scale coordinates back to original frame size
+        w, h = self._frame_w, self._frame_h
+        x, y, bw, bh = det['bbox']
+        x = int(x * self._scale_inv)
+        y = int(y * self._scale_inv)
+        bw = int(bw * self._scale_inv)
+        bh = int(bh * self._scale_inv)
+
+        x = max(0, min(x, w - 1))
+        y = max(0, min(y, h - 1))
+        bw = min(bw, w - x)
+        bh = min(bh, h - y)
+
+        if det['keypoints'] is not None:
+            det['keypoints'][:, :2] *= self._scale_inv
+
+        det['bbox'] = (x, y, bw, bh)
+        return det
+
+
+# =============================================================================
 # EV3 Motor Controller
 # =============================================================================
 
@@ -422,7 +556,13 @@ class MotorController:
                     self._ev3.Led('orange', 'static')
             except Exception:
                 pass
-            self._ev3 = self._pan = self._tilt = None
+            try:
+                if self._ev3:
+                    self._ev3.close()
+            except Exception:
+                pass
+            self._pan = self._tilt = None
+            self._ev3 = None
             self.connected = False
             logger.info("EV3 disconnected")
 
@@ -715,9 +855,8 @@ class HumanTracker:
         self.recording_mode = tracker_cfg.get('recording_mode', 'local')
         self._camera_base_url = f"http://{net['camera_ip']}:{cam['port']}"
 
-        # Frame buffers
-        self._scale_inv = 1.0 / self.process_scale
-        self._scaled_buffer = None
+        # Async detector (created in connect() once we know frame size)
+        self._async_detector: Optional[AsyncDetector] = None
 
         # Shift logger
         self._shift_logger = None
@@ -733,73 +872,68 @@ class HumanTracker:
 
         self.motors.set_frame_size(self.capture.width, self.capture.height)
 
-        if self.process_scale < 1.0:
-            sh = int(self.capture.height * self.process_scale)
-            sw = int(self.capture.width * self.process_scale)
-            self._scaled_buffer = np.empty((sh, sw, 3), dtype=np.uint8)
+        # Start async detection thread
+        if self.detector.ready:
+            self._async_detector = AsyncDetector(
+                self.detector, self.process_scale,
+                self.capture.width, self.capture.height,
+            )
+            self._async_detector.start()
+            logger.info("Async detection thread started")
 
         return True
 
     def process_frame(self, frame: np.ndarray) -> tuple:
-        """Process frame, return (annotated_frame, detection)."""
+        """Process frame, return (annotated_frame, detection).
+
+        Detection runs **asynchronously** in a background thread so this
+        method never blocks on MoveNet inference.  Between detections the
+        lightweight MOSSE tracker keeps the bounding box up-to-date.
+        """
         self.frame_count += 1
 
-        # Try tracker first
-        tracked_bbox = self.tracker.update(frame) if self.tracker.active else None
-        need_detect = (tracked_bbox is None or
-                       self.frame_count % self.detection_interval == 0)
+        # --- 1. Pick up async detection result (non-blocking) ---------------
+        det_result = None
+        if self._async_detector is not None:
+            det_result = self._async_detector.get_result()
+        if det_result:
+            self.tracker.init(frame, det_result['bbox'])
+            self.current_detection = det_result
 
-        # Run pose detection (re-detect periodically or when tracker lost)
+        # --- 2. Submit frame for detection when needed ----------------------
+        #   • Periodically (every N frames) to refresh the pose estimate
+        #   • Urgently every frame when there is nothing to track yet
+        if self._async_detector is not None:
+            need_detect = (
+                self.frame_count % self.detection_interval == 0
+                or not self.tracker.active
+            )
+            if need_detect and not self._async_detector.busy:
+                self._async_detector.submit(frame)
+
+        # --- 3. Fast tracker update (MOSSE ≈ 0.5 ms) -----------------------
         detection = None
-        if need_detect:
-            detection = self._detect(frame)
-            if detection:
-                self.tracker.init(frame, detection['bbox'])
+        tracked_bbox = self.tracker.update(frame) if self.tracker.active else None
 
-        # Fall back to tracked bbox if detection didn't fire or failed
-        if detection is None and tracked_bbox is not None:
+        if tracked_bbox is not None:
             detection = {
                 'bbox': tracked_bbox,
-                'confidence': self.current_detection.get('confidence', 0.5) if self.current_detection else 0.5,
-                'keypoints': self.current_detection.get('keypoints') if self.current_detection else None
+                'confidence': (
+                    self.current_detection.get('confidence', 0.5)
+                    if self.current_detection else 0.5
+                ),
+                'keypoints': (
+                    self.current_detection.get('keypoints')
+                    if self.current_detection else None
+                ),
             }
+            self.current_detection = detection
+        elif det_result:
+            # Tracker init + update failed, but we have a fresh detection
+            detection = det_result
 
-        self.current_detection = detection
         annotated = self._draw(frame.copy(), detection)
-
         return annotated, detection
-
-    def _detect(self, frame: np.ndarray) -> Optional[dict]:
-        """Run detection on scaled frame."""
-        if self.process_scale < 1.0 and self._scaled_buffer is not None:
-            cv2.resize(frame, (self._scaled_buffer.shape[1], self._scaled_buffer.shape[0]),
-                      dst=self._scaled_buffer, interpolation=cv2.INTER_AREA)
-            small = self._scaled_buffer
-        else:
-            small = frame
-
-        det = self.detector.detect(small)
-        if det is None:
-            return None
-
-        # Scale back to original coordinates
-        x, y, w, h = det['bbox']
-        x = int(x * self._scale_inv)
-        y = int(y * self._scale_inv)
-        w = int(w * self._scale_inv)
-        h = int(h * self._scale_inv)
-
-        # Clip to frame
-        x = max(0, min(x, self.capture.width - 1))
-        y = max(0, min(y, self.capture.height - 1))
-        w = min(w, self.capture.width - x)
-        h = min(h, self.capture.height - y)
-
-        if det['keypoints'] is not None:
-            det['keypoints'][:, :2] *= self._scale_inv
-
-        det['bbox'] = (x, y, w, h)
-        return det
 
     def _draw(self, frame: np.ndarray, detection: Optional[dict]) -> np.ndarray:
         """Draw tracking overlay."""
@@ -997,6 +1131,9 @@ class HumanTracker:
         """Release all resources."""
         logger.info("Cleaning up...")
         self.running = False
+        if self._async_detector:
+            self._async_detector.stop()
+            self._async_detector = None
         self.motors.disconnect()
         self.stop_recording()
         if self.capture:

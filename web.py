@@ -804,12 +804,20 @@ def api_start():
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
     """Stop tracking."""
-    global _tracker
+    global _tracker, _tracker_thread
 
     if _tracker:
         _tracker.running = False
-        _tracker.cleanup()
-        _tracker = None
+        # Wait for the tracker loop thread to finish before cleanup
+        # so we don't race with its finally block
+        if _tracker_thread and _tracker_thread.is_alive():
+            _tracker_thread.join(timeout=3.0)
+        _tracker_thread = None
+        # The tracker loop's finally block handles cleanup;
+        # only clean up here if the thread didn't do it
+        if _tracker:
+            _tracker.cleanup()
+            _tracker = None
 
     return jsonify({'status': 'ok'})
 
@@ -1001,6 +1009,7 @@ def _run_tracker_loop():
     finally:
         if _tracker:
             _tracker.cleanup()
+            _tracker = None
 
 
 # =============================================================================

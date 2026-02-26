@@ -40,10 +40,10 @@ tracker:
   #               uses Pi's hardware H.264 encoder, saves files on the camera Pi)
   recording_mode: "local"
 
-  # Detection settings (Pi 5 can handle higher quality)
+  # Detection settings (runs asynchronously — main loop never blocks)
   detection:
-    interval: 6           # Run detection every N frames
-    scale: 0.5            # Frame scale for detection (0.2-1.0)
+    interval: 10          # Re-detect every N frames (async, no FPS impact)
+    scale: 0.4            # Frame scale for detection (0.2-1.0)
     confidence: 0.5       # Minimum confidence threshold (0.0-1.0)
     keypoint_threshold: 0.3
 
@@ -77,12 +77,12 @@ web:
 # Performance Presets (used by run scripts)
 presets:
   pi3:
-    detection_interval: 12
-    process_scale: 0.35
+    detection_interval: 15
+    process_scale: 0.3
     movenet_threads: 2
   pi5:
-    detection_interval: 6
-    process_scale: 0.5
+    detection_interval: 10
+    process_scale: 0.4
     movenet_threads: 4
 
 # Logging
