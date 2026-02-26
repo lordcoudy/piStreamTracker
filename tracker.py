@@ -692,6 +692,8 @@ class _RecordingThread:
         self._cv_writer: Optional[cv2.VideoWriter] = None
         self._width = width
         self._height = height
+        self._stderr_lines: list[str] = []
+        self._stderr_thread: Optional[Thread] = None
 
         self._init_writer(path, width, height, fps, encoder)
 
@@ -744,6 +746,15 @@ class _RecordingThread:
             cmd, stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
+        # Drain stderr in a background thread to prevent pipe-buffer
+        # deadlock — ffmpeg writes progress/stats continuously and if
+        # the OS pipe buffer (~64 KB on Linux) fills up, ffmpeg blocks
+        # and the stdin write from Python raises BrokenPipeError.
+        self._stderr_thread = Thread(
+            target=self._drain_stderr, daemon=True,
+            name="ffmpeg-stderr",
+        )
+        self._stderr_thread.start()
 
     # ---- public API --------------------------------------------------
 
@@ -772,18 +783,52 @@ class _RecordingThread:
                 logger.debug(f"ffmpeg close: {e}")
                 self._proc.kill()
 
+        if self._stderr_thread and self._stderr_thread.is_alive():
+            self._stderr_thread.join(timeout=2.0)
+
+        # Log ffmpeg exit status
+        if self._proc and self._proc.returncode and self._proc.returncode != 0:
+            tail = self._stderr_lines[-20:]
+            logger.warning(
+                f"ffmpeg exited with code {self._proc.returncode}:\n"
+                + "\n".join(tail)
+            )
+
         if self._cv_writer:
             self._cv_writer.release()
 
     # ---- internal ----------------------------------------------------
 
+    def _drain_stderr(self):
+        """Read ffmpeg stderr continuously to prevent pipe-buffer deadlock."""
+        try:
+            for raw_line in self._proc.stderr:
+                line = raw_line.decode(errors='replace').rstrip()
+                if line:
+                    self._stderr_lines.append(line)
+        except (ValueError, OSError):
+            pass  # stderr closed
+
     def _write(self, frame: np.ndarray):
         """Write one frame to whichever backend is active."""
         if self._proc and self._proc.stdin:
+            # Detect ffmpeg death early before attempting write
+            if self._proc.poll() is not None:
+                tail = self._stderr_lines[-10:]
+                logger.warning(
+                    f"ffmpeg died (exit {self._proc.returncode}) — stopping recording\n"
+                    + "\n".join(tail)
+                )
+                self._stop.set()
+                return
             try:
                 self._proc.stdin.write(frame.tobytes())
             except BrokenPipeError:
-                logger.warning("ffmpeg pipe broken — stopping recording")
+                tail = self._stderr_lines[-10:]
+                logger.warning(
+                    "ffmpeg pipe broken — stopping recording\n"
+                    + "\n".join(tail)
+                )
                 self._stop.set()
         elif self._cv_writer:
             self._cv_writer.write(frame)
