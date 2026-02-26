@@ -650,6 +650,10 @@ def _probe_encoder() -> str:
       1. h264_v4l2m2m  — Pi hardware encoder (near-zero CPU)
       2. libx264       — CPU-based but vastly more efficient than MJPG
 
+    Each candidate is validated by encoding a single tiny test frame so we
+    detect missing hardware devices (e.g. no V4L2 encode node) instead of
+    only checking whether ffmpeg was compiled with the encoder.
+
     Returns the encoder name or '' if ffmpeg is not available.
     """
     if not shutil.which('ffmpeg'):
@@ -657,14 +661,32 @@ def _probe_encoder() -> str:
 
     for enc in ('h264_v4l2m2m', 'libx264'):
         try:
+            # Encode one 64×64 black frame to /dev/null — proves the encoder
+            # can actually initialise on this hardware.
+            cmd = [
+                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+                '-f', 'rawvideo', '-pix_fmt', 'bgr24',
+                '-s', '64x64', '-r', '1',
+                '-i', 'pipe:0',
+                '-frames:v', '1',
+                '-c:v', enc,
+                '-pix_fmt', 'yuv420p',
+                '-f', 'null', '-',
+            ]
             r = subprocess.run(
-                ['ffmpeg', '-hide_banner', '-encoders'],
-                capture_output=True, text=True, timeout=5,
+                cmd,
+                input=b'\x00' * (64 * 64 * 3),
+                capture_output=True, timeout=10,
             )
-            if enc in r.stdout:
-                logger.info(f"Detected ffmpeg encoder: {enc}")
+            if r.returncode == 0:
+                logger.info(f"Verified ffmpeg encoder: {enc}")
                 return enc
-        except Exception:
+            logger.debug(
+                f"Encoder {enc} failed probe: "
+                + r.stderr.decode(errors='replace').strip()
+            )
+        except Exception as e:
+            logger.debug(f"Encoder {enc} probe error: {e}")
             continue
     return ''
 
