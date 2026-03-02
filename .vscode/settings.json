@@ -1,0 +1,8 @@
+{
+	"chat.tools.terminal.autoApprove": {
+		"/^python3 -c \"import ast; ast\\.parse\\(open\\('tracker\\.py'\\)\\.read\\(\\)\\); print\\('OK'\\)\"$/": {
+			"approve": true,
+			"matchCommandLine": true
+		}
+	}
+}

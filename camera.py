@@ -46,6 +46,8 @@ HOST = camera_cfg.get('host', '0.0.0.0')
 PORT = camera_cfg.get('port', 8000)
 WIDTH = camera_cfg.get('resolution', {}).get('width', 1280)
 HEIGHT = camera_cfg.get('resolution', {}).get('height', 960)
+FRAMERATE = camera_cfg.get('framerate', 30)
+JPEG_QUALITY = camera_cfg.get('jpeg_quality', 80)
 CAMERA_IP = network_cfg.get('camera_ip', '192.168.100.1')
 OUTPUT_DIR = Path(camera_cfg.get('recording_dir', 'recordings'))
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -183,20 +185,26 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-cache, private')
             self.send_header('Pragma', 'no-cache')
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+            self.send_header('Connection', 'keep-alive')
             self.end_headers()
 
             try:
                 while True:
                     with self.output.condition:
-                        self.output.condition.wait()
+                        if not self.output.condition.wait(timeout=2.0):
+                            continue  # No new frame within timeout, retry
                         frame = self.output.frame
 
+                    if frame is None:
+                        continue
+
                     self.wfile.write(b'--FRAME\r\n')
-                    self.send_header('Content-Type', 'image/jpeg')
-                    self.send_header('Content-Length', len(frame))
-                    self.end_headers()
+                    self.wfile.write(b'Content-Type: image/jpeg\r\n')
+                    self.wfile.write(f'Content-Length: {len(frame)}\r\n'.encode())
+                    self.wfile.write(b'\r\n')
                     self.wfile.write(frame)
                     self.wfile.write(b'\r\n')
+                    self.wfile.flush()
 
             except Exception as e:
                 logger.debug(f'Client disconnected: {self.client_address} - {e}')
@@ -240,9 +248,18 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 
 
 class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
-    """Threaded HTTP server."""
+    """Threaded HTTP server with tuning for low-latency streaming."""
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 8
+    timeout = 10
+
+    def server_bind(self):
+        """Override to set socket options for streaming performance."""
+        import socket
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        super().server_bind()
 
 
 def main():
@@ -250,14 +267,17 @@ def main():
 
     # Initialize camera
     picam2 = Picamera2()
-    picam2.configure(picam2.create_video_configuration(
-        main={"size": (WIDTH, HEIGHT)}
-    ))
+    video_config = picam2.create_video_configuration(
+        main={"size": (WIDTH, HEIGHT)},
+        controls={"FrameRate": FRAMERATE},
+    )
+    picam2.configure(video_config)
 
-    # Setup streaming
+    # Setup streaming with quality-tuned JPEG encoder
     output = StreamingOutput()
     StreamingHandler.output = output
-    picam2.start_recording(JpegEncoder(), FileOutput(output))
+    jpeg_encoder = JpegEncoder(q=JPEG_QUALITY)
+    picam2.start_recording(jpeg_encoder, FileOutput(output))
 
     # Setup server-side recorder (hardware H.264)
     recorder = CameraRecorder(picam2, OUTPUT_DIR)

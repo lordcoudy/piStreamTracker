@@ -75,7 +75,11 @@ def load_config(config_path: str = "config.yaml") -> dict:
 # =============================================================================
 
 class VideoCapture:
-    """Threaded video capture with low-latency buffering."""
+    """Threaded video capture with low-latency buffering and auto-reconnect."""
+
+    MAX_FAILURES = 30        # consecutive read failures before reconnect
+    RECONNECT_DELAY = 1.0    # seconds between reconnect attempts
+    MAX_RECONNECTS = 10      # give up after this many consecutive reconnects
 
     def __init__(self, source: str, buffer_size: int = 2):
         self.source = source
@@ -89,10 +93,24 @@ class VideoCapture:
         self.width = 0
         self.height = 0
         self.fps = 30.0
+        self._is_http = source.startswith(('http://', 'https://'))
 
-    def start(self) -> bool:
-        """Start video capture."""
-        for backend in [cv2.CAP_V4L2, cv2.CAP_FFMPEG, cv2.CAP_ANY]:
+    def _open_capture(self) -> bool:
+        """Open the video capture with appropriate backend."""
+        if self._cap:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            self._cap = None
+
+        if self._is_http:
+            # For HTTP MJPEG streams, FFMPEG is the correct backend
+            backends = [cv2.CAP_FFMPEG, cv2.CAP_ANY]
+        else:
+            backends = [cv2.CAP_V4L2, cv2.CAP_FFMPEG, cv2.CAP_ANY]
+
+        for backend in backends:
             try:
                 self._cap = cv2.VideoCapture(self.source, backend)
                 if self._cap.isOpened():
@@ -103,11 +121,23 @@ class VideoCapture:
         if not self._cap or not self._cap.isOpened():
             self._cap = cv2.VideoCapture(self.source)
 
-        if not self._cap.isOpened():
-            logger.error(f"Failed to open: {self.source}")
+        if not self._cap or not self._cap.isOpened():
             return False
 
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
+        # For HTTP streams: reduce internal FFMPEG buffer for lower latency
+        if self._is_http:
+            self._cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            self._cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+
+        return True
+
+    def start(self) -> bool:
+        """Start video capture."""
+        if not self._open_capture():
+            logger.error(f"Failed to open: {self.source}")
+            return False
+
         self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -125,13 +155,36 @@ class VideoCapture:
         return True
 
     def _capture_loop(self):
+        failures = 0
+        reconnects = 0
         while not self._stop.is_set():
             ret, frame = self._cap.read()
             if ret:
                 with self._lock:
                     self._ret, self._frame = ret, frame
+                failures = 0
+                reconnects = 0
             else:
-                self._stop.wait(0.001)
+                failures += 1
+                if failures >= self.MAX_FAILURES:
+                    if reconnects >= self.MAX_RECONNECTS:
+                        logger.error("Max reconnect attempts reached, giving up")
+                        with self._lock:
+                            self._ret = False
+                        return
+                    logger.warning(f"Stream lost ({failures} failures), reconnecting...")
+                    self._stop.wait(self.RECONNECT_DELAY)
+                    if self._stop.is_set():
+                        return
+                    if self._open_capture():
+                        logger.info("Stream reconnected")
+                        failures = 0
+                        reconnects += 1
+                    else:
+                        reconnects += 1
+                        logger.warning(f"Reconnect attempt {reconnects}/{self.MAX_RECONNECTS} failed")
+                else:
+                    self._stop.wait(0.005)
 
     def read(self):
         """Get latest frame."""
@@ -469,6 +522,8 @@ class MotorController:
         self._ev3 = None
         self._pan = None
         self._tilt = None
+        self._pan_home = 0
+        self._tilt_home = 0
         self._last_cmd = 0.0
         self._cam_w = 1280
         self._cam_h = 960
@@ -487,13 +542,21 @@ class MotorController:
             self._tilt = self._ev3.Motor(self.tilt_port)
             self.connected = True
 
+            # Store initial motor positions as home
+            try:
+                self._pan_home = self._pan.position
+                self._tilt_home = self._tilt.position
+            except Exception:
+                self._pan_home = 0
+                self._tilt_home = 0
+
             try:
                 self._ev3.Led('green', 'pulse')
             except Exception:
                 pass
 
             self.stop()
-            logger.info("EV3 connected")
+            logger.info(f"EV3 connected (home: pan={self._pan_home}, tilt={self._tilt_home})")
             return True
 
         except Exception as e:
@@ -546,6 +609,41 @@ class MotorController:
                 self._tilt.stop()
         except Exception:
             pass
+
+    def move_to_home(self):
+        """Move motors back to their initial (home) position."""
+        if not self.connected:
+            return
+        try:
+            pan_pos = self._pan.position
+            tilt_pos = self._tilt.position
+            pan_delta = self._pan_home - pan_pos
+            tilt_delta = self._tilt_home - tilt_pos
+            speed = max(int(self.max_speed * 0.6), 10)
+            if abs(pan_delta) > 2:
+                self._pan.run_to(degrees=pan_delta, speed=speed)
+            if abs(tilt_delta) > 2:
+                self._tilt.run_to(degrees=tilt_delta, speed=speed)
+            logger.info(f"Moving to home (pan={pan_delta:+d}, tilt={tilt_delta:+d})")
+        except Exception as e:
+            logger.warning(f"Move to home failed: {e}")
+
+    def manual_move(self, pan_degrees: int = 0, tilt_degrees: int = 0,
+                    speed: Optional[int] = None):
+        """Manually move camera by given degrees."""
+        if not self.connected:
+            return
+        if speed is None:
+            speed = max(int(self.max_speed * 0.5), 10)
+        try:
+            if pan_degrees != 0 and self._pan:
+                d = -pan_degrees if self.invert_x else pan_degrees
+                self._pan.run_to(degrees=d, speed=speed)
+            if tilt_degrees != 0 and self._tilt:
+                d = -tilt_degrees if self.invert_y else tilt_degrees
+                self._tilt.run_to(degrees=d, speed=speed)
+        except Exception as e:
+            logger.debug(f"Manual move error: {e}")
 
     def disconnect(self):
         """Disconnect from EV3."""
@@ -918,6 +1016,13 @@ class HumanTracker:
         self._fps_time = time.monotonic()
         self._fps = 0.0
 
+        # Digital zoom (1.0 = no zoom, up to 4.0)
+        self.zoom_level: float = 1.0
+
+        # Horizon stabilization
+        self.horizon_correction: bool = False
+        self._horizon_angle_ema: float = 0.0  # exponential moving average of tilt
+
         # Recording mode: 'local' (Pi 5) or 'camera' (Pi 3B+)
         self.recording_mode = tracker_cfg.get('recording_mode', 'local')
         self._camera_base_url = f"http://{net['camera_ip']}:{cam['port']}"
@@ -1002,9 +1107,70 @@ class HumanTracker:
         annotated = self._draw(frame.copy(), detection)
         return annotated, detection
 
+    def _compute_horizon_correction(self, detection: Optional[dict]) -> float:
+        """Compute horizon tilt angle from shoulder/hip keypoints.
+
+        Returns a correction angle in degrees. Positive = clockwise tilt detected.
+        Uses exponential moving average to smooth jitter.
+        """
+        if not self.horizon_correction or detection is None:
+            return 0.0
+
+        kp = detection.get('keypoints')
+        if kp is None or len(kp) < 13:
+            return self._horizon_angle_ema
+
+        # MoveNet keypoint indices: 5=left_shoulder, 6=right_shoulder,
+        # 11=left_hip, 12=right_hip
+        angles = []
+        pairs = [(5, 6), (11, 12)]  # left-right pairs
+        threshold = self.detector.keypoint_threshold
+
+        for li, ri in pairs:
+            lx, ly, lc = kp[li]
+            rx, ry, rc = kp[ri]
+            if lc >= threshold and rc >= threshold:
+                dx = float(rx - lx)
+                dy = float(ry - ly)
+                if abs(dx) > 5:  # avoid near-zero division
+                    angle = np.degrees(np.arctan2(dy, dx))
+                    angles.append(angle)
+
+        if angles:
+            raw_angle = float(np.mean(angles))
+            # EMA smoothing (alpha=0.15 for stability)
+            alpha = 0.15
+            self._horizon_angle_ema = alpha * raw_angle + (1 - alpha) * self._horizon_angle_ema
+
+        return self._horizon_angle_ema
+
+    def _apply_zoom(self, frame: np.ndarray) -> np.ndarray:
+        """Apply digital zoom by center-cropping and resizing."""
+        if self.zoom_level <= 1.0:
+            return frame
+
+        h, w = frame.shape[:2]
+        crop_w = int(w / self.zoom_level)
+        crop_h = int(h / self.zoom_level)
+        x1 = (w - crop_w) // 2
+        y1 = (h - crop_h) // 2
+        cropped = frame[y1:y1 + crop_h, x1:x1 + crop_w]
+        return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
     def _draw(self, frame: np.ndarray, detection: Optional[dict]) -> np.ndarray:
         """Draw tracking overlay."""
         cx, cy = self.capture.width // 2, self.capture.height // 2
+
+        # Horizon stabilization — rotate frame to counteract tilt
+        horizon_angle = self._compute_horizon_correction(detection)
+        if abs(horizon_angle) > 0.5:
+            h_fr, w_fr = frame.shape[:2]
+            M = cv2.getRotationMatrix2D((w_fr / 2, h_fr / 2), -horizon_angle, 1.0)
+            frame = cv2.warpAffine(frame, M, (w_fr, h_fr),
+                                   borderMode=cv2.BORDER_REPLICATE)
+            # Show horizon indicator
+            cv2.putText(frame, f"H:{horizon_angle:+.1f}", (cx - 30, 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 1)
 
         # Center crosshair
         cv2.line(frame, (cx - 10, cy), (cx + 10, cy), (255, 0, 0), 1)
@@ -1012,11 +1178,14 @@ class HumanTracker:
 
         if detection:
             x, y, w, h = detection['bbox']
-            tx, ty = x + w // 2, y + h // 2
+            # Target: center of upper half of bounding box (head/torso area)
+            tx, ty = x + w // 2, y + h // 4
             shift_x, shift_y = tx - cx, ty - cy
 
             # Bounding box
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            # Upper-half midline marker
+            cv2.line(frame, (x, y + h // 2), (x + w, y + h // 2), (0, 180, 0), 1)
             cv2.circle(frame, (tx, ty), 4, (0, 0, 255), -1)
             cv2.line(frame, (cx, cy), (tx, ty), (255, 255, 0), 1)
 
@@ -1037,6 +1206,9 @@ class HumanTracker:
             self.motors.update(shift_x, shift_y)
         else:
             self.motors.stop()
+
+        # Apply digital zoom (after all annotations)
+        frame = self._apply_zoom(frame)
 
         return frame
 
@@ -1185,7 +1357,8 @@ class HumanTracker:
                     elif key == ord('d'):
                         self.tracker.reset()
                         self.current_detection = None
-                        logger.info("Detection reset")
+                        self.motors.move_to_home()
+                        logger.info("Detection reset + camera homed")
                     elif key == ord('e'):
                         self.motors.disconnect() if self.motors.connected else self.motors.connect()
 

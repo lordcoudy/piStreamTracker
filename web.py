@@ -198,6 +198,46 @@ HTML_TEMPLATE = """
             grid-template-columns: 1fr 1fr;
             gap: 8px;
         }
+
+        /* D-pad for manual camera control */
+        .dpad {
+            display: grid;
+            grid-template-columns: 40px 40px 40px;
+            grid-template-rows: 40px 40px 40px;
+            gap: 4px;
+            justify-content: center;
+            margin: 10px 0;
+        }
+        .dpad button {
+            padding: 0;
+            font-size: 1.1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #334155;
+            border-radius: 6px;
+            min-width: 0;
+        }
+        .dpad button:hover { background: #475569; }
+        .dpad .dpad-center { background: #1e293b; cursor: default; font-size: 0.7rem; color: #94a3b8; }
+        .dpad .dpad-center:hover { background: #1e293b; }
+        .dpad .dpad-empty { background: transparent; cursor: default; }
+        .dpad .dpad-empty:hover { background: transparent; }
+
+        /* Zoom controls */
+        .zoom-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .zoom-controls .zoom-level {
+            font-size: 0.9rem;
+            font-weight: bold;
+            color: #4ade80;
+            min-width: 40px;
+            text-align: center;
+        }
         .info-item {
             background: #1e293b;
             padding: 10px;
@@ -414,6 +454,48 @@ HTML_TEMPLATE = """
                 </div>
 
                 <div class="panel">
+                    <h3>Manual Camera Control</h3>
+                    <div class="dpad">
+                        <div class="dpad-empty"></div>
+                        <button onclick="moveCamera('up')" title="Tilt Up">▲</button>
+                        <div class="dpad-empty"></div>
+                        <button onclick="moveCamera('left')" title="Pan Left">◀</button>
+                        <div class="dpad-center">10°</div>
+                        <button onclick="moveCamera('right')" title="Pan Right">▶</button>
+                        <div class="dpad-empty"></div>
+                        <button onclick="moveCamera('down')" title="Tilt Down">▼</button>
+                        <div class="dpad-empty"></div>
+                    </div>
+                    <div class="slider-group">
+                        <label>
+                            <span>Step Size</span>
+                            <span id="step-value">10</span>°
+                        </label>
+                        <input type="range" id="step-slider" min="2" max="30" step="1" value="10"
+                               oninput="document.getElementById('step-value').textContent=this.value; document.querySelector('.dpad-center').textContent=this.value+'°'">
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>Zoom</h3>
+                    <div class="zoom-controls">
+                        <button class="secondary" onclick="zoomCamera('out')">-</button>
+                        <span class="zoom-level" id="zoom-value">1.0x</span>
+                        <button class="secondary" onclick="zoomCamera('in')">+</button>
+                        <button class="secondary" onclick="zoomCamera('reset')" style="margin-left:auto">Reset</button>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>Horizon Stabilization</h3>
+                    <label class="toggle-switch">
+                        <span>Auto-Level</span>
+                        <input type="checkbox" id="horizon-toggle" onchange="toggleHorizon()">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+
+                <div class="panel">
                     <h3>Detection Settings</h3>
                     <div class="slider-group">
                         <label>
@@ -528,7 +610,29 @@ HTML_TEMPLATE = """
 
         async function resetDetection() {
             const res = await api('reset', 'POST');
-            if (res) log('Detection reset', 'success');
+            if (res) log('Detection reset + camera homed', 'success');
+        }
+
+        async function moveCamera(direction) {
+            const degrees = parseInt(document.getElementById('step-slider').value) || 10;
+            const res = await api('motor_move', 'POST', { direction, degrees });
+            if (res && res.status === 'ok') {
+                log('Move: ' + direction + ' ' + degrees + '°');
+            }
+        }
+
+        async function zoomCamera(action) {
+            const res = await api('zoom', 'POST', { action });
+            if (res && res.zoom !== undefined) {
+                document.getElementById('zoom-value').textContent = res.zoom.toFixed(2) + 'x';
+                log('Zoom: ' + res.zoom.toFixed(2) + 'x');
+            }
+        }
+
+        async function toggleHorizon() {
+            const enabled = document.getElementById('horizon-toggle').checked;
+            await api('settings', 'POST', { horizon: enabled });
+            log('Horizon stabilization ' + (enabled ? 'ON' : 'OFF'), 'success');
         }
 
         async function toggleRecording() {
@@ -582,6 +686,12 @@ HTML_TEMPLATE = """
                 if (res.shift_x !== null) {
                     document.getElementById('info-shift-x').textContent = res.shift_x;
                     document.getElementById('info-shift-y').textContent = res.shift_y;
+                }
+                if (res.zoom !== undefined) {
+                    document.getElementById('zoom-value').textContent = res.zoom.toFixed(2) + 'x';
+                }
+                if (res.horizon !== undefined) {
+                    document.getElementById('horizon-toggle').checked = res.horizon;
                 }
                 updateUI();
             }
@@ -759,8 +869,9 @@ def api_status():
             x, y, w, h = detection['bbox']
             cx = _tracker.capture.width // 2 if _tracker.capture else 640
             cy = _tracker.capture.height // 2 if _tracker.capture else 480
+            # Target: center of upper half of bbox
             shift_x = x + w // 2 - cx
-            shift_y = y + h // 2 - cy
+            shift_y = y + h // 4 - cy
 
         return jsonify({
             'running': _tracker.running,
@@ -769,7 +880,9 @@ def api_status():
             'fps': _tracker.fps,
             'detected': detection is not None,
             'shift_x': shift_x,
-            'shift_y': shift_y
+            'shift_y': shift_y,
+            'zoom': _tracker.zoom_level,
+            'horizon': _tracker.horizon_correction
         })
 
     return jsonify({
@@ -779,7 +892,9 @@ def api_status():
         'fps': 0,
         'detected': False,
         'shift_x': None,
-        'shift_y': None
+        'shift_y': None,
+        'zoom': 1.0,
+        'horizon': False
     })
 
 
@@ -824,10 +939,11 @@ def api_stop():
 
 @app.route('/api/reset', methods=['POST'])
 def api_reset():
-    """Reset detection."""
+    """Reset detection and move camera to home position."""
     if _tracker:
         _tracker.tracker.reset()
         _tracker.current_detection = None
+        _tracker.motors.move_to_home()
     return jsonify({'status': 'ok'})
 
 
@@ -886,8 +1002,58 @@ def api_settings():
         _tracker.detector.confidence = float(data['confidence'])
     if 'interval' in data:
         _tracker.detection_interval = int(data['interval'])
+    if 'horizon' in data:
+        _tracker.horizon_correction = bool(data['horizon'])
 
     return jsonify({'status': 'ok'})
+
+
+@app.route('/api/motor_move', methods=['POST'])
+def api_motor_move():
+    """Manually move camera motors."""
+    if not _tracker:
+        return jsonify({'status': 'error', 'message': 'Tracker not running'})
+    if not _tracker.motors.connected:
+        return jsonify({'status': 'error', 'message': 'EV3 not connected'})
+
+    data = request.get_json() or {}
+    direction = data.get('direction', '')
+    degrees = int(data.get('degrees', 10))
+
+    pan = tilt = 0
+    if direction == 'left':
+        pan = -degrees
+    elif direction == 'right':
+        pan = degrees
+    elif direction == 'up':
+        tilt = -degrees
+    elif direction == 'down':
+        tilt = degrees
+
+    _tracker.motors.manual_move(pan_degrees=pan, tilt_degrees=tilt)
+    return jsonify({'status': 'ok', 'pan': pan, 'tilt': tilt})
+
+
+@app.route('/api/zoom', methods=['POST'])
+def api_zoom():
+    """Control digital zoom."""
+    if not _tracker:
+        return jsonify({'status': 'error', 'message': 'Tracker not running'})
+
+    data = request.get_json() or {}
+    action = data.get('action', '')
+    level = data.get('level')
+
+    if level is not None:
+        _tracker.zoom_level = max(1.0, min(float(level), 4.0))
+    elif action == 'in':
+        _tracker.zoom_level = min(_tracker.zoom_level + 0.25, 4.0)
+    elif action == 'out':
+        _tracker.zoom_level = max(_tracker.zoom_level - 0.25, 1.0)
+    elif action == 'reset':
+        _tracker.zoom_level = 1.0
+
+    return jsonify({'status': 'ok', 'zoom': _tracker.zoom_level})
 
 
 @app.route('/api/config')

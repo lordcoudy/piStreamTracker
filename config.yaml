@@ -25,7 +25,7 @@ camera:
 tracker:
   stream_url: null  # Auto: http://192.168.100.1:8000/stream
   output_dir: "recordings"
-  recording_fps: 30  # Fixed output framerate for recordings (stable regardless of processing speed)
+  recording_fps: 60  # Fixed output framerate for recordings (stable regardless of processing speed)
 
   # Recording encoder — controls CPU vs hardware encoding
   #   "auto"            — auto-detect best encoder (recommended)
