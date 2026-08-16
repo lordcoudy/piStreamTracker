@@ -1,18 +1,18 @@
 flowchart LR
   %% ========== Entry ==========
   A["main()"] --> B["argparse CLI"]
-  B --> C["OptimizedTracker.__init__"]
-  C --> D["OptimizedTracker.run()"]
+  B --> C["HumanTracker.__init__"]
+  C --> D["HumanTracker.run()"]
 
   %% ========== Core components ==========
-  subgraph T["OptimizedTracker"]
+  subgraph T["HumanTracker"]
     D --> E["connect()"]
     D --> F["main loop"]
     D --> G["cleanup()"]
 
     %% connect()
-    E --> VC[ThreadedVideoCapture]
-    E --> EV3S[EV3Controller.set_camera_size]
+    E --> VC[VideoCapture]
+    E --> EV3S[MotorController.set_frame_size]
     E --> SFB[Pre-allocate scaled frame buffer]
 
     %% main loop steps
@@ -23,7 +23,7 @@ flowchart LR
   end
 
   %% ========== Video capture thread ==========
-  subgraph VCT["ThreadedVideoCapture (background thread)"]
+  subgraph VCT["VideoCapture (background thread)"]
     VC --> VCSTART["start()"]
     VCSTART --> LOOP["_capture_loop()"]
     LOOP -->|cap read| LATEST["latest frame + ret"]
@@ -38,13 +38,13 @@ flowchart LR
 
     TRKUP -->|bbox or None| TRACKED["tracked_human"]
     DETNEED --> RUNDET["_run_detection()"]
-    RUNDET --> MND["MoveNetDetector.detect()"]
+    RUNDET --> MND["PoseDetector.detect()"]
     RUNDET --> TRKINIT["_init_tracker(bbox)"]
     TRKINIT --> TRACKED
   end
 
   %% ========== MoveNet ==========
-  subgraph MN["MoveNetDetector (TFLite)"]
+  subgraph MN["PoseDetector (TFLite)"]
     MND --> PRE["resize + BGR→RGB (preallocated buffer)"]
     PRE --> TIN["fill input tensor (float/uint8/int8)"]
     TIN --> INF["interpreter.invoke()"]
@@ -57,11 +57,11 @@ flowchart LR
     PF --> DRAW["_draw_overlay(frame, tracked)"]
     DRAW --> SHIFT["compute shift from frame center"]
     SHIFT --> LOG["BatchedLogWriter.log()"]
-    SHIFT --> MTR["EV3Controller.update_motors()"]
+    SHIFT --> MTR["MotorController.update()"]
   end
 
   %% ========== EV3 ==========
-  subgraph EV3["EV3Controller"]
+  subgraph EV3["MotorController"]
     MTR --> RL{"rate limit cooldown?"}
     RL -->|ok| CMP["calculate_motor_params x/y"]
     CMP --> CMD["motor.run_to_rel_pos / stop"]
@@ -76,7 +76,7 @@ flowchart LR
   end
 
   %% ========== Shutdown ==========
-  G --> STOP1["EV3Controller.disconnect()"]
-  G --> STOP2["ThreadedVideoCapture.stop()"]
-  G --> STOP3["BatchedLogWriter.flush()"]
+  G --> STOP1["MotorController.disconnect()"]
+  G --> STOP2["VideoCapture.stop()"]
+  G --> STOP3["ShiftLogger.flush()"]
   G --> STOP4["cv2.destroyAllWindows()"]

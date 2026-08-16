@@ -1,7 +1,7 @@
 classDiagram
 direction LR
 
-class ThreadedVideoCapture {
+class VideoCapture {
   -src: str
   -cap
   -frame
@@ -35,7 +35,7 @@ class BatchedLogWriter {
   +flush()
 }
 
-class EV3Controller {
+class MotorController {
   -deadzone_x: int
   -deadzone_y: int
   -speed_factor: float
@@ -63,7 +63,7 @@ class EV3Controller {
   +disconnect()
 }
 
-class MoveNetDetector {
+class PoseDetector {
   <<Detector>>
   +KEYPOINT_NAMES: list
   -model_path: str|None
@@ -85,7 +85,7 @@ class MoveNetDetector {
   +is_ready bool
 }
 
-class OptimizedTracker {
+class HumanTracker {
   -stream_url: str
   -output_dir: str
   -confidence_threshold: float
@@ -127,12 +127,13 @@ class OptimizedTracker {
 class EV3_USB
 
 %% Relationships / dependencies
-OptimizedTracker *-- ThreadedVideoCapture : cap
-OptimizedTracker *-- MoveNetDetector : detector
-OptimizedTracker *-- EV3Controller : ev3
-OptimizedTracker *-- BatchedLogWriter : shift_logger
+HumanTracker *-- VideoCapture : capture
+HumanTracker *-- PoseDetector : detector
+HumanTracker *-- AsyncDetector : _async_detector
+HumanTracker *-- MotorController : motors
+HumanTracker *-- ShiftLogger : _shift_logger
 
-EV3Controller --> EV3_USB : uses
+MotorController --> EV3_USB : uses
 
 %% External libs (implicit)
 
@@ -141,7 +142,7 @@ class CV2_Tracker
 class CV2_VideoWriter
 class TFLite_Interpreter
 
-ThreadedVideoCapture ..> CV2_VideoCapture : uses
-MoveNetDetector ..> TFLite_Interpreter : uses
-OptimizedTracker ..> CV2_Tracker : uses
-OptimizedTracker ..> CV2_VideoWriter : uses
+VideoCapture ..> CV2_VideoCapture : uses
+PoseDetector ..> TFLite_Interpreter : uses
+HumanTracker ..> CV2_Tracker : uses
+HumanTracker ..> RecordingThread : uses

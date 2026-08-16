@@ -26,32 +26,34 @@ Connect the two Pis via Ethernet cable (direct connection or switch).
 
 **On Pi 3B+ (Camera):**
 ```bash
-git clone https://github.com/yourusername/piStreamTracker.git
+git clone https://github.com/lordcoudy/piStreamTracker.git
 cd piStreamTracker
 ./setup.sh --camera
 ```
 
 **On Pi 5 (Tracker):**
 ```bash
-git clone https://github.com/yourusername/piStreamTracker.git
+git clone https://github.com/lordcoudy/piStreamTracker.git
 cd piStreamTracker
 ./setup.sh --tracker
 ```
+
+Assign the static Ethernet IPs once (systemd-networkd during setup, or a one-shot `sudo ./run_cam.sh --configure-network` / `sudo ./run_tracker.sh --configure-network`). Do **not** run the Python processes as root.
 
 ### Run
 
 **1. Start Camera (Pi 3B+):**
 ```bash
-sudo ./run_cam.sh
+./run_cam.sh
 ```
 
 **2. Start Tracker (Pi 5):**
 ```bash
 # With display
-sudo ./run_tracker.sh --pi5
+./run_tracker.sh --pi5
 
 # Or with web interface (headless)
-sudo ./run_tracker.sh --web
+./run_tracker.sh --web
 ```
 
 ## Architecture
@@ -99,18 +101,27 @@ ev3:
   ports: {pan: "a", tilt: "b"}
 
 web:
+  host: null            # bind tracker_ip; use 0.0.0.0 to listen on all interfaces
   port: 5000
+  overlay: true         # false = proxy raw camera MJPEG (lowest preview delay)
+  preview_quality: 70
+  preview_max_edge: 640
+  preview_max_fps: 15
 ```
+
+By default the camera server and web UI bind only to `camera_ip` / `tracker_ip`. Set `host: "0.0.0.0"` if you need them on Wi-Fi as well (anyone on that LAN can then start motors and delete recordings).
 
 ## Web Interface
 
 Access at `http://192.168.100.2:5000`
 
-- Live video stream with overlay
+- Live video stream with overlay (or raw camera proxy)
 - Start/stop tracking
 - Recording controls
 - EV3 motor adjustments
 - Detection tuning
+
+Turn **Tracking overlay** off to watch the camera MJPEG directly (no JPEG re-encode on the Pi 5). That is the lowest-delay preview. Overlay preview is capped at `preview_max_fps` and `preview_max_edge`.
 
 ## Command-Line Options
 
@@ -147,25 +158,39 @@ python tracker.py [OPTIONS]
 
 **Default (balanced):**
 ```bash
-sudo ./run_tracker.sh
+./run_tracker.sh
 ```
 
 **Fast mode (higher FPS):**
 ```bash
-sudo ./run_tracker.sh --fast
+./run_tracker.sh --fast
 ```
 
 **Quality mode (better accuracy):**
 ```bash
-sudo ./run_tracker.sh --quality
+./run_tracker.sh --quality
 ```
 
 **Headless (maximum FPS):**
 ```bash
-python tracker.py --no-display
+python tracker.py --no-display --preset fast
 ```
 
+`--fast` / `--quality` / `--pi5` on `run_tracker.sh` select the matching `presets:` block in `config.yaml`. `--web` forwards `--preset` to `web.py`.
+
+## Tests
+
+```bash
+python3 -m pytest
+# or
+PYTHONPATH=. python3 -m unittest discover -s tests -v
+```
+
+Most tests do not need a Pi or EV3. The package/web template test needs Flask. CI runs ruff + pytest on Python 3.12.
+
 ## Troubleshooting
+
+**Preview lag:** Turn off Tracking overlay, or lower `web.preview_max_edge` / `web.preview_quality`.
 
 **Low FPS:** Reduce `--process-scale` or increase `--detection-interval`
 
@@ -173,22 +198,33 @@ python tracker.py --no-display
 
 **EV3 not connecting:** Check USB connection, ensure `ev3-dc` is installed
 
-**Network issues:** Verify IPs with `ping 192.168.100.1`
+**Network issues:** Verify IPs with `ping 192.168.100.1`. Scripts no longer flush `eth0` on start.
+
+**EV3 permission denied:** Re-plug the brick after setup so the udev rule applies, or add your user to `plugdev`.
 
 ## Project Structure
 
 ```
 piStreamTracker/
-├── config.yaml       # All settings
-├── tracker.py        # Main tracking application
-├── camera.py         # Camera streaming server
-├── web.py            # Web interface
-├── ev3_usb.py        # EV3 communication wrapper
-├── setup.sh          # One-command setup
-├── run_tracker.sh    # Run tracker
-├── run_cam.sh        # Run camera server
-├── requirements.txt  # Python dependencies
-└── models/           # MoveNet model (auto-downloads)
+├── config.yaml         # All settings
+├── tracker.py          # CLI entry (display tracker)
+├── web.py              # CLI entry (Flask UI)
+├── camera.py           # Camera Pi stream server
+├── pistream/           # Application package
+│   ├── config.py
+│   ├── capture.py
+│   ├── detect.py
+│   ├── motors.py
+│   ├── record.py
+│   ├── track.py
+│   ├── web_app.py
+│   ├── templates/index.html
+│   └── static/{app.js,style.css}
+├── tests/
+├── setup.sh
+├── run_tracker.sh
+├── run_cam.sh
+└── models/             # MoveNet (auto-download, gitignored)
 ```
 
 ## License
