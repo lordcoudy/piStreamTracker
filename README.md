@@ -1,83 +1,113 @@
 # piStreamTracker
 
-Real-time human tracking with MoveNet pose detection and EV3 motor control.
+Follow-cam for a lecturer: a Pi 3B+ streams MJPEG, a Pi 5 runs MoveNet + OpenCV tracking and drives an EV3 pan/tilt head. Control it from a local web UI or a display on the tracker Pi.
 
-## Hardware Setup
+Do not run the Python processes as root. Assign Ethernet IPs once, then start the apps as a normal user (EV3 via udev).
 
-| Device | Role | IP Address |
-|--------|------|------------|
-| **Raspberry Pi 3B+** | Camera streaming | 192.168.100.1 |
-| **Raspberry Pi 5** | Detection + EV3 control | 192.168.100.2 |
-| **EV3 Brick** | Motor control (USB to Pi 5) | - |
+## Hardware
 
-Connect the two Pis via Ethernet cable (direct connection or switch).
+| Device | Role | Address |
+|--------|------|---------|
+| Raspberry Pi 3B+ | Camera + MJPEG (and optional H.264 record) | 192.168.100.1 |
+| Raspberry Pi 5 | Detection, web UI, EV3 | 192.168.100.2 |
+| EV3 brick (USB) | Port A pan, port B tilt | — |
+
+Direct Ethernet (or a switch) between the two Pis.
+
+```
+Pi 3B+  --MJPEG /record/*-->  Pi 5  --USB-->  EV3 (A=pan, B=tilt)
+192.168.100.1                 192.168.100.2
+camera.py                     tracker.py  or  web.py
+```
 
 ## Features
 
-- **MoveNet Lightning** pose detection on Pi 5
-- **EV3 motor control** for pan/tilt camera tracking
-- **Web interface** for remote control and monitoring
-- **MJPEG streaming** from Pi 3B+ to Pi 5
-- **One-command setup** with automatic configuration
+- MoveNet Lightning (async) + MOSSE/KCF/CSRT between detects
+- Aims at the upper half of the box (head/torso)
+- EV3 pan/tilt with deadzone, home-hold after Reset, D-pad
+- Web UI: overlay or raw-camera proxy, zoom, horizon preview, recordings
+- Local H.264 (ffmpeg, hardware when available) or camera-side record
+- Stream reconnects after a camera reboot; status shows `stream_lost`
+- Optional `camera.token` on `/record/*`; cap on concurrent `/stream` clients
 
-## Quick Start
+## Setup
 
-### Setup
+**Pi 3B+**
 
-**On Pi 3B+ (Camera):**
 ```bash
 git clone https://github.com/lordcoudy/piStreamTracker.git
 cd piStreamTracker
 ./setup.sh --camera
 ```
 
-**On Pi 5 (Tracker):**
+**Pi 5**
+
 ```bash
 git clone https://github.com/lordcoudy/piStreamTracker.git
 cd piStreamTracker
 ./setup.sh --tracker
 ```
 
-Assign the static Ethernet IPs once (systemd-networkd during setup, or a one-shot `sudo ./run_cam.sh --configure-network` / `sudo ./run_tracker.sh --configure-network`). Do **not** run the Python processes as root.
+Setup can write systemd-networkd for `eth0` and an EV3 udev rule. Alternatively, once:
 
-### Run
+```bash
+sudo ./run_cam.sh --configure-network      # 192.168.100.1/24
+sudo ./run_tracker.sh --configure-network  # 192.168.100.2/24
+```
 
-**1. Start Camera (Pi 3B+):**
+Scripts accept `venv/` (what `setup.sh` creates) or `.venv/`.
+
+## Run
+
+Camera Pi:
+
 ```bash
 ./run_cam.sh
 ```
 
-**2. Start Tracker (Pi 5):**
+Stream: `http://192.168.100.1:8000/stream`
+
+Tracker Pi:
+
 ```bash
-# With display
-./run_tracker.sh --pi5
-
-# Or with web interface (headless)
-./run_tracker.sh --web
+./run_tracker.sh --pi5     # OpenCV window
+./run_tracker.sh --web     # http://192.168.100.2:5000
+./run_tracker.sh --fast    # preset: fast
+./run_tracker.sh --quality # preset: quality
 ```
 
-## Architecture
+`--web` forwards `--preset` (default `pi5`) to `web.py`. Presets live in `config.yaml`.
 
+Laptop (no Pi / no EV3):
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+.venv/bin/python scripts/fake_mjpeg.py          # :8000
+.venv/bin/python web.py --host 127.0.0.1 --port 5000 --no-ev3 \
+  --url http://127.0.0.1:8000/stream
 ```
-┌─────────────────┐  Ethernet   ┌─────────────────┐
-│  Pi 3B+ Camera  │   MJPEG     │    Pi 5         │
-│  192.168.100.1  │────────────►│  192.168.100.2  │
-│                 │             │                 │
-│  • Pi Camera    │             │  • MoveNet      │
-│  • Stream Server│             │  • OpenCV       │
-└─────────────────┘             │  • Web UI       │
-                                └────────┬────────┘
-                                         │ USB
-                                ┌────────▼────────┐
-                                │    EV3 Brick    │
-                                │  Port A: Pan    │
-                                │  Port B: Tilt   │
-                                └─────────────────┘
-```
+
+## Web UI
+
+`http://192.168.100.2:5000` (or the `--host` you passed)
+
+| Control | What it does |
+|---------|----------------|
+| Start / Stop | Connects to the camera stream, then tracks. Start fails if the stream is down. |
+| Reset | Clears the tracker and homes the EV3; auto-track is held for `ev3.home_hold` seconds |
+| Record / Screenshot | Local files under `tracker.output_dir`, or camera Pi if `recording_mode: camera` |
+| Tracking overlay | Off = proxy the camera MJPEG (lowest delay). On = annotated preview at `preview_max_fps` / `preview_max_edge` |
+| Auto-Level | Rotate the **preview** to level shoulders/hips; motors still use the raw box |
+| D-pad / Zoom | Manual pan/tilt; digital zoom on the preview only |
+| Recordings | Lists `.mp4` / `.avi` / stills. Camera-mode lists files via `GET /record/list` on the camera Pi |
+
+The tracking status dot turns yellow while the stream is reconnecting (`stream_lost`).
+
+By default the UI and camera server bind to `tracker_ip` / `camera_ip`. Set `host: "0.0.0.0"` only if you need another NIC; anyone who can reach the port can move motors and delete recordings.
 
 ## Configuration
 
-All settings in `config.yaml`:
+All defaults are in `config.yaml`. CLI flags override a named `--preset`, which overrides the file.
 
 ```yaml
 network:
@@ -86,145 +116,113 @@ network:
 
 camera:
   port: 8000
+  framerate: 30
   resolution: {width: 1280, height: 960}
+  token: null              # Bearer for /record/* ; empty = open LAN
+  max_stream_clients: 4
 
 tracker:
+  recording_mode: local    # or camera (files on the 3B+)
+  recording_encoder: auto  # h264_v4l2m2m | libx264 | mjpg
+  recording_fps: 30        # capped to camera.framerate
   detection:
-    interval: 8         # Frames between detections
-    scale: 0.5          # Processing scale (lower = faster)
-    confidence: 0.5     # Detection threshold
+    interval: 10
+    scale: 0.4
+    confidence: 0.5
 
 ev3:
-  enabled: true
   deadzone: {x: 90, y: 90}
   max_speed: 50
+  home_hold: 3.0
   ports: {pan: "a", tilt: "b"}
 
 web:
-  host: null            # bind tracker_ip; use 0.0.0.0 to listen on all interfaces
+  host: null               # null = tracker_ip
   port: 5000
-  overlay: true         # false = proxy raw camera MJPEG (lowest preview delay)
+  overlay: true
   preview_quality: 70
   preview_max_edge: 640
   preview_max_fps: 15
+
+presets:
+  pi5:     {detection_interval: 10, process_scale: 0.4, movenet_threads: 4}
+  fast:    {detection_interval: 10, process_scale: 0.35, movenet_threads: 4}
+  quality: {detection_interval: 4,  process_scale: 0.6,  movenet_threads: 4}
 ```
 
-By default the camera server and web UI bind only to `camera_ip` / `tracker_ip`. Set `host: "0.0.0.0"` if you need them on Wi-Fi as well (anyone on that LAN can then start motors and delete recordings).
-
-## Web Interface
-
-Access at `http://192.168.100.2:5000`
-
-- Live video stream with overlay (or raw camera proxy)
-- Start/stop tracking
-- Recording controls
-- EV3 motor adjustments
-- Detection tuning
-
-Turn **Tracking overlay** off to watch the camera MJPEG directly (no JPEG re-encode on the Pi 5). That is the lowest-delay preview. Overlay preview is capped at `preview_max_fps` and `preview_max_edge`.
-
-## Command-Line Options
+## CLI
 
 ```bash
-python tracker.py [OPTIONS]
-
-# Stream
---url URL              Video stream URL
---config FILE          Config file path
-
-# Detection
---detection-interval N   Frames between detections (default: 8)
---process-scale N        Scale factor 0.2-1.0 (default: 0.5)
---confidence N           Confidence threshold (default: 0.5)
---movenet-threads N      Inference threads
-
-# Display
---no-display            Headless mode
---auto-record           Auto-start recording
---no-ev3                Disable EV3
+python tracker.py --help
+python web.py --help
 ```
 
-## Keyboard Controls
+Shared flags: `--config`, `--url`, `--output-dir`, `--detection-interval`, `--process-scale`, `--confidence`, `--movenet-threads`, `--no-ev3`, `--preset`.
+
+Tracker-only: `--no-display`, `--auto-record`.
+
+Web-only: `--host`, `--port`.
+
+### OpenCV window keys
 
 | Key | Action |
 |-----|--------|
 | `q` | Quit |
 | `r` | Toggle recording |
 | `s` | Screenshot |
-| `d` | Reset detection |
-| `e` | Toggle EV3 |
+| `d` | Reset tracker + home EV3 |
+| `e` | Connect / disconnect EV3 |
 
-## Performance Tuning (Pi 5)
-
-**Default (balanced):**
-```bash
-./run_tracker.sh
-```
-
-**Fast mode (higher FPS):**
-```bash
-./run_tracker.sh --fast
-```
-
-**Quality mode (better accuracy):**
-```bash
-./run_tracker.sh --quality
-```
-
-**Headless (maximum FPS):**
-```bash
-python tracker.py --no-display --preset fast
-```
-
-`--fast` / `--quality` / `--pi5` on `run_tracker.sh` select the matching `presets:` block in `config.yaml`. `--web` forwards `--preset` to `web.py`.
-
-## Tests
+## Tests and CI
 
 ```bash
-python3 -m pytest
-# or
-PYTHONPATH=. python3 -m unittest discover -s tests -v
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/pytest
+.venv/bin/ruff check pistream tests tracker.py web.py camera.py ev3_usb.py
 ```
 
-Most tests do not need a Pi or EV3. The package/web template test needs Flask. CI runs ruff + pytest on Python 3.12.
+No Pi or EV3 required. GitHub Actions runs the same on Python 3.12.
 
 ## Troubleshooting
 
-**Preview lag:** Turn off Tracking overlay, or lower `web.preview_max_edge` / `web.preview_quality`.
+| Symptom | What to try |
+|---------|-------------|
+| Preview lag | Turn **Tracking overlay** off, or lower `web.preview_max_edge` / `preview_quality` / `preview_max_fps` |
+| Low FPS | `--preset fast`, or raise `detection.interval` / lower `detection.scale` |
+| No detection | Lower `confidence` |
+| Stream dies mid-talk | Wait: capture reconnects with backoff. Yellow status = `stream_lost`. Do not need a second Start unless you clicked Stop |
+| EV3 not found | USB cable, `ev3-dc` installed, udev rule; re-plug the brick / re-login after `plugdev` |
+| EV3 permission denied | `setup.sh` udev (`idVendor=0694`); user in `plugdev` |
+| Record Refresh empty | `recording_mode: local` files are on the Pi 5. `camera` mode lists the 3B+ via `/record/list` |
+| Bind / “address already in use” | Something else on 5000/8000, or `host` is an IP that is not assigned yet |
+| Network | `ping 192.168.100.1`. Launch scripts do not flush `eth0` |
 
-**Low FPS:** Reduce `--process-scale` or increase `--detection-interval`
-
-**No detection:** Lower `--confidence` threshold
-
-**EV3 not connecting:** Check USB connection, ensure `ev3-dc` is installed
-
-**Network issues:** Verify IPs with `ping 192.168.100.1`. Scripts no longer flush `eth0` on start.
-
-**EV3 permission denied:** Re-plug the brick after setup so the udev rule applies, or add your user to `plugdev`.
-
-## Project Structure
+## Layout
 
 ```
 piStreamTracker/
-├── config.yaml         # All settings
-├── tracker.py          # CLI entry (display tracker)
-├── web.py              # CLI entry (Flask UI)
-├── camera.py           # Camera Pi stream server
-├── pistream/           # Application package
-│   ├── config.py
-│   ├── capture.py
-│   ├── detect.py
-│   ├── motors.py
-│   ├── record.py
-│   ├── track.py
-│   ├── web_app.py
-│   ├── templates/index.html
-│   └── static/{app.js,style.css}
-├── tests/
+├── config.yaml          # Single source of settings
+├── tracker.py           # Display / CLI entry
+├── web.py               # Flask entry
+├── camera.py            # Camera Pi server
+├── ev3_usb.py           # Shim → pistream.ev3_usb
 ├── setup.sh
-├── run_tracker.sh
 ├── run_cam.sh
-└── models/             # MoveNet (auto-download, gitignored)
+├── run_tracker.sh
+├── pistream/            # Application package
+│   ├── capture.py       # Threaded MJPEG capture + reconnect
+│   ├── detect.py        # MoveNet + async worker
+│   ├── track.py         # HumanTracker, MOSSE, CLI
+│   ├── motors.py        # EV3 pan/tilt + home hold
+│   ├── record.py        # ffmpeg / MJPG writer
+│   ├── web_app.py       # Routes
+│   ├── recordings.py    # Listing + path safety
+│   ├── preview.py       # Preview gate / scale / fps cap
+│   ├── templates/index.html
+│   └── static/
+├── tests/
+├── scripts/fake_mjpeg.py
+└── models/              # MoveNet (downloaded, gitignored)
 ```
 
 ## License

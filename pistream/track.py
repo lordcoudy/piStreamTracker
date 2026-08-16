@@ -18,10 +18,37 @@ from pistream.config import apply_cli_overrides, configure_logging, load_config
 from pistream.detect import AsyncDetector, PoseDetector
 from pistream.horizon import tilt_degrees
 from pistream.motors import MotorController
+from pistream.camera_auth import auth_headers
 from pistream.preview import accept_new_frame, capped_recording_fps
 from pistream.record import _RecordingThread
 
 logger = logging.getLogger(__name__)
+
+REINIT_IOU = 0.3
+
+
+def bbox_iou(a: tuple, b: tuple) -> float:
+    """Intersection-over-union for (x, y, w, h) boxes."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def should_reinit_tracker(active: bool, iou: Optional[float], min_iou: float = REINIT_IOU) -> bool:
+    if not active:
+        return True
+    if iou is None:
+        return True
+    return iou < min_iou
 
 
 class ObjectTracker:
@@ -131,6 +158,8 @@ class HumanTracker:
         self.running = False
         self.recording = False
         self.current_detection = None
+        self._last_keypoints = None
+        self._last_confidence = 0.5
         self.frame_count = 0
         self._rec_thread: Optional[_RecordingThread] = None
         self._fps_count = 0
@@ -147,6 +176,7 @@ class HumanTracker:
         # Recording mode: 'local' (Pi 5) or 'camera' (Pi 3B+)
         self.recording_mode = tracker_cfg.get('recording_mode', 'local')
         self._camera_base_url = f"http://{net['camera_ip']}:{cam['port']}"
+        self._camera_token = (cam or {}).get('token') or ''
 
         # Async detector (created in connect() once we know frame size)
         self._async_detector: Optional[AsyncDetector] = None
@@ -191,7 +221,13 @@ class HumanTracker:
         if self._async_detector is not None:
             det_result = self._async_detector.get_result()
         if det_result:
-            self.tracker.init(frame, det_result['bbox'])
+            iou = None
+            if self.tracker.active and self.current_detection:
+                iou = bbox_iou(self.current_detection['bbox'], det_result['bbox'])
+            if should_reinit_tracker(self.tracker.active, iou):
+                self.tracker.init(frame, det_result['bbox'])
+            self._last_keypoints = det_result.get('keypoints')
+            self._last_confidence = det_result.get('confidence', 0.5)
             self.current_detection = det_result
 
         # --- 2. Submit frame for detection when needed ----------------------
@@ -212,14 +248,8 @@ class HumanTracker:
         if tracked_bbox is not None:
             detection = {
                 'bbox': tracked_bbox,
-                'confidence': (
-                    self.current_detection.get('confidence', 0.5)
-                    if self.current_detection else 0.5
-                ),
-                'keypoints': (
-                    self.current_detection.get('keypoints')
-                    if self.current_detection else None
-                ),
+                'confidence': self._last_confidence,
+                'keypoints': self._last_keypoints,
             }
             self.current_detection = detection
         elif det_result:
@@ -331,6 +361,7 @@ class HumanTracker:
                 req = urllib.request.Request(
                     f"{self._camera_base_url}/record/start",
                     method='POST', data=b'',
+                    headers=auth_headers(self._camera_token),
                 )
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     import json
@@ -373,6 +404,7 @@ class HumanTracker:
                 req = urllib.request.Request(
                     f"{self._camera_base_url}/record/stop",
                     method='POST', data=b'',
+                    headers=auth_headers(self._camera_token),
                 )
                 urllib.request.urlopen(req, timeout=5)
                 logger.info("Camera-side recording stopped")
@@ -469,6 +501,7 @@ class HumanTracker:
                     elif key == ord('d'):
                         self.tracker.reset()
                         self.current_detection = None
+                        self._last_keypoints = None
                         self.motors.move_to_home()
                         logger.info("Detection reset + camera homed")
                     elif key == ord('e'):

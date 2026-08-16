@@ -7,13 +7,23 @@ import cv2
 
 logger = logging.getLogger(__name__)
 
+BURST_RECONNECTS = 10
+BURST_DELAY = 1.0
+BACKOFF_DELAY = 5.0
+
+
+def reconnect_wait(reconnects: int) -> float:
+    """Seconds to wait before the next reconnect. Never 0 (never give up)."""
+    if reconnects > 0 and reconnects % BURST_RECONNECTS == 0:
+        return BACKOFF_DELAY
+    return BURST_DELAY
+
 
 class VideoCapture:
     """Threaded video capture with low-latency buffering and auto-reconnect."""
 
     MAX_FAILURES = 30        # consecutive read failures before reconnect
-    RECONNECT_DELAY = 1.0    # seconds between reconnect attempts
-    MAX_RECONNECTS = 10      # give up after this many consecutive reconnects
+    MAX_RECONNECTS = BURST_RECONNECTS
 
     def __init__(self, source: str, buffer_size: int = 2):
         self.source = source
@@ -101,22 +111,23 @@ class VideoCapture:
             else:
                 failures += 1
                 if failures >= self.MAX_FAILURES:
-                    if reconnects >= self.MAX_RECONNECTS:
-                        logger.error("Max reconnect attempts reached, giving up")
-                        with self._lock:
-                            self._ret = False
-                        return
-                    logger.warning(f"Stream lost ({failures} failures), reconnecting...")
-                    self._stop.wait(self.RECONNECT_DELAY)
+                    with self._lock:
+                        self._ret = False
+                    reconnects += 1
+                    delay = reconnect_wait(reconnects)
+                    logger.warning(
+                        f"Stream lost ({failures} failures), "
+                        f"reconnect {reconnects} in {delay:.0f}s"
+                    )
+                    self._stop.wait(delay)
                     if self._stop.is_set():
                         return
                     if self._open_capture():
                         logger.info("Stream reconnected")
                         failures = 0
-                        reconnects += 1
+                        reconnects = 0
                     else:
-                        reconnects += 1
-                        logger.warning(f"Reconnect attempt {reconnects}/{self.MAX_RECONNECTS} failed")
+                        logger.warning(f"Reconnect attempt {reconnects} failed")
                 else:
                     self._stop.wait(0.005)
 
@@ -136,3 +147,8 @@ class VideoCapture:
     @property
     def is_open(self) -> bool:
         return self._cap is not None and self._cap.isOpened()
+
+    @property
+    def stream_lost(self) -> bool:
+        with self._lock:
+            return not self._ret

@@ -17,7 +17,9 @@ def compute_axis_command(
         return None
     if frame_dim <= 0 or scale <= 0:
         return None
-    speed = int(min(abs(shift) / 100.0 * speed_factor, max_speed))
+    excess = abs(shift) - deadzone
+    span = max(frame_dim / 2.0 - deadzone, 1.0)
+    speed = int(min(excess / span * max_speed * speed_factor, max_speed))
     degrees = int((-shift if invert else shift) / (frame_dim / scale))
     if speed <= 0:
         return None

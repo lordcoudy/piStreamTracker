@@ -7,7 +7,6 @@ Simple Flask-based control panel for the tracking system
 import logging
 import time
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from typing import Optional
@@ -21,7 +20,11 @@ from pistream.config import (apply_cli_overrides, configure_logging, load_config
                              web_bind_host)
 from pistream.lifecycle import TrackerLifecycle
 from pistream.preview import accept_new_frame, camera_stream_url, preview_gate, preview_target_size
-from pistream.recordings import is_recording_file, safe_recording_path
+from pistream.recordings import (
+    fetch_remote_recordings,
+    list_recording_files,
+    safe_recording_path,
+)
 from pistream.track import HumanTracker
 
 logger = logging.getLogger(__name__)
@@ -172,6 +175,7 @@ def api_status():
             shift_x = x + w // 2 - cx
             shift_y = y + h // 4 - cy
 
+        stream_lost = bool(trk.capture and trk.capture.stream_lost)
         return jsonify({
             'running': trk.running,
             'recording': trk.recording,
@@ -183,6 +187,7 @@ def api_status():
             'zoom': trk.zoom_level,
             'horizon': trk.horizon_correction,
             'overlay': _overlay_enabled,
+            'stream_lost': stream_lost,
         })
 
     return jsonify({
@@ -196,6 +201,7 @@ def api_status():
         'zoom': 1.0,
         'horizon': False,
         'overlay': _overlay_enabled,
+        'stream_lost': False,
     })
 
 
@@ -229,6 +235,7 @@ def api_reset():
     if trk:
         trk.tracker.reset()
         trk.current_detection = None
+        trk._last_keypoints = None
         trk.motors.move_to_home()
     return jsonify({'status': 'ok'})
 
@@ -378,32 +385,19 @@ def _recording_dir() -> Path:
 
 @app.route('/api/recordings')
 def api_recordings():
-    """List recording files."""
-    rec_path = _recording_dir()
-    if not rec_path.exists():
-        return jsonify({'files': []})
-
-    files = []
-    for f in sorted(rec_path.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if not is_recording_file(f):
-            continue
-        stat = f.stat()
-        size = stat.st_size
-        if size < 1024:
-            size_str = f"{size} B"
-        elif size < 1024 * 1024:
-            size_str = f"{size / 1024:.1f} KB"
-        else:
-            size_str = f"{size / (1024 * 1024):.1f} MB"
-        date_str = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
-        files.append({
-            'name': f.name,
-            'size': size_str,
-            'bytes': stat.st_size,
-            'date': date_str,
-            'type': f.suffix.lower().lstrip('.')
-        })
-
+    """List recording files (local, or camera Pi when recording_mode is camera)."""
+    files = list_recording_files(_recording_dir())
+    mode = (_config.get('tracker') or {}).get('recording_mode', 'local')
+    if mode == 'camera':
+        net = _config.get('network') or {}
+        cam = _config.get('camera') or {}
+        base = f"http://{net.get('camera_ip', '127.0.0.1')}:{cam.get('port', 8000)}"
+        try:
+            remote = fetch_remote_recordings(base, cam.get('token') or '')
+            if remote:
+                files = remote
+        except Exception as exc:
+            logger.warning(f"Camera recording list failed: {exc}")
     return jsonify({'files': files})
 
 

@@ -227,6 +227,10 @@ create_service() {
     print_step "Creating systemd service..."
 
     local work_dir=$(pwd)
+    local py="${work_dir}/venv/bin/python"
+    if [[ ! -x "$py" && -x "${work_dir}/.venv/bin/python" ]]; then
+        py="${work_dir}/.venv/bin/python"
+    fi
 
     sudo tee /etc/systemd/system/pitracker.service > /dev/null << EOF
 [Unit]
@@ -237,7 +241,10 @@ After=network.target
 Type=simple
 User=$(whoami)
 WorkingDirectory=${work_dir}
-ExecStart=${work_dir}/venv/bin/python ${work_dir}/${script}
+Environment=OPENBLAS_NUM_THREADS=2
+Environment=OMP_NUM_THREADS=2
+Environment=MKL_NUM_THREADS=2
+ExecStart=${py} ${work_dir}/${script}
 Restart=always
 RestartSec=5
 

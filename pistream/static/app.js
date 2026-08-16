@@ -118,7 +118,6 @@
             document.getElementById('btn-stop').disabled = !isTracking;
             document.getElementById('btn-record').textContent = isRecording ? 'Stop Rec' : 'Record';
             document.getElementById('btn-record').className = isRecording ? 'danger' : '';
-            document.getElementById('status-tracking').className = 'dot ' + (isTracking ? 'green' : 'red');
             document.getElementById('status-recording').className = 'dot ' + (isRecording ? 'red' : 'yellow');
         }
 
@@ -127,6 +126,12 @@
             if (res) {
                 isTracking = res.running;
                 isRecording = res.recording;
+                const trackingDot = document.getElementById('status-tracking');
+                if (res.running && res.stream_lost) {
+                    trackingDot.className = 'dot yellow';
+                } else {
+                    trackingDot.className = 'dot ' + (isTracking ? 'green' : 'red');
+                }
                 document.getElementById('status-ev3').className = 'dot ' + (res.ev3_connected ? 'green' : 'red');
                 document.getElementById('ev3-toggle').checked = res.ev3_connected;
                 document.getElementById('info-fps').textContent = res.fps.toFixed(1);

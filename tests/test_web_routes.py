@@ -42,3 +42,11 @@ class WebRecordingsRouteTests(unittest.TestCase):
                 body, status = web_app.api_recordings_delete('/etc/passwd')
         self.assertEqual(status, 403)
         self.assertEqual(body.get_json().get('status'), 'error')
+
+    def test_status_includes_stream_lost_flag(self):
+        from pistream import web_app
+
+        web_app._lifecycle = None
+        payload = web_app.app.test_client().get('/api/status').get_json()
+        self.assertIn('stream_lost', payload)
+        self.assertFalse(payload['stream_lost'])

@@ -4,7 +4,12 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from pistream.recordings import RECORDING_SUFFIXES, is_recording_file, safe_recording_path
+from pistream.recordings import (
+    RECORDING_SUFFIXES,
+    is_recording_file,
+    list_recording_files,
+    safe_recording_path,
+)
 
 
 class RecordingSuffixTests(unittest.TestCase):
@@ -25,6 +30,15 @@ class RecordingSuffixTests(unittest.TestCase):
             p = Path(tmp) / 'rec_20260101.mp4'
             p.write_bytes(b'x')
             self.assertTrue(is_recording_file(p))
+
+    def test_list_recording_files_includes_mp4(self):
+        with TemporaryDirectory() as tmp:
+            rec = Path(tmp)
+            (rec / 'talk.mp4').write_bytes(b'x')
+            (rec / 'notes.md').write_text('no')
+            names = {item['name'] for item in list_recording_files(rec)}
+        self.assertIn('talk.mp4', names)
+        self.assertNotIn('notes.md', names)
 
 
 class SafeRecordingPathTests(unittest.TestCase):

@@ -19,7 +19,7 @@ def project_root() -> Path:
 def default_config() -> dict:
     return {
         'network': {'camera_ip': '192.168.100.1', 'tracker_ip': '192.168.100.2'},
-        'camera': {'port': 8000, 'framerate': 30},
+        'camera': {'port': 8000, 'framerate': 30, 'token': None, 'max_stream_clients': 4},
         'tracker': {
             'output_dir': 'recordings',
             'recording_fps': 30,

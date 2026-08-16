@@ -69,7 +69,9 @@ class AxisCommandTests(unittest.TestCase):
         self.assertIsNotNone(cmd)
         degrees, speed = cmd
         self.assertEqual(degrees, 20)  # 200 / (1280/128)
-        self.assertEqual(speed, 2)     # min(200/100 * 1.0, 50)
+        # (|200|-90) / (1280/2 - 90) * 50 = 110/550 * 50 = 10
+        self.assertEqual(speed, 10)
+        self.assertGreater(speed, 2)
 
 
 class HomeHoldTests(unittest.TestCase):
