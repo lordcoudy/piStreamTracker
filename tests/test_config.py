@@ -1,0 +1,79 @@
+"""Config preset and CLI merge helpers."""
+
+import unittest
+from argparse import Namespace
+
+from pistream.config import (apply_cli_overrides, apply_preset, camera_bind_host,
+                             web_bind_host)
+
+
+def _base():
+    return {
+        'network': {'tracker_ip': '192.168.100.2'},
+        'tracker': {
+            'stream_url': None,
+            'output_dir': 'recordings',
+            'detection': {'interval': 10, 'scale': 0.4, 'confidence': 0.5},
+            'movenet': {'threads': 4},
+        },
+        'ev3': {'enabled': True},
+        'web': {'host': None, 'port': 5000},
+        'presets': {
+            'fast': {'detection_interval': 10, 'process_scale': 0.35, 'movenet_threads': 4},
+            'quality': {'detection_interval': 4, 'process_scale': 0.6, 'movenet_threads': 4},
+        },
+    }
+
+
+class ApplyPresetTests(unittest.TestCase):
+    def test_fast_preset_overrides_scale(self):
+        cfg = apply_preset(_base(), 'fast')
+        self.assertEqual(cfg['tracker']['detection']['scale'], 0.35)
+        self.assertEqual(cfg['tracker']['detection']['interval'], 10)
+
+    def test_unknown_preset_raises(self):
+        with self.assertRaises(ValueError):
+            apply_preset(_base(), 'turbo')
+
+
+class CliOverrideTests(unittest.TestCase):
+    def test_explicit_interval_wins_over_preset(self):
+        args = Namespace(
+            url=None, output_dir=None, detection_interval=7,
+            process_scale=None, confidence=None, movenet_threads=None,
+            no_ev3=False, preset='fast',
+        )
+        cfg = apply_cli_overrides(_base(), args)
+        self.assertEqual(cfg['tracker']['detection']['interval'], 7)
+        self.assertEqual(cfg['tracker']['detection']['scale'], 0.35)
+
+    def test_no_ev3_disables_motors(self):
+        args = Namespace(
+            url=None, output_dir=None, detection_interval=None,
+            process_scale=None, confidence=None, movenet_threads=None,
+            no_ev3=True, preset=None,
+        )
+        cfg = apply_cli_overrides(_base(), args)
+        self.assertFalse(cfg['ev3']['enabled'])
+
+
+class WebBindHostTests(unittest.TestCase):
+    def test_falls_back_to_tracker_ip(self):
+        self.assertEqual(web_bind_host(_base()), '192.168.100.2')
+
+    def test_explicit_host_wins(self):
+        cfg = _base()
+        cfg['web']['host'] = '0.0.0.0'
+        self.assertEqual(web_bind_host(cfg), '0.0.0.0')
+
+
+class CameraBindHostTests(unittest.TestCase):
+    def test_falls_back_to_camera_ip(self):
+        cfg = _base()
+        cfg['network']['camera_ip'] = '192.168.100.1'
+        cfg['camera'] = {'host': None}
+        self.assertEqual(camera_bind_host(cfg), '192.168.100.1')
+
+
+if __name__ == '__main__':
+    unittest.main()

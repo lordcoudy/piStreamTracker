@@ -8,8 +8,16 @@ wheels/
 
 # Virtual environments
 .venv
-uv.lock
-pyproject.toml
+venv/
+
+# Isolated git worktrees
+.worktrees/
+
+# Editor / local tooling
+.kilo/
+
+# Downloaded models
+models/*.tflite
 
 # Logs
 *.log

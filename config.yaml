@@ -14,8 +14,11 @@ network:
 
 # Camera Server Settings (Pi 3B+)
 camera:
-  host: "0.0.0.0"
+  host: null                # null = bind camera_ip only (set 0.0.0.0 to listen on all NICs)
   port: 8000
+  framerate: 30
+  token: null               # optional Bearer token for /record/* (empty = open LAN)
+  max_stream_clients: 4     # concurrent /stream connections
   recording_dir: "recordings"   # Server-side recording output (used when recording_mode: camera)
   resolution:
     width: 1280
@@ -25,7 +28,7 @@ camera:
 tracker:
   stream_url: null  # Auto: http://192.168.100.1:8000/stream
   output_dir: "recordings"
-  recording_fps: 60  # Fixed output framerate for recordings (stable regardless of processing speed)
+  recording_fps: 30  # Capped to camera.framerate (duplicating frames costs CPU and disk)
 
   # Recording encoder — controls CPU vs hardware encoding
   #   "auto"            — auto-detect best encoder (recommended)
@@ -64,6 +67,7 @@ ev3:
     x: false              # Invert horizontal direction
     y: false              # Invert vertical direction
   cooldown: 0.5           # Command cooldown in seconds
+  home_hold: 3.0          # Seconds to ignore auto-track after Reset/home
   ports:
     pan: "a"              # Horizontal (pan) motor port
     tilt: "b"             # Vertical (tilt) motor port
@@ -71,10 +75,14 @@ ev3:
 # Web Interface Settings
 web:
   enabled: true
-  host: "0.0.0.0"
+  host: null              # null = bind tracker_ip only (set 0.0.0.0 to listen on all NICs)
   port: 5000
+  overlay: true           # false = proxy raw camera MJPEG (no re-encode)
+  preview_quality: 70     # JPEG quality for the annotated preview
+  preview_max_edge: 640   # Long-side cap in pixels (0 = native)
+  preview_max_fps: 15     # Do not re-encode faster than this
 
-# Performance Presets (used by run scripts)
+# Performance Presets (used by run scripts via --preset)
 presets:
   pi3:
     detection_interval: 15
@@ -83,6 +91,14 @@ presets:
   pi5:
     detection_interval: 10
     process_scale: 0.4
+    movenet_threads: 4
+  fast:
+    detection_interval: 10
+    process_scale: 0.35
+    movenet_threads: 4
+  quality:
+    detection_interval: 4
+    process_scale: 0.6
     movenet_threads: 4
 
 # Logging

@@ -8,16 +8,19 @@ import io
 import json
 import logging
 import socketserver
-import time
 from datetime import datetime
 from http import server
 from pathlib import Path
 from threading import Condition, Lock
 
-import yaml
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder, JpegEncoder
 from picamera2.outputs import FfmpegOutput, FileOutput
+
+from pistream.camera_auth import extract_bearer, token_ok
+from pistream.config import camera_bind_host, load_config
+from pistream.recordings import list_recording_files
+from pistream.stream_limit import StreamLimiter
 
 # Configure logging
 logging.basicConfig(
@@ -27,22 +30,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_config(path: str = "config.yaml") -> dict:
-    """Load configuration from file."""
-    config_file = Path(path)
-    if config_file.exists():
-        with open(config_file) as f:
-            return yaml.safe_load(f) or {}
-    return {}
-
-
 # Load configuration
 config = load_config()
 camera_cfg = config.get('camera', {})
 network_cfg = config.get('network', {})
 
 # Settings with defaults
-HOST = camera_cfg.get('host', '0.0.0.0')
+HOST = camera_bind_host(config)
 PORT = camera_cfg.get('port', 8000)
 WIDTH = camera_cfg.get('resolution', {}).get('width', 1280)
 HEIGHT = camera_cfg.get('resolution', {}).get('height', 960)
@@ -51,6 +45,8 @@ JPEG_QUALITY = camera_cfg.get('jpeg_quality', 80)
 CAMERA_IP = network_cfg.get('camera_ip', '192.168.100.1')
 OUTPUT_DIR = Path(camera_cfg.get('recording_dir', 'recordings'))
 OUTPUT_DIR.mkdir(exist_ok=True)
+CAMERA_TOKEN = camera_cfg.get('token') or ''
+STREAM_LIMIT = StreamLimiter(max_clients=int(camera_cfg.get('max_stream_clients') or 4))
 
 
 # HTML page template
@@ -180,6 +176,10 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.wfile.write(content)
 
         elif self.path == '/stream':
+            if not STREAM_LIMIT.acquire():
+                logger.warning('Stream client cap reached')
+                self.send_error(503, 'Too many stream clients')
+                return
             self.send_response(200)
             self.send_header('Age', 0)
             self.send_header('Cache-Control', 'no-cache, private')
@@ -208,6 +208,13 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 
             except Exception as e:
                 logger.debug(f'Client disconnected: {self.client_address} - {e}')
+            finally:
+                STREAM_LIMIT.release()
+
+        elif self.path == '/record/list':
+            if not self._authorized():
+                return
+            self._json_response({'files': list_recording_files(OUTPUT_DIR)})
 
         elif self.path == '/record/status':
             self._json_response({
@@ -219,7 +226,16 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_error(404)
             self.end_headers()
 
+    def _authorized(self) -> bool:
+        provided = extract_bearer(self.headers.get('Authorization'))
+        if token_ok(provided, CAMERA_TOKEN or None):
+            return True
+        self._json_response({'error': 'unauthorized'}, 401)
+        return False
+
     def do_POST(self):
+        if self.path in ('/record/start', '/record/stop') and not self._authorized():
+            return
         if self.path == '/record/start':
             if not self.recorder:
                 self._json_response({'error': 'recorder not available'}, 500)
@@ -292,7 +308,7 @@ def main():
         logger.info(f"Resolution:    {WIDTH}x{HEIGHT}")
         logger.info(f"Stream URL:    http://{CAMERA_IP}:{PORT}/stream")
         logger.info(f"Web Interface: http://{CAMERA_IP}:{PORT}/")
-        logger.info(f"Record API:    POST /record/start  POST /record/stop")
+        logger.info("Record API:    POST /record/start  POST /record/stop")
         logger.info(f"Recordings:    {OUTPUT_DIR}/")
         logger.info("Press Ctrl+C to stop")
         logger.info("=" * 50)

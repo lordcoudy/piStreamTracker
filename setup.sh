@@ -96,7 +96,8 @@ install_system_deps() {
         libv4l-dev libxvidcore-dev libx264-dev \
         libfontconfig1-dev libcairo2-dev libgdk-pixbuf-2.0-dev \
         libpango1.0-dev libgtk-3-dev libopenblas-dev \
-        python3-dev
+        python3-dev \
+        ffmpeg
 
     # Camera dependencies (if available)
     if [[ "$1" == "camera" ]] || [[ "$1" == "full" ]]; then
@@ -226,6 +227,10 @@ create_service() {
     print_step "Creating systemd service..."
 
     local work_dir=$(pwd)
+    local py="${work_dir}/venv/bin/python"
+    if [[ ! -x "$py" && -x "${work_dir}/.venv/bin/python" ]]; then
+        py="${work_dir}/.venv/bin/python"
+    fi
 
     sudo tee /etc/systemd/system/pitracker.service > /dev/null << EOF
 [Unit]
@@ -236,7 +241,10 @@ After=network.target
 Type=simple
 User=$(whoami)
 WorkingDirectory=${work_dir}
-ExecStart=${work_dir}/venv/bin/python ${work_dir}/${script}
+Environment=OPENBLAS_NUM_THREADS=2
+Environment=OMP_NUM_THREADS=2
+Environment=MKL_NUM_THREADS=2
+ExecStart=${py} ${work_dir}/${script}
 Restart=always
 RestartSec=5
 
@@ -249,6 +257,17 @@ EOF
     print_step "Service created (pitracker.service)"
     echo "  Enable with: sudo systemctl enable pitracker"
     echo "  Start with:  sudo systemctl start pitracker"
+}
+
+# Allow non-root access to the EV3 brick over USB (LEGO vendor 0694)
+install_ev3_udev() {
+    print_step "Installing EV3 udev rule (USB without root)..."
+    sudo tee /etc/udev/rules.d/99-ev3.rules > /dev/null << 'EOF'
+SUBSYSTEM=="usb", ATTR{idVendor}=="0694", MODE="0666", GROUP="plugdev"
+EOF
+    sudo udevadm control --reload-rules 2>/dev/null || true
+    sudo usermod -aG plugdev,video "$(whoami)" 2>/dev/null || true
+    print_step "udev rule installed (re-plug the EV3 / re-login for groups)"
 }
 
 # Make scripts executable
@@ -271,7 +290,7 @@ print_instructions() {
         echo "Pi 3B+ Camera Setup Complete!"
         echo ""
         echo "To start the camera server:"
-        echo "  sudo ./run_cam.sh"
+        echo "  ./run_cam.sh"
         echo ""
         echo "Stream URL: http://192.168.100.1:8000/stream"
         echo ""
@@ -281,8 +300,8 @@ print_instructions() {
         echo "Pi 5 Tracker Setup Complete!"
         echo ""
         echo "To start tracking:"
-        echo "  sudo ./run_tracker.sh          # With display"
-        echo "  sudo ./run_tracker.sh --web    # Web interface only"
+        echo "  ./run_tracker.sh          # With display"
+        echo "  ./run_tracker.sh --web    # Web interface only"
         echo ""
         echo "Web interface: http://192.168.100.2:5000"
         echo ""
@@ -384,6 +403,14 @@ main() {
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             create_service "$mode"
+        fi
+
+        if [[ "$mode" == "tracker" ]]; then
+            read -p "Install EV3 udev rule (USB without root)? [Y/n] " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                install_ev3_udev
+            fi
         fi
     fi
 

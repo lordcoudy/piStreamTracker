@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>piStreamTracker</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>piStreamTracker</h1>
+            <div class="status">
+                <div class="status-item">
+                    <span class="dot" id="status-tracking"></span>
+                    <span>Tracking</span>
+                </div>
+                <div class="status-item">
+                    <span class="dot" id="status-ev3"></span>
+                    <span>EV3</span>
+                </div>
+                <div class="status-item">
+                    <span class="dot" id="status-recording"></span>
+                    <span>Recording</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="main-grid">
+            <div class="video-container">
+                <img id="video-feed" src="/video_feed" alt="Video Feed">
+                <div class="video-overlay" id="fps-display">-- FPS</div>
+            </div>
+
+            <div class="controls">
+                <div class="panel">
+                    <h3>Tracking Control</h3>
+                    <div class="btn-group">
+                        <button id="btn-start" class="success" onclick="startTracking()">Start</button>
+                        <button id="btn-stop" class="danger" onclick="stopTracking()" disabled>Stop</button>
+                        <button id="btn-reset" class="secondary" onclick="resetDetection()">Reset</button>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>Recording</h3>
+                    <div class="btn-group">
+                        <button id="btn-record" onclick="toggleRecording()">Record</button>
+                        <button onclick="takeScreenshot()">Screenshot</button>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>EV3 Motor Control</h3>
+                    <label class="toggle-switch">
+                        <span>Motors Enabled</span>
+                        <input type="checkbox" id="ev3-toggle" onchange="toggleEV3()">
+                        <span class="slider"></span>
+                    </label>
+                    <div class="slider-group">
+                        <label>
+                            <span>Speed Factor</span>
+                            <span id="speed-value">1.0</span>
+                        </label>
+                        <input type="range" id="speed-slider" min="0.1" max="2.0" step="0.1" value="1.0"
+                               onchange="updateSetting('ev3_speed', this.value)">
+                    </div>
+                    <div class="slider-group">
+                        <label>
+                            <span>Deadzone</span>
+                            <span id="deadzone-value">90</span>
+                        </label>
+                        <input type="range" id="deadzone-slider" min="20" max="200" step="10" value="90"
+                               onchange="updateSetting('ev3_deadzone', this.value)">
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>Manual Camera Control</h3>
+                    <div class="dpad">
+                        <div class="dpad-empty"></div>
+                        <button onclick="moveCamera('up')" title="Tilt Up">▲</button>
+                        <div class="dpad-empty"></div>
+                        <button onclick="moveCamera('left')" title="Pan Left">◀</button>
+                        <div class="dpad-center">10°</div>
+                        <button onclick="moveCamera('right')" title="Pan Right">▶</button>
+                        <div class="dpad-empty"></div>
+                        <button onclick="moveCamera('down')" title="Tilt Down">▼</button>
+                        <div class="dpad-empty"></div>
+                    </div>
+                    <div class="slider-group">
+                        <label>
+                            <span>Step Size</span>
+                            <span id="step-value">10</span>°
+                        </label>
+                        <input type="range" id="step-slider" min="2" max="30" step="1" value="10"
+                               oninput="document.getElementById('step-value').textContent=this.value; document.querySelector('.dpad-center').textContent=this.value+'°'">
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>Zoom</h3>
+                    <div class="zoom-controls">
+                        <button class="secondary" onclick="zoomCamera('out')">-</button>
+                        <span class="zoom-level" id="zoom-value">1.0x</span>
+                        <button class="secondary" onclick="zoomCamera('in')">+</button>
+                        <button class="secondary" onclick="zoomCamera('reset')" style="margin-left:auto">Reset</button>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>Preview</h3>
+                    <label class="toggle-switch">
+                        <span>Tracking overlay</span>
+                        <input type="checkbox" id="overlay-toggle" checked onchange="toggleOverlay()">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+
+                <div class="panel">
+                    <h3>Horizon Stabilization</h3>
+                    <label class="toggle-switch">
+                        <span>Auto-Level</span>
+                        <input type="checkbox" id="horizon-toggle" onchange="toggleHorizon()">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+
+                <div class="panel">
+                    <h3>Detection Settings</h3>
+                    <div class="slider-group">
+                        <label>
+                            <span>Confidence</span>
+                            <span id="conf-value">0.5</span>
+                        </label>
+                        <input type="range" id="conf-slider" min="0.2" max="0.9" step="0.05" value="0.5"
+                               onchange="updateSetting('confidence', this.value)">
+                    </div>
+                    <div class="slider-group">
+                        <label>
+                            <span>Detection Interval</span>
+                            <span id="interval-value">8</span>
+                        </label>
+                        <input type="range" id="interval-slider" min="2" max="20" step="1" value="8"
+                               onchange="updateSetting('interval', this.value)">
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>Status</h3>
+                    <div class="info-grid">
+                        <div class="info-item">
+                            <div class="value" id="info-fps">--</div>
+                            <div class="label">FPS</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="value" id="info-detection">--</div>
+                            <div class="label">Detection</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="value" id="info-shift-x">--</div>
+                            <div class="label">Shift X</div>
+                        </div>
+                        <div class="info-item">
+                            <div class="value" id="info-shift-y">--</div>
+                            <div class="label">Shift Y</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <h3>Log</h3>
+                    <div class="log-output" id="log-output"></div>
+                </div>
+
+                <div class="panel">
+                    <div class="recordings-header" onclick="toggleRecordingsPanel()">
+                        <h3>Recordings</h3>
+                        <span class="recordings-toggle" id="rec-toggle">&#9660;</span>
+                    </div>
+                    <div class="recordings-body" id="rec-body">
+                        <div style="margin-top:10px">
+                            <button class="secondary" onclick="loadRecordings()" style="padding:6px 12px;font-size:0.8rem">Refresh</button>
+                        </div>
+                        <div class="rec-list" id="rec-list">
+                            <div class="rec-empty">Click Refresh to load</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
