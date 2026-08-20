@@ -86,6 +86,7 @@ class _RecordingThread:
         self._height = height
         self._stderr_lines: list[str] = []
         self._stderr_thread: Optional[Thread] = None
+        self.output_path = path
 
         self._init_writer(path, width, height, fps, encoder)
 
@@ -96,8 +97,10 @@ class _RecordingThread:
         """Try ffmpeg pipe first, fall back to OpenCV MJPG."""
         if encoder == 'auto':
             encoder = _probe_encoder()
+        elif encoder == 'mjpg':
+            encoder = ''
 
-        if encoder:
+        if encoder and shutil.which('ffmpeg'):
             try:
                 self._start_ffmpeg(path, w, h, fps, encoder)
                 return
@@ -109,12 +112,17 @@ class _RecordingThread:
         fourcc = cv2.VideoWriter_fourcc(*'MJPG')
         fallback_path = path.rsplit('.', 1)[0] + '.avi'
         self._cv_writer = cv2.VideoWriter(fallback_path, fourcc, fps, (w, h))
+        if not self._cv_writer.isOpened():
+            self._cv_writer.release()
+            self._cv_writer = None
+            raise RuntimeError(f"Could not open recording output: {fallback_path}")
+        self.output_path = fallback_path
 
     def _start_ffmpeg(self, path: str, w: int, h: int, fps: float,
                       encoder: str):
         """Launch ffmpeg as a subprocess accepting raw BGR frames on stdin."""
         cmd = [
-            'ffmpeg', '-y',
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning', '-nostats',
             '-f', 'rawvideo',
             '-pix_fmt', 'bgr24',
             '-s', f'{w}x{h}',
@@ -157,6 +165,8 @@ class _RecordingThread:
 
     def start(self):
         """Start the recording thread."""
+        if not self.ready:
+            raise RuntimeError("Recording writer is not available")
         self._stop.clear()
         self._thread = Thread(target=self._run, daemon=True, name="RecordingThread")
         self._thread.start()
@@ -174,6 +184,10 @@ class _RecordingThread:
             except Exception as e:
                 logger.debug(f"ffmpeg close: {e}")
                 self._proc.kill()
+                try:
+                    self._proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    logger.warning("ffmpeg did not exit after being killed")
 
         if self._stderr_thread and self._stderr_thread.is_alive():
             self._stderr_thread.join(timeout=2.0)
@@ -198,6 +212,7 @@ class _RecordingThread:
                 line = raw_line.decode(errors='replace').rstrip()
                 if line:
                     self._stderr_lines.append(line)
+                    del self._stderr_lines[:-100]
         except (ValueError, OSError):
             pass  # stderr closed
 
@@ -215,7 +230,7 @@ class _RecordingThread:
                 return
             try:
                 self._proc.stdin.write(frame.tobytes())
-            except BrokenPipeError:
+            except (BrokenPipeError, OSError, ValueError):
                 tail = self._stderr_lines[-10:]
                 logger.warning(
                     "ffmpeg pipe broken — stopping recording\n"
@@ -230,13 +245,23 @@ class _RecordingThread:
         while not self._stop.is_set():
             now = time.monotonic()
             sleep_for = next_tick - now
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            next_tick += self._interval
+            if sleep_for > 0 and self._stop.wait(sleep_for):
+                break
+            if self._stop.is_set():
+                break
+
+            # Skip missed ticks instead of burst-writing duplicate frames
+            # after a stall in ffmpeg or the scheduler.
+            now = time.monotonic()
+            next_tick = max(next_tick + self._interval, now + self._interval)
 
             with self._lock:
                 frame = self._frame
             if frame is not None:
                 self._write(frame)
 
-
+    @property
+    def ready(self) -> bool:
+        if self._proc is not None:
+            return self._proc.poll() is None and self._proc.stdin is not None
+        return self._cv_writer is not None and self._cv_writer.isOpened()

@@ -76,6 +76,13 @@ class SafeRecordingPathTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 safe_recording_path(rec, '/etc/passwd')
 
+    def test_rejects_nested_path(self):
+        with TemporaryDirectory() as tmp:
+            rec = Path(tmp) / 'recordings'
+            (rec / 'nested').mkdir(parents=True)
+            with self.assertRaises(ValueError):
+                safe_recording_path(rec, 'nested/clip.mp4')
+
 
 if __name__ == '__main__':
     unittest.main()

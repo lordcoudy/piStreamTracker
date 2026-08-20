@@ -1,0 +1,75 @@
+flowchart TD
+  %% High-level runtime and deployment architecture.
+  OP["Operator"]
+  BROWSER["Browser UI"]
+
+  subgraph CAMERA["Camera Pi 3B+"]
+    CAM_RUN["run_cam.sh"] --> CAM_APP["camera.py"]
+    CAM_APP --> PICAM["Picamera2"]
+    PICAM --> FRAME_BUF["Latest JPEG frame buffer"]
+    CAM_APP --> CAM_HTTP{"Threaded camera HTTP server"}
+    FRAME_BUF --> CAM_HTTP
+
+    CAM_HTTP -->|"authenticated start / stop"| CAM_REC["CameraRecorder"]
+    CAM_REC --> CAM_H264["Camera H.264 recordings"]
+    CAM_HTTP -->|"authenticated list / download / delete"| CAM_H264
+  end
+
+  subgraph TRACKER["Tracker Pi 5"]
+    TRACK_RUN["run_tracker.sh"] --> MODE{"Runtime mode"}
+    MODE -->|"CLI"| CLI["tracker.py → track.main()"]
+    MODE -->|"--web"| WEB["web.py → web_app.main()"]
+
+    CONFIG["config.yaml + environment + CLI overrides"] --> CLI
+    CONFIG --> WEB
+
+    CLI --> CORE["HumanTracker"]
+    WEB --> LIFE["TrackerLifecycle"]
+    LIFE --> CORE
+
+    CORE --> CAPTURE["VideoCapture thread"]
+    CORE --> PIPELINE["Async pose detection + object tracking"]
+    CORE --> AIM["Aim calculation + motor policy"]
+    CORE --> LOCAL_REC["Local recording thread"]
+    LOCAL_REC --> LOCAL_FILES["ffmpeg H.264 or OpenCV MJPG files"]
+
+    PIPELINE --> ANNOTATED["Annotated latest-frame buffer"]
+    ANNOTATED --> WEB
+    WEB --> RECORDINGS["Unified local + camera recording API"]
+  end
+
+  subgraph ROBOT["LEGO EV3"]
+    USB["USB transport"] --> MOTORS["Horizontal + vertical motors"]
+  end
+
+  OP -->|"launch / configure"| TRACK_RUN
+  OP -->|"launch"| CAM_RUN
+  OP --> BROWSER
+
+  CAM_HTTP -->|"MJPEG GET /stream"| CAPTURE
+  CAM_HTTP -->|"raw-stream proxy"| WEB
+  CORE -->|"camera recording mode"| CAM_HTTP
+  RECORDINGS -->|"Bearer-authenticated /record/*"| CAM_HTTP
+
+  BROWSER -->|"control and settings APIs"| WEB
+  WEB -->|"annotated or raw MJPEG + JSON"| BROWSER
+
+  AIM --> USB
+
+  SETUP["setup.sh<br/>venv, dependencies, model, service and network setup"] -.-> CAM_RUN
+  SETUP -.-> TRACK_RUN
+  TESTS["pytest suite<br/>config, lifecycle, motors, preview, recording and routes"] -.-> CORE
+  TESTS -.-> WEB
+  TESTS -.-> CAM_HTTP
+
+  classDef actor fill:#fff7ed,stroke:#c2410c,color:#431407
+  classDef camera fill:#ecfeff,stroke:#0e7490,color:#083344
+  classDef tracker fill:#eff6ff,stroke:#1d4ed8,color:#172554
+  classDef robot fill:#f5f3ff,stroke:#6d28d9,color:#2e1065
+  classDef support fill:#f8fafc,stroke:#64748b,color:#0f172a,stroke-dasharray:5 3
+
+  class OP,BROWSER actor
+  class CAM_RUN,CAM_APP,PICAM,FRAME_BUF,CAM_HTTP,CAM_REC,CAM_H264 camera
+  class TRACK_RUN,MODE,CLI,WEB,CONFIG,LIFE,CORE,CAPTURE,PIPELINE,AIM,LOCAL_REC,LOCAL_FILES,ANNOTATED,RECORDINGS tracker
+  class USB,MOTORS robot
+  class SETUP,TESTS support

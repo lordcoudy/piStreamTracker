@@ -77,6 +77,28 @@ class TrackerLifecycleTests(unittest.TestCase):
         self.assertFalse(fake.running)
         self.assertIsNone(life.tracker)
 
+    def test_timeout_does_not_forget_live_connect_worker(self):
+        fake = FakeTracker(connect_ok=True, connect_delay=0.2)
+        life = TrackerLifecycle(lambda: fake, _loop_until_stopped, join_timeout=0.01)
+        result = life.start(connect_timeout=0.01)
+        self.assertEqual(result['status'], 'error')
+        self.assertIs(life.tracker, fake)
+        self.assertEqual(life.start(connect_timeout=0.01)['status'], 'already_running')
+        time.sleep(0.25)
+        self.assertEqual(life.stop()['status'], 'ok')
+        self.assertIsNone(life.tracker)
+
+    def test_connect_exception_is_reported_as_start_error(self):
+        class BrokenTracker(FakeTracker):
+            def connect(self):
+                raise RuntimeError('camera exploded')
+
+        life = TrackerLifecycle(BrokenTracker, _loop_until_stopped)
+        result = life.start(connect_timeout=1.0)
+        self.assertEqual(result['status'], 'error')
+        self.assertIn('camera exploded', result['message'])
+        self.assertIsNone(life.tracker)
+
     def test_cleanup_is_safe_to_call_twice_on_tracker(self):
         # HumanTracker.cleanup must not break if invoked after lifecycle finally.
         fake = FakeTracker(connect_ok=True)

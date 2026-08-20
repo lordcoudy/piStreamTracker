@@ -1,82 +1,98 @@
 flowchart LR
-  %% ========== Entry ==========
-  A["main()"] --> B["argparse CLI"]
-  B --> C["HumanTracker.__init__"]
-  C --> D["HumanTracker.run()"]
+  %% Detailed frame-processing and control flow shared by CLI and web modes.
+  START["CLI main or TrackerLifecycle"] --> INIT["HumanTracker.__init__<br/>config, detector, object tracker, motors"]
+  INIT --> CONNECT["connect()<br/>start capture, learn frame size, start async detector"]
+  CONNECT --> LOOP
 
-  %% ========== Core components ==========
-  subgraph T["HumanTracker"]
-    D --> E["connect()"]
-    D --> F["main loop"]
-    D --> G["cleanup()"]
+  subgraph MAIN["Per-frame loop"]
+    LOOP["Read latest frame"] --> GATE{"accept_new_frame()?"}
+    GATE -->|"duplicate / too soon"| LOOP
+    GATE -->|"accepted"| PROCESS["process_frame(frame)"]
 
-    %% connect()
-    E --> VC[VideoCapture]
-    E --> EV3S[MotorController.set_frame_size]
-    E --> SFB[Pre-allocate scaled frame buffer]
+    PROCESS --> POLL{"Fresh async result?"}
+    POLL -->|"person detected"| MATCH{"IoU matches current target?"}
+    MATCH -->|"yes, or no active target"| TRACK_INIT["ObjectTracker.init(bbox)"]
+    MATCH -->|"different target"| KEEP["Keep current tracker"]
+    POLL -->|"no person"| MISS["Increment detection misses"]
+    MISS -->|"miss limit reached"| DROP["Drop stale tracker"]
+    MISS -->|"below limit"| KEEP
 
-    %% main loop steps
-    F --> R["cap.read() -> latest frame"]
-    R --> PF["process_frame(frame)"]
-    PF -->|annotated frame| DISP["cv2.imshow / headless skip"]
-    PF --> KEY["_handle_key(q/r/s/d/e)"]
+    TRACK_INIT --> SUBMIT
+    KEEP --> SUBMIT
+    DROP --> SUBMIT
+    POLL -->|"no completed result"| SUBMIT
+
+    SUBMIT{"Detection due and worker idle?"} -->|"yes"| QUEUE["Copy scaled frame to async worker"]
+    SUBMIT -->|"no"| UPDATE
+    QUEUE --> UPDATE["ObjectTracker.update(frame)"]
+
+    UPDATE --> TARGET{"Tracked target available?"}
+    TARGET -->|"yes"| AIM["Aim at upper torso<br/>compute normalized x/y shift"]
+    AIM --> MOTOR["MotorController.update(x, y)"]
+    TARGET -->|"no"| STOP_MOTOR["MotorController.stop()"]
+
+    MOTOR --> DRAW["Draw box, keypoints and status"]
+    STOP_MOTOR --> DRAW
+    DRAW --> HORIZON{"Horizon correction enabled?"}
+    HORIZON -->|"yes"| ROTATE["Rotate and crop using calibrated angle"]
+    HORIZON -->|"no"| ZOOM
+    ROTATE --> ZOOM["Apply digital zoom"]
+    ZOOM --> OUTPUT["Return annotated frame"]
   end
 
-  %% ========== Video capture thread ==========
-  subgraph VCT["VideoCapture (background thread)"]
-    VC --> VCSTART["start()"]
-    VCSTART --> LOOP["_capture_loop()"]
-    LOOP -->|cap read| LATEST["latest frame + ret"]
-    R -->|locks + returns reference| LATEST
+  subgraph DETECT["Async pose-detection worker"]
+    QUEUE --> PREP["Resize, BGR → RGB, fill reusable input tensor"]
+    PREP --> INFER["TFLite interpreter.invoke()"]
+    INFER --> PARSE["Parse confident keypoints and person bbox"]
+    PARSE --> PUBLISH["Publish latest result"]
+    PUBLISH -.-> POLL
   end
 
-  %% ========== Detection + Tracking ==========
-  subgraph DT["Detection & Tracking"]
-    PF --> TRKCHK{"tracker exists?"}
-    TRKCHK -->|yes| TRKUP["_update_tracker()"]
-    TRKCHK -->|no / failed| DETNEED["need_detection=true"]
-
-    TRKUP -->|bbox or None| TRACKED["tracked_human"]
-    DETNEED --> RUNDET["_run_detection()"]
-    RUNDET --> MND["PoseDetector.detect()"]
-    RUNDET --> TRKINIT["_init_tracker(bbox)"]
-    TRKINIT --> TRACKED
+  subgraph DRIVE["EV3 motor control"]
+    MOTOR --> RATE{"Cooldown elapsed?"}
+    RATE -->|"no"| HOLD["Keep current command"]
+    RATE -->|"yes"| POLICY["compute_axis_command()<br/>dead zone, gain, limits"]
+    POLICY --> USB["EV3_USB.run_to() / stop()"]
+    USB --> PHYSICAL["Horizontal + vertical motors"]
+    STOP_MOTOR --> USB
   end
 
-  %% ========== MoveNet ==========
-  subgraph MN["PoseDetector (TFLite)"]
-    MND --> PRE["resize + BGR→RGB (preallocated buffer)"]
-    PRE --> TIN["fill input tensor (float/uint8/int8)"]
-    TIN --> INF["interpreter.invoke()"]
-    INF --> PARSE["parse keypoints & bbox"]
-    PARSE -->|detection dict| RUNDET
+  subgraph PRESENT["Presentation"]
+    OUTPUT -->|"CLI"| DISPLAY["cv2.imshow, or headless skip"]
+    OUTPUT -->|"web"| SHARED["Thread-safe latest-frame buffer"]
+    SHARED --> MJPEG["/video_feed annotated MJPEG"]
+    RAW["Camera /stream"] --> PROXY["/video_feed raw proxy"]
   end
 
-  %% ========== Overlay + Motor control + Logging ==========
-  subgraph OUT["Overlay + EV3 + Logging"]
-    PF --> DRAW["_draw_overlay(frame, tracked)"]
-    DRAW --> SHIFT["compute shift from frame center"]
-    SHIFT --> LOG["BatchedLogWriter.log()"]
-    SHIFT --> MTR["MotorController.update()"]
+  subgraph RECORD["Recording control"]
+    REC_TOGGLE["CLI key or web API"] --> REC_MODE{"Configured backend"}
+    REC_MODE -->|"camera"| CAM_API["Camera /record/start or /record/stop"]
+    CAM_API -->|"request fails and fallback is enabled"| LOCAL["_RecordingThread"]
+    REC_MODE -->|"local"| LOCAL
+    LOOP -.->|"copy accepted source frame"| LOCAL
+    LOCAL --> ENCODER{"Available encoder"}
+    ENCODER -->|"preferred"| FFMPEG["ffmpeg H.264"]
+    ENCODER -->|"fallback"| OPENCV["OpenCV MJPG"]
   end
 
-  %% ========== EV3 ==========
-  subgraph EV3["MotorController"]
-    MTR --> RL{"rate limit cooldown?"}
-    RL -->|ok| CMP["calculate_motor_params x/y"]
-    CMP --> CMD["motor.run_to_rel_pos / stop"]
-    EV3USB["EV3_USB"] -->|USB transport| CMD
-  end
+  EXIT["Stop request, q, signal or failure"] --> CLEANUP["cleanup()"]
+  CLEANUP --> C1["Stop async detector"]
+  CLEANUP --> C2["Disconnect motors"]
+  CLEANUP --> C3["Stop recording and capture"]
+  CLEANUP --> C4["Flush shift log and close windows"]
 
-  %% ========== Recording ==========
-  subgraph REC["Recording"]
-    KEY -->|r toggles| RECCTRL["start_recording / stop_recording"]
-    RECCTRL --> VW["cv2.VideoWriter"]
-    PF -->|optionally write frame| VW
-  end
+  LOOP -.-> EXIT
 
-  %% ========== Shutdown ==========
-  G --> STOP1["MotorController.disconnect()"]
-  G --> STOP2["VideoCapture.stop()"]
-  G --> STOP3["ShiftLogger.flush()"]
-  G --> STOP4["cv2.destroyAllWindows()"]
+  classDef lifecycle fill:#fff7ed,stroke:#c2410c,color:#431407
+  classDef frame fill:#eff6ff,stroke:#1d4ed8,color:#172554
+  classDef worker fill:#ecfeff,stroke:#0e7490,color:#083344
+  classDef motor fill:#f5f3ff,stroke:#6d28d9,color:#2e1065
+  classDef record fill:#f0fdf4,stroke:#15803d,color:#052e16
+  classDef shutdown fill:#fef2f2,stroke:#b91c1c,color:#450a0a
+
+  class START,INIT,CONNECT lifecycle
+  class LOOP,GATE,PROCESS,POLL,MATCH,TRACK_INIT,KEEP,MISS,DROP,SUBMIT,UPDATE,TARGET,AIM,STOP_MOTOR,DRAW,HORIZON,ROTATE,ZOOM,OUTPUT frame
+  class QUEUE,PREP,INFER,PARSE,PUBLISH worker
+  class MOTOR,RATE,HOLD,POLICY,USB,PHYSICAL motor
+  class REC_TOGGLE,REC_MODE,CAM_API,LOCAL,ENCODER,FFMPEG,OPENCV record
+  class EXIT,CLEANUP,C1,C2,C3,C4 shutdown

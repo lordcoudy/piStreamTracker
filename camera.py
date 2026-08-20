@@ -7,11 +7,13 @@ Streams MJPEG video from Raspberry Pi Camera to network
 import io
 import json
 import logging
+import mimetypes
 import socketserver
 from datetime import datetime
 from http import server
 from pathlib import Path
 from threading import Condition, Lock
+from urllib.parse import quote, unquote, urlsplit
 
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder, JpegEncoder
@@ -19,7 +21,7 @@ from picamera2.outputs import FfmpegOutput, FileOutput
 
 from pistream.camera_auth import extract_bearer, token_ok
 from pistream.config import camera_bind_host, load_config
-from pistream.recordings import list_recording_files
+from pistream.recordings import is_recording_file, list_recording_files, safe_recording_path
 from pistream.stream_limit import StreamLimiter
 
 # Configure logging
@@ -44,7 +46,7 @@ FRAMERATE = camera_cfg.get('framerate', 30)
 JPEG_QUALITY = camera_cfg.get('jpeg_quality', 80)
 CAMERA_IP = network_cfg.get('camera_ip', '192.168.100.1')
 OUTPUT_DIR = Path(camera_cfg.get('recording_dir', 'recordings'))
-OUTPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CAMERA_TOKEN = camera_cfg.get('token') or ''
 STREAM_LIMIT = StreamLimiter(max_clients=int(camera_cfg.get('max_stream_clients') or 4))
 
@@ -104,6 +106,7 @@ class StreamingOutput(io.BufferedIOBase):
         with self.condition:
             self.frame = buf
             self.condition.notify_all()
+        return len(buf)
 
 
 class CameraRecorder:
@@ -128,7 +131,7 @@ class CameraRecorder:
             if self.recording:
                 return self.current_file
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             path = self._output_dir / f"cam_rec_{ts}.mp4"
             self._encoder = H264Encoder(bitrate=bitrate)
             self._output = FfmpegOutput(str(path))
@@ -147,6 +150,7 @@ class CameraRecorder:
                 self._picam2.stop_encoder(self._encoder)
             except Exception as e:
                 logger.warning(f"Stop encoder error: {e}")
+                raise RuntimeError(f"camera encoder did not stop: {e}") from e
             self.recording = False
             logger.info(f"Camera recording stopped: {self.current_file}")
             self.current_file = None
@@ -162,12 +166,13 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
         logger.debug(format % args)
 
     def do_GET(self):
-        if self.path == '/':
+        path = unquote(urlsplit(self.path).path)
+        if path == '/':
             self.send_response(301)
             self.send_header('Location', '/index.html')
             self.end_headers()
 
-        elif self.path == '/index.html':
+        elif path == '/index.html':
             content = HTML_PAGE.encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
@@ -175,20 +180,20 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(content)
 
-        elif self.path == '/stream':
+        elif path == '/stream':
             if not STREAM_LIMIT.acquire():
                 logger.warning('Stream client cap reached')
                 self.send_error(503, 'Too many stream clients')
                 return
-            self.send_response(200)
-            self.send_header('Age', 0)
-            self.send_header('Cache-Control', 'no-cache, private')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
-            self.send_header('Connection', 'keep-alive')
-            self.end_headers()
-
             try:
+                self.send_response(200)
+                self.send_header('Age', 0)
+                self.send_header('Cache-Control', 'no-cache, private')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+                self.send_header('Connection', 'keep-alive')
+                self.end_headers()
+
                 while True:
                     with self.output.condition:
                         if not self.output.condition.wait(timeout=2.0):
@@ -211,20 +216,33 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             finally:
                 STREAM_LIMIT.release()
 
-        elif self.path == '/record/list':
+        elif path == '/record/list':
             if not self._authorized():
                 return
-            self._json_response({'files': list_recording_files(OUTPUT_DIR)})
+            active_name = None
+            if self.recorder and self.recorder.recording and self.recorder.current_file:
+                active_name = Path(self.recorder.current_file).name
+            files = [
+                {**entry, 'active': entry['name'] == active_name}
+                for entry in list_recording_files(OUTPUT_DIR)
+            ]
+            self._json_response({'files': files})
 
-        elif self.path == '/record/status':
+        elif path == '/record/status':
+            if not self._authorized():
+                return
             self._json_response({
                 'recording': self.recorder.recording if self.recorder else False,
                 'file': self.recorder.current_file if self.recorder else None,
             })
 
+        elif path.startswith('/record/files/'):
+            if not self._authorized():
+                return
+            self._send_recording(path.removeprefix('/record/files/'))
+
         else:
             self.send_error(404)
-            self.end_headers()
 
     def _authorized(self) -> bool:
         provided = extract_bearer(self.headers.get('Authorization'))
@@ -234,25 +252,99 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
         return False
 
     def do_POST(self):
-        if self.path in ('/record/start', '/record/stop') and not self._authorized():
+        path = unquote(urlsplit(self.path).path)
+        if path in ('/record/start', '/record/stop') and not self._authorized():
             return
-        if self.path == '/record/start':
+        if path == '/record/start':
             if not self.recorder:
                 self._json_response({'error': 'recorder not available'}, 500)
                 return
-            fname = self.recorder.start()
-            self._json_response({'recording': True, 'file': fname})
+            try:
+                fname = self.recorder.start()
+                self._json_response({'recording': True, 'file': fname})
+            except Exception as exc:
+                logger.exception('Could not start camera recording')
+                self._json_response({'error': str(exc)}, 500)
 
-        elif self.path == '/record/stop':
+        elif path == '/record/stop':
             if not self.recorder:
                 self._json_response({'error': 'recorder not available'}, 500)
                 return
-            self.recorder.stop()
-            self._json_response({'recording': False})
+            try:
+                self.recorder.stop()
+                self._json_response({'recording': False})
+            except Exception as exc:
+                logger.exception('Could not stop camera recording')
+                self._json_response({'error': str(exc)}, 500)
 
         else:
             self.send_error(404)
+
+    def do_DELETE(self):
+        path = unquote(urlsplit(self.path).path)
+        if not path.startswith('/record/files/'):
+            self.send_error(404)
+            return
+        if not self._authorized():
+            return
+        try:
+            file_path = self._recording_path(path.removeprefix('/record/files/'))
+            if (
+                self.recorder
+                and self.recorder.recording
+                and self.recorder.current_file
+                and file_path == Path(self.recorder.current_file).resolve()
+            ):
+                self._json_response({'error': 'cannot delete an active recording'}, 409)
+                return
+            file_path.unlink()
+        except ValueError:
+            self._json_response({'error': 'invalid path'}, 403)
+        except FileNotFoundError:
+            self._json_response({'error': 'file not found'}, 404)
+        except OSError as exc:
+            self._json_response({'error': str(exc)}, 500)
+        else:
+            self._json_response({'status': 'ok'})
+
+    def _recording_path(self, filename: str) -> Path:
+        file_path = safe_recording_path(OUTPUT_DIR, filename)
+        if not is_recording_file(file_path):
+            raise FileNotFoundError(filename)
+        return file_path
+
+    def _send_recording(self, filename: str) -> None:
+        try:
+            file_path = self._recording_path(filename)
+            stat = file_path.stat()
+            file_handle = file_path.open('rb')
+        except ValueError:
+            self._json_response({'error': 'invalid path'}, 403)
+            return
+        except (FileNotFoundError, OSError):
+            self._json_response({'error': 'file not found'}, 404)
+            return
+
+        disposition = 'inline' if file_path.suffix.lower() in {'.jpg', '.png'} else 'attachment'
+        encoded_name = quote(file_path.name)
+        try:
+            self.send_response(200)
+            self.send_header(
+                'Content-Type', mimetypes.guess_type(file_path.name)[0] or 'application/octet-stream'
+            )
+            self.send_header('Content-Length', stat.st_size)
+            self.send_header(
+                'Content-Disposition', f"{disposition}; filename*=UTF-8''{encoded_name}"
+            )
             self.end_headers()
+            remaining = stat.st_size
+            while remaining and (chunk := file_handle.read(min(64 * 1024, remaining))):
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionError):
+            logger.debug('Recording download client disconnected')
+        finally:
+            file_handle.close()
 
     def _json_response(self, data: dict, code: int = 200):
         body = json.dumps(data).encode('utf-8')
@@ -319,8 +411,12 @@ def main():
         logger.info("\nShutting down...")
 
     finally:
-        recorder.stop()
-        picam2.stop_recording()
+        try:
+            recorder.stop()
+        except Exception:
+            logger.exception("Camera recorder did not stop cleanly")
+        finally:
+            picam2.stop_recording()
         logger.info("Camera server stopped")
 
 

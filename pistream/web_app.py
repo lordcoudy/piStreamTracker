@@ -5,24 +5,36 @@ Simple Flask-based control panel for the tracking system
 """
 
 import logging
+import math
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from threading import Lock
 from typing import Optional
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
-from flask import (Flask, Response, jsonify, render_template, request,
-                   send_from_directory)
+from flask import (
+    Flask,
+    Response,
+    has_request_context,
+    jsonify,
+    render_template,
+    request,
+    send_from_directory,
+    stream_with_context,
+)
 
-from pistream.config import (apply_cli_overrides, configure_logging, load_config,
-                             web_bind_host)
+from pistream.config import apply_cli_overrides, configure_logging, load_config, web_bind_host
 from pistream.lifecycle import TrackerLifecycle
 from pistream.preview import accept_new_frame, camera_stream_url, preview_gate, preview_target_size
 from pistream.recordings import (
+    delete_remote_recording,
     fetch_remote_recordings,
     list_recording_files,
+    open_remote_recording,
     safe_recording_path,
 )
 from pistream.track import HumanTracker
@@ -48,6 +60,76 @@ _config: dict = {}
 
 def _tracker() -> Optional[HumanTracker]:
     return _lifecycle.tracker if _lifecycle else None
+
+
+def _active_tracker() -> Optional[HumanTracker]:
+    trk = _tracker()
+    return trk if trk is not None and trk.running and trk.capture is not None else None
+
+
+def _clear_latest_frame() -> None:
+    global _latest_frame, _latest_seq
+    with _frame_lock:
+        _latest_frame = None
+        _latest_seq += 1
+
+
+def _json_object() -> Optional[dict]:
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else None
+
+
+def _finite(value, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f'{name} must be a number')
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{name} must be a number') from exc
+    if not math.isfinite(number):
+        raise ValueError(f'{name} must be finite')
+    return number
+
+
+def _bounded(value, name: str, minimum: float, maximum: float) -> float:
+    number = _finite(value, name)
+    if not minimum <= number <= maximum:
+        raise ValueError(f'{name} must be between {minimum:g} and {maximum:g}')
+    return number
+
+
+def _bounded_int(value, name: str, minimum: int, maximum: int) -> int:
+    number = _bounded(value, name, minimum, maximum)
+    if not number.is_integer():
+        raise ValueError(f'{name} must be an integer')
+    return int(number)
+
+
+def _error(message: str, status: int = 400):
+    return jsonify({'status': 'error', 'message': message}), status
+
+
+@app.before_request
+def reject_cross_origin_mutation():
+    """Block browser-based cross-site requests to motor and recording controls."""
+    if request.method in {'GET', 'HEAD', 'OPTIONS'}:
+        return None
+    origin = request.headers.get('Origin')
+    if not origin:
+        return None  # Preserve CLI and embedded-controller clients.
+    actual = urlsplit(origin)
+    expected = urlsplit(request.host_url)
+    if (actual.scheme, actual.netloc) != (expected.scheme, expected.netloc):
+        return _error('Cross-origin control requests are not allowed', 403)
+    return None
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    response.headers.setdefault('Referrer-Policy', 'no-referrer')
+    return response
 
 
 
@@ -145,7 +227,7 @@ def _proxy_camera_stream():
             except Exception:
                 pass
 
-    return Response(generate(), mimetype=content_type)
+    return Response(generate(), content_type=content_type)
 
 
 @app.route('/video_feed')
@@ -157,7 +239,7 @@ def video_feed():
             return proxied
     return Response(
         _generate_overlay_preview(),
-        mimetype='multipart/x-mixed-replace; boundary=frame',
+        content_type='multipart/x-mixed-replace; boundary=frame',
     )
 
 
@@ -166,7 +248,7 @@ def api_status():
     """Get current tracker status."""
     trk = _tracker()
     if trk:
-        detection = trk.current_detection
+        detection = trk.current_detection if trk.running else None
         shift_x = shift_y = None
         if detection:
             x, y, w, h = detection['bbox']
@@ -211,6 +293,7 @@ def api_start():
     if _lifecycle is None:
         return jsonify({'status': 'error', 'message': 'Web app not initialized'}), 500
     try:
+        _clear_latest_frame()
         result = _lifecycle.start()
         if result['status'] == 'error':
             return jsonify(result), 503
@@ -225,32 +308,37 @@ def api_stop():
     """Stop tracking."""
     if _lifecycle is None:
         return jsonify({'status': 'ok'})
-    return jsonify(_lifecycle.stop())
+    result = _lifecycle.stop()
+    _clear_latest_frame()
+    return jsonify(result), (202 if result['status'] == 'stopping' else 200)
 
 
 @app.route('/api/reset', methods=['POST'])
 def api_reset():
     """Reset detection and move camera to home position."""
-    trk = _tracker()
-    if trk:
-        trk.tracker.reset()
-        trk.current_detection = None
-        trk._last_keypoints = None
-        trk.motors.move_to_home()
+    trk = _active_tracker()
+    if not trk:
+        return _error('Tracker not running', 409)
+    trk.reset_tracking(home=True)
     return jsonify({'status': 'ok'})
 
 
 @app.route('/api/record', methods=['POST'])
 def api_record():
     """Toggle recording."""
-    trk = _tracker()
+    trk = _active_tracker()
     if trk:
-        if trk.recording:
-            trk.stop_recording()
+        was_recording = trk.recording
+        if was_recording:
+            if trk.stop_recording():
+                return jsonify({'status': 'ok', 'recording': False})
+            return _error('Camera did not confirm that recording stopped', 503)
         else:
             trk.start_recording()
-        return jsonify({'status': 'ok', 'recording': trk.recording})
-    return jsonify({'status': 'error', 'message': 'Tracker not running'})
+        if trk.recording:
+            return jsonify({'status': 'ok', 'recording': True})
+        return _error('Could not start recording', 503)
+    return _error('Tracker not running', 409)
 
 
 @app.route('/api/screenshot', methods=['POST'])
@@ -258,26 +346,34 @@ def api_screenshot():
     """Take screenshot."""
     global _latest_frame
 
-    trk = _tracker()
-    if trk and _latest_frame is not None:
+    trk = _active_tracker()
+    if trk:
         with _frame_lock:
-            trk.screenshot(_latest_frame)
-        return jsonify({'status': 'ok', 'path': str(trk.output_dir)})
-    return jsonify({'status': 'error', 'message': 'No frame available'})
+            frame = _latest_frame.copy() if _latest_frame is not None else None
+        if frame is not None:
+            try:
+                path = trk.screenshot(frame)
+            except OSError as exc:
+                return _error(str(exc), 500)
+            return jsonify({'status': 'ok', 'path': str(path)})
+    return _error('No frame available', 409)
 
 
 @app.route('/api/ev3', methods=['POST'])
 def api_ev3():
     """Toggle EV3 connection."""
-    trk = _tracker()
+    trk = _active_tracker()
     if trk:
-        data = request.get_json() or {}
+        data = _json_object()
+        if data is None or not isinstance(data.get('enabled'), bool):
+            return _error('enabled must be a boolean')
         if data.get('enabled', False):
-            trk.motors.connect()
+            if not trk.motors.connect():
+                return _error('Could not connect to EV3', 503)
         else:
             trk.motors.disconnect()
         return jsonify({'status': 'ok', 'connected': trk.motors.connected})
-    return jsonify({'status': 'error', 'message': 'Tracker not running'})
+    return _error('Tracker not running', 409)
 
 
 @app.route('/api/settings', methods=['POST'])
@@ -285,30 +381,56 @@ def api_settings():
     """Update settings. Overlay can change before tracking starts."""
     global _overlay_enabled
 
-    data = request.get_json() or {}
-    if 'overlay' in data:
-        _overlay_enabled = bool(data['overlay'])
-        _config.setdefault('web', {})['overlay'] = _overlay_enabled
-
+    data = _json_object()
+    if data is None:
+        return _error('Expected a JSON object')
+    allowed = {'overlay', 'ev3_speed', 'ev3_deadzone', 'confidence', 'interval', 'horizon'}
+    unknown = set(data) - allowed
+    if unknown:
+        return _error(f"Unknown setting: {sorted(unknown)[0]}")
     trk = _tracker()
-    if not trk:
-        extra = set(data.keys()) - {'overlay'}
-        if extra:
-            return jsonify({'status': 'error', 'message': 'Tracker not running'})
-        return jsonify({'status': 'ok'})
+    tracker_settings = set(data) - {'overlay'}
+    if tracker_settings and not trk:
+        return _error('Tracker not running', 409)
 
-    if 'ev3_speed' in data:
-        trk.motors.speed_factor = min(float(data['ev3_speed']), 2.0)
-    if 'ev3_deadzone' in data:
-        v = int(data['ev3_deadzone'])
-        trk.motors.deadzone_x = v
-        trk.motors.deadzone_y = v
-    if 'confidence' in data:
-        trk.detector.confidence = float(data['confidence'])
-    if 'interval' in data:
-        trk.detection_interval = int(data['interval'])
+    values = {}
+    try:
+        if 'ev3_speed' in data:
+            values['ev3_speed'] = _bounded(data['ev3_speed'], 'ev3_speed', 0.1, 2)
+        if 'ev3_deadzone' in data:
+            values['ev3_deadzone'] = _bounded_int(
+                data['ev3_deadzone'], 'ev3_deadzone', 0, 10000
+            )
+        if 'confidence' in data:
+            values['confidence'] = _bounded(data['confidence'], 'confidence', 0, 1)
+        if 'interval' in data:
+            values['interval'] = _bounded_int(data['interval'], 'interval', 1, 10000)
+    except ValueError as exc:
+        return _error(str(exc))
     if 'horizon' in data:
-        trk.horizon_correction = bool(data['horizon'])
+        if not isinstance(data['horizon'], bool):
+            return _error('horizon must be a boolean')
+        values['horizon'] = data['horizon']
+    if 'overlay' in data:
+        if not isinstance(data['overlay'], bool):
+            return _error('overlay must be a boolean')
+        values['overlay'] = data['overlay']
+
+    if 'overlay' in values:
+        _overlay_enabled = values['overlay']
+        _config.setdefault('web', {})['overlay'] = _overlay_enabled
+    if trk:
+        if 'ev3_speed' in values:
+            trk.motors.speed_factor = values['ev3_speed']
+        if 'ev3_deadzone' in values:
+            trk.motors.deadzone_x = values['ev3_deadzone']
+            trk.motors.deadzone_y = values['ev3_deadzone']
+        if 'confidence' in values:
+            trk.detector.confidence = values['confidence']
+        if 'interval' in values:
+            trk.detection_interval = values['interval']
+        if 'horizon' in values:
+            trk.horizon_correction = values['horizon']
 
     return jsonify({'status': 'ok'})
 
@@ -316,15 +438,22 @@ def api_settings():
 @app.route('/api/motor_move', methods=['POST'])
 def api_motor_move():
     """Manually move camera motors."""
-    trk = _tracker()
+    trk = _active_tracker()
     if not trk:
-        return jsonify({'status': 'error', 'message': 'Tracker not running'})
+        return _error('Tracker not running', 409)
     if not trk.motors.connected:
-        return jsonify({'status': 'error', 'message': 'EV3 not connected'})
+        return _error('EV3 not connected', 409)
 
-    data = request.get_json() or {}
-    direction = data.get('direction', '')
-    degrees = int(data.get('degrees', 10))
+    data = _json_object()
+    if data is None:
+        return _error('Expected a JSON object')
+    direction = data.get('direction')
+    if direction not in {'left', 'right', 'up', 'down'}:
+        return _error('direction must be left, right, up, or down')
+    try:
+        degrees = _bounded_int(data.get('degrees', 10), 'degrees', 1, 90)
+    except ValueError as exc:
+        return _error(str(exc))
 
     pan = tilt = 0
     if direction == 'left':
@@ -343,22 +472,29 @@ def api_motor_move():
 @app.route('/api/zoom', methods=['POST'])
 def api_zoom():
     """Control digital zoom."""
-    trk = _tracker()
+    trk = _active_tracker()
     if not trk:
-        return jsonify({'status': 'error', 'message': 'Tracker not running'})
+        return _error('Tracker not running', 409)
 
-    data = request.get_json() or {}
+    data = _json_object()
+    if data is None:
+        return _error('Expected a JSON object')
     action = data.get('action', '')
     level = data.get('level')
 
     if level is not None:
-        trk.zoom_level = max(1.0, min(float(level), 4.0))
+        try:
+            trk.zoom_level = _bounded(level, 'level', 1, 4)
+        except ValueError as exc:
+            return _error(str(exc))
     elif action == 'in':
         trk.zoom_level = min(trk.zoom_level + 0.25, 4.0)
     elif action == 'out':
         trk.zoom_level = max(trk.zoom_level - 0.25, 1.0)
     elif action == 'reset':
         trk.zoom_level = 1.0
+    else:
+        return _error('action must be in, out, or reset')
 
     return jsonify({'status': 'ok', 'zoom': trk.zoom_level})
 
@@ -383,27 +519,106 @@ def _recording_dir() -> Path:
     return Path(_config.get('tracker', {}).get('output_dir', 'recordings'))
 
 
+def _camera_recording_config() -> tuple[str, str]:
+    net = _config.get('network') or {}
+    cam = _config.get('camera') or {}
+    base = f"http://{net.get('camera_ip', '127.0.0.1')}:{cam.get('port', 8000)}"
+    return base, cam.get('token') or ''
+
+
+def _camera_recording_mode() -> bool:
+    return (_config.get('tracker') or {}).get('recording_mode', 'local') == 'camera'
+
+
+def _recording_source() -> str:
+    source = request.args.get('source', 'local') if has_request_context() else 'local'
+    if source not in {'local', 'camera'}:
+        raise ValueError('source must be local or camera')
+    if source == 'camera' and not _camera_recording_mode():
+        raise ValueError('camera recordings are not enabled')
+    return source
+
+
+def _camera_http_error(exc: urllib.error.HTTPError):
+    messages = {
+        401: 'Camera recording token was rejected',
+        403: 'Camera rejected the recording path',
+        404: 'Camera recording not found',
+        409: 'Cannot delete an active camera recording',
+    }
+    return _error(messages.get(exc.code, 'Camera recording request failed'), exc.code)
+
+
 @app.route('/api/recordings')
 def api_recordings():
-    """List recording files (local, or camera Pi when recording_mode is camera)."""
-    files = list_recording_files(_recording_dir())
-    mode = (_config.get('tracker') or {}).get('recording_mode', 'local')
-    if mode == 'camera':
-        net = _config.get('network') or {}
-        cam = _config.get('camera') or {}
-        base = f"http://{net.get('camera_ip', '127.0.0.1')}:{cam.get('port', 8000)}"
+    """List local artifacts plus camera files when camera recording is configured."""
+    trk = _active_tracker()
+    active_path = trk.local_recording_path if trk is not None else None
+    active_name = active_path.name if active_path is not None else None
+    files = [
+        {**entry, 'source': 'local', 'active': entry['name'] == active_name}
+        for entry in list_recording_files(_recording_dir())
+    ]
+    warning = None
+    if _camera_recording_mode():
+        base, token = _camera_recording_config()
         try:
-            remote = fetch_remote_recordings(base, cam.get('token') or '')
-            if remote:
-                files = remote
+            remote = fetch_remote_recordings(base, token)
+            files.extend(
+                {**entry, 'source': 'camera'}
+                for entry in remote
+                if isinstance(entry, dict) and isinstance(entry.get('name'), str)
+            )
         except Exception as exc:
             logger.warning(f"Camera recording list failed: {exc}")
-    return jsonify({'files': files})
+            warning = 'Camera recordings are temporarily unavailable'
+    def mtime(entry):
+        try:
+            return float(entry.get('mtime') or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    files.sort(key=mtime, reverse=True)
+    return jsonify({'files': files, 'warning': warning})
 
 
 @app.route('/api/recordings/<path:filename>')
 def api_recordings_download(filename):
     """Download or view a recording file."""
+    try:
+        source = _recording_source()
+    except ValueError as exc:
+        return _error(str(exc))
+
+    if source == 'camera':
+        base, token = _camera_recording_config()
+        try:
+            remote = open_remote_recording(base, filename, token)
+        except urllib.error.HTTPError as exc:
+            return _camera_http_error(exc)
+        except (OSError, urllib.error.URLError) as exc:
+            logger.warning(f"Camera recording download failed: {exc}")
+            return _error('Camera recording is unavailable', 502)
+
+        headers = {}
+        for name in ('Content-Length', 'Content-Disposition'):
+            value = remote.headers.get(name)
+            if value:
+                headers[name] = value
+
+        def generate():
+            try:
+                while chunk := remote.read(64 * 1024):
+                    yield chunk
+            finally:
+                remote.close()
+
+        return Response(
+            stream_with_context(generate()),
+            content_type=remote.headers.get('Content-Type', 'application/octet-stream'),
+            headers=headers,
+        )
+
     rec_path = _recording_dir()
     try:
         file_path = safe_recording_path(rec_path, filename)
@@ -420,6 +635,22 @@ def api_recordings_download(filename):
 @app.route('/api/recordings/<path:filename>', methods=['DELETE'])
 def api_recordings_delete(filename):
     """Delete a recording file."""
+    try:
+        source = _recording_source()
+    except ValueError as exc:
+        return _error(str(exc))
+
+    if source == 'camera':
+        base, token = _camera_recording_config()
+        try:
+            delete_remote_recording(base, filename, token)
+        except urllib.error.HTTPError as exc:
+            return _camera_http_error(exc)
+        except (OSError, urllib.error.URLError) as exc:
+            logger.warning(f"Camera recording delete failed: {exc}")
+            return _error('Camera recording is unavailable', 502)
+        return jsonify({'status': 'ok'})
+
     rec_path = _recording_dir()
     try:
         file_path = safe_recording_path(rec_path, filename)
@@ -428,6 +659,11 @@ def api_recordings_delete(filename):
 
     if not file_path.exists():
         return jsonify({'status': 'error', 'message': 'File not found'}), 404
+
+    trk = _active_tracker()
+    active_path = trk.local_recording_path if trk is not None else None
+    if active_path is not None and file_path == active_path.resolve():
+        return _error('Cannot delete an active recording', 409)
 
     try:
         file_path.unlink()
@@ -456,7 +692,7 @@ def _run_tracker_loop(trk: HumanTracker):
 
             rec_frame = (
                 frame.copy()
-                if trk.recording and trk.recording_mode != 'camera'
+                if trk.records_locally
                 else None
             )
             annotated, _ = trk.process_frame(frame)
@@ -470,6 +706,8 @@ def _run_tracker_loop(trk: HumanTracker):
 
     except Exception as e:
         logger.error(f"Tracker loop error: {e}")
+    finally:
+        _clear_latest_frame()
 
 
 # =============================================================================
@@ -504,8 +742,11 @@ def main():
     parser.add_argument('--preset', help='Performance preset from config.yaml')
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    apply_cli_overrides(config, args)
+    try:
+        config = load_config(args.config)
+        apply_cli_overrides(config, args)
+    except (OSError, ValueError) as exc:
+        parser.error(f"configuration error: {exc}")
     configure_logging(config)
     host = args.host or web_bind_host(config)
     port = args.port if args.port is not None else int(config.get('web', {}).get('port', 5000))
