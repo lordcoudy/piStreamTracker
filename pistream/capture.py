@@ -41,12 +41,7 @@ class VideoCapture:
 
     def _open_capture(self) -> bool:
         """Open the video capture with appropriate backend."""
-        if self._cap:
-            try:
-                self._cap.release()
-            except Exception:
-                pass
-            self._cap = None
+        self._release_capture()
 
         if self._is_http:
             # For HTTP MJPEG streams, FFMPEG is the correct backend
@@ -55,26 +50,44 @@ class VideoCapture:
             backends = [cv2.CAP_V4L2, cv2.CAP_FFMPEG, cv2.CAP_ANY]
 
         for backend in backends:
+            candidate = None
             try:
-                self._cap = cv2.VideoCapture(self.source, backend)
-                if self._cap.isOpened():
-                    break
+                if self._is_http:
+                    candidate = cv2.VideoCapture(
+                        self.source,
+                        backend,
+                        [
+                            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+                            cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000,
+                        ],
+                    )
+                else:
+                    candidate = cv2.VideoCapture(self.source, backend)
             except Exception:
-                continue
-
-        if not self._cap or not self._cap.isOpened():
-            self._cap = cv2.VideoCapture(self.source)
+                # Older OpenCV builds do not expose the constructor params.
+                try:
+                    candidate = cv2.VideoCapture(self.source, backend)
+                except Exception:
+                    candidate = None
+            if candidate is not None and candidate.isOpened():
+                self._cap = candidate
+                break
+            if candidate is not None:
+                candidate.release()
 
         if not self._cap or not self._cap.isOpened():
             return False
 
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
-        # For HTTP streams: reduce internal FFMPEG buffer for lower latency
-        if self._is_http:
-            self._cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-            self._cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
-
         return True
+
+    def _release_capture(self) -> None:
+        cap, self._cap = self._cap, None
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                logger.debug("Capture release failed", exc_info=True)
 
     def start(self) -> bool:
         """Start video capture."""
@@ -89,7 +102,10 @@ class VideoCapture:
         self._ret, self._frame = self._cap.read()
         if not self._ret:
             logger.error("Failed to read initial frame")
+            self._release_capture()
             return False
+        if self.width <= 0 or self.height <= 0:
+            self.height, self.width = self._frame.shape[:2]
 
         self._stop.clear()
         self._thread = Thread(target=self._capture_loop, daemon=True)
@@ -101,35 +117,40 @@ class VideoCapture:
     def _capture_loop(self):
         failures = 0
         reconnects = 0
-        while not self._stop.is_set():
-            ret, frame = self._cap.read()
-            if ret:
-                with self._lock:
-                    self._ret, self._frame = ret, frame
-                failures = 0
-                reconnects = 0
-            else:
-                failures += 1
-                if failures >= self.MAX_FAILURES:
+        try:
+            while not self._stop.is_set():
+                cap = self._cap
+                ret, frame = cap.read() if cap is not None else (False, None)
+                if ret:
                     with self._lock:
-                        self._ret = False
-                    reconnects += 1
-                    delay = reconnect_wait(reconnects)
-                    logger.warning(
-                        f"Stream lost ({failures} failures), "
-                        f"reconnect {reconnects} in {delay:.0f}s"
-                    )
-                    self._stop.wait(delay)
-                    if self._stop.is_set():
-                        return
-                    if self._open_capture():
-                        logger.info("Stream reconnected")
-                        failures = 0
-                        reconnects = 0
-                    else:
-                        logger.warning(f"Reconnect attempt {reconnects} failed")
+                        self._ret, self._frame = ret, frame
+                    failures = 0
+                    reconnects = 0
                 else:
-                    self._stop.wait(0.005)
+                    failures += 1
+                    if failures >= self.MAX_FAILURES:
+                        with self._lock:
+                            self._ret = False
+                        reconnects += 1
+                        delay = reconnect_wait(reconnects)
+                        logger.warning(
+                            f"Stream lost ({failures} failures), "
+                            f"reconnect {reconnects} in {delay:.0f}s"
+                        )
+                        self._stop.wait(delay)
+                        if self._stop.is_set():
+                            return
+                        if self._open_capture():
+                            logger.info("Stream reconnected")
+                            failures = 0
+                            reconnects = 0
+                        else:
+                            logger.warning(f"Reconnect attempt {reconnects} failed")
+                    else:
+                        self._stop.wait(0.005)
+        finally:
+            if self._stop.is_set():
+                self._release_capture()
 
     def read(self):
         """Get latest frame."""
@@ -140,9 +161,13 @@ class VideoCapture:
         """Stop capture."""
         self._stop.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        if self._cap:
-            self._cap.release()
+            self._thread.join(timeout=6.0)
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning("Capture thread did not stop within the read timeout")
+        else:
+            self._release_capture()
+        with self._lock:
+            self._ret = False
 
     @property
     def is_open(self) -> bool:

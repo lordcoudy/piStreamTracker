@@ -12,6 +12,9 @@
 
 set -e
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -235,7 +238,8 @@ create_service() {
     sudo tee /etc/systemd/system/pitracker.service > /dev/null << EOF
 [Unit]
 Description=${desc}
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -263,7 +267,7 @@ EOF
 install_ev3_udev() {
     print_step "Installing EV3 udev rule (USB without root)..."
     sudo tee /etc/udev/rules.d/99-ev3.rules > /dev/null << 'EOF'
-SUBSYSTEM=="usb", ATTR{idVendor}=="0694", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0694", MODE="0660", GROUP="plugdev"
 EOF
     sudo udevadm control --reload-rules 2>/dev/null || true
     sudo usermod -aG plugdev,video "$(whoami)" 2>/dev/null || true
@@ -354,6 +358,11 @@ main() {
     done
 
     print_header
+
+    if [[ $EUID -eq 0 ]]; then
+        print_error "Do not run setup as root; it uses sudo only for the required system changes."
+        exit 1
+    fi
 
     # Detect Pi model
     pi_model=$(detect_pi)

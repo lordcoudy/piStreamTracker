@@ -2,9 +2,17 @@
 
 import unittest
 from argparse import Namespace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from pistream.config import (apply_cli_overrides, apply_preset, camera_bind_host,
-                             web_bind_host)
+from pistream.config import (
+    apply_cli_overrides,
+    apply_preset,
+    camera_bind_host,
+    load_config,
+    web_bind_host,
+)
 
 
 def _base():
@@ -55,6 +63,46 @@ class CliOverrideTests(unittest.TestCase):
         )
         cfg = apply_cli_overrides(_base(), args)
         self.assertFalse(cfg['ev3']['enabled'])
+
+    def test_zero_detection_interval_is_rejected(self):
+        args = Namespace(
+            url=None, output_dir=None, detection_interval=0,
+            process_scale=None, confidence=None, movenet_threads=None,
+            no_ev3=False, preset=None,
+        )
+        with self.assertRaisesRegex(ValueError, 'positive integer'):
+            apply_cli_overrides(_base(), args)
+
+
+class ConfigValidationTests(unittest.TestCase):
+    def test_non_mapping_yaml_root_has_clear_error(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('- not\n- a\n- mapping\n')
+            with self.assertRaisesRegex(ValueError, 'root must be a mapping'):
+                load_config(str(path))
+
+    def test_invalid_recording_mode_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('tracker:\n  recording_mode: nowhere\n')
+            with self.assertRaisesRegex(ValueError, 'recording_mode'):
+                load_config(str(path))
+
+    def test_null_section_has_clear_error(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('camera: null\n')
+            with self.assertRaisesRegex(ValueError, 'camera must be a mapping'):
+                load_config(str(path))
+
+    def test_environment_camera_token_overrides_file(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('camera:\n  token: file-secret\n')
+            with patch.dict('os.environ', {'PISTREAM_CAMERA_TOKEN': 'env-secret'}):
+                config = load_config(str(path))
+        self.assertEqual(config['camera']['token'], 'env-secret')
 
 
 class WebBindHostTests(unittest.TestCase):

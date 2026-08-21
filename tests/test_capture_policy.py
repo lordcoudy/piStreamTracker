@@ -1,8 +1,9 @@
 """Capture reconnect backoff never gives up."""
 
 import unittest
+from unittest.mock import patch
 
-from pistream.capture import reconnect_wait
+from pistream.capture import VideoCapture, reconnect_wait
 
 
 class ReconnectWaitTests(unittest.TestCase):
@@ -17,3 +18,33 @@ class ReconnectWaitTests(unittest.TestCase):
     def test_never_signals_give_up(self):
         for n in range(1, 35):
             self.assertGreater(reconnect_wait(n), 0)
+
+
+class CaptureCleanupTests(unittest.TestCase):
+    def test_failed_initial_read_releases_capture(self):
+        class FakeCapture:
+            def __init__(self):
+                self.released = False
+
+            def isOpened(self):
+                return True
+
+            def set(self, *_args):
+                return True
+
+            def get(self, *_args):
+                return 30
+
+            def read(self):
+                return False, None
+
+            def release(self):
+                self.released = True
+
+        fake = FakeCapture()
+        with patch('pistream.capture.cv2.VideoCapture', return_value=fake):
+            capture = VideoCapture('http://camera/stream')
+            self.assertFalse(capture.start())
+
+        self.assertTrue(fake.released)
+        self.assertFalse(capture.is_open)

@@ -18,7 +18,10 @@
                     opts.body = JSON.stringify(data);
                 }
                 const res = await fetch('/api/' + endpoint, opts);
-                return await res.json();
+                const payload = await res.json();
+                payload.httpOk = res.ok;
+                payload.httpStatus = res.status;
+                return payload;
             } catch (e) {
                 log('API error: ' + e.message, 'error');
                 return null;
@@ -28,7 +31,7 @@
         async function startTracking() {
             log('Starting tracker...');
             const res = await api('start', 'POST');
-            if (res && res.status === 'ok') {
+            if (res && (res.status === 'ok' || res.status === 'already_running')) {
                 isTracking = true;
                 updateUI();
                 log('Tracking started', 'success');
@@ -40,16 +43,17 @@
         async function stopTracking() {
             log('Stopping tracker...');
             const res = await api('stop', 'POST');
-            if (res && res.status === 'ok') {
+            if (res && (res.status === 'ok' || res.status === 'stopping')) {
                 isTracking = false;
                 updateUI();
-                log('Tracking stopped', 'success');
+                log(res.status === 'stopping' ? 'Tracker is stopping…' : 'Tracking stopped', 'success');
             }
         }
 
         async function resetDetection() {
             const res = await api('reset', 'POST');
-            if (res) log('Detection reset + camera homed', 'success');
+            if (res && res.status === 'ok') log('Detection reset + camera homed', 'success');
+            else if (res) log('Reset failed: ' + (res.message || 'unknown error'), 'error');
         }
 
         async function moveCamera(direction) {
@@ -57,7 +61,7 @@
             const res = await api('motor_move', 'POST', { direction, degrees });
             if (res && res.status === 'ok') {
                 log('Move: ' + direction + ' ' + degrees + '°');
-            }
+            } else if (res) log('Move failed: ' + (res.message || 'unknown error'), 'error');
         }
 
         async function zoomCamera(action) {
@@ -65,13 +69,18 @@
             if (res && res.zoom !== undefined) {
                 document.getElementById('zoom-value').textContent = res.zoom.toFixed(2) + 'x';
                 log('Zoom: ' + res.zoom.toFixed(2) + 'x');
-            }
+            } else if (res) log('Zoom failed: ' + (res.message || 'unknown error'), 'error');
         }
 
         async function toggleHorizon() {
             const enabled = document.getElementById('horizon-toggle').checked;
-            await api('settings', 'POST', { horizon: enabled });
-            log('Horizon stabilization ' + (enabled ? 'ON' : 'OFF'), 'success');
+            const res = await api('settings', 'POST', { horizon: enabled });
+            if (res && res.status === 'ok') {
+                log('Horizon stabilization ' + (enabled ? 'ON' : 'OFF'), 'success');
+            } else {
+                document.getElementById('horizon-toggle').checked = !enabled;
+                if (res) log('Horizon update failed: ' + (res.message || 'unknown error'), 'error');
+            }
         }
 
         async function toggleOverlay() {
@@ -80,27 +89,36 @@
             if (res && res.status === 'ok') {
                 document.getElementById('video-feed').src = '/video_feed?t=' + Date.now();
                 log(enabled ? 'Overlay ON' : 'Overlay OFF (raw camera)', 'success');
+            } else {
+                document.getElementById('overlay-toggle').checked = !enabled;
+                if (res) log('Overlay update failed: ' + (res.message || 'unknown error'), 'error');
             }
         }
 
         async function toggleRecording() {
             const res = await api('record', 'POST');
-            if (res) {
+            if (res && res.status === 'ok') {
                 isRecording = res.recording;
                 updateUI();
                 log(isRecording ? 'Recording started' : 'Recording stopped', 'success');
-            }
+            } else if (res) log('Recording failed: ' + (res.message || 'unknown error'), 'error');
         }
 
         async function takeScreenshot() {
             const res = await api('screenshot', 'POST');
-            if (res && res.path) log('Screenshot: ' + res.path, 'success');
+            if (res && res.status === 'ok') log('Screenshot: ' + res.path, 'success');
+            else if (res) log('Screenshot failed: ' + (res.message || 'unknown error'), 'error');
         }
 
         async function toggleEV3() {
             const enabled = document.getElementById('ev3-toggle').checked;
             const res = await api('ev3', 'POST', { enabled });
-            if (res) log('EV3 ' + (enabled ? 'connected' : 'disconnected'), 'success');
+            if (res && res.status === 'ok') {
+                log('EV3 ' + (enabled ? 'connected' : 'disconnected'), 'success');
+            } else {
+                document.getElementById('ev3-toggle').checked = !enabled;
+                if (res) log('EV3 update failed: ' + (res.message || 'unknown error'), 'error');
+            }
         }
 
         async function updateSetting(key, value) {
@@ -110,7 +128,10 @@
             if (key === 'confidence') document.getElementById('conf-value').textContent = value;
             if (key === 'interval') document.getElementById('interval-value').textContent = value;
 
-            await api('settings', 'POST', { [key]: parseFloat(value) });
+            const res = await api('settings', 'POST', { [key]: parseFloat(value) });
+            if (res && res.status !== 'ok') {
+                log('Setting update failed: ' + (res.message || 'unknown error'), 'error');
+            }
         }
 
         function updateUI() {
@@ -139,6 +160,9 @@
                 if (res.shift_x !== null) {
                     document.getElementById('info-shift-x').textContent = res.shift_x;
                     document.getElementById('info-shift-y').textContent = res.shift_y;
+                } else {
+                    document.getElementById('info-shift-x').textContent = '--';
+                    document.getElementById('info-shift-y').textContent = '--';
                 }
                 if (res.zoom !== undefined) {
                     document.getElementById('zoom-value').textContent = res.zoom.toFixed(2) + 'x';
@@ -167,19 +191,21 @@
         async function loadRecordings() {
             const res = await api('recordings');
             const list = document.getElementById('rec-list');
+            if (res && res.warning) log(res.warning, 'error');
             if (!res || !res.files || res.files.length === 0) {
                 list.innerHTML = '<div class="rec-empty">No recordings found</div>';
                 return;
             }
             list.innerHTML = '';
             res.files.forEach(f => {
+                const sourceQuery = f.source === 'camera' ? '?source=camera' : '';
                 const item = document.createElement('div');
                 item.className = 'rec-item';
 
                 if (f.name.toLowerCase().endsWith('.jpg') || f.name.toLowerCase().endsWith('.png')) {
                     const thumb = document.createElement('img');
                     thumb.className = 'rec-thumb';
-                    thumb.src = '/api/recordings/' + encodeURIComponent(f.name);
+                    thumb.src = '/api/recordings/' + encodeURIComponent(f.name) + sourceQuery;
                     thumb.alt = 'thumb';
                     item.appendChild(thumb);
                 }
@@ -201,7 +227,7 @@
                 actions.className = 'rec-actions';
 
                 const dlLink = document.createElement('a');
-                dlLink.href = '/api/recordings/' + encodeURIComponent(f.name);
+                dlLink.href = '/api/recordings/' + encodeURIComponent(f.name) + sourceQuery;
                 dlLink.download = f.name;
                 dlLink.style.textDecoration = 'none';
                 const dlBtn = document.createElement('button');
@@ -214,8 +240,11 @@
                 delBtn.className = 'danger';
                 delBtn.textContent = '✕';
                 delBtn.dataset.filename = f.name;
+                delBtn.dataset.source = f.source || 'local';
+                delBtn.disabled = Boolean(f.active);
+                delBtn.title = f.active ? 'Stop recording before deleting' : 'Delete';
                 delBtn.addEventListener('click', function() {
-                    deleteRecording(this.dataset.filename);
+                    deleteRecording(this.dataset.filename, this.dataset.source);
                 });
                 actions.appendChild(delBtn);
 
@@ -224,9 +253,10 @@
             });
         }
 
-        async function deleteRecording(name) {
+        async function deleteRecording(name, source = 'local') {
             if (!confirm('Delete ' + name + '?')) return;
-            const res = await fetch('/api/recordings/' + encodeURIComponent(name), { method: 'DELETE' });
+            const query = source === 'camera' ? '?source=camera' : '';
+            const res = await fetch('/api/recordings/' + encodeURIComponent(name) + query, { method: 'DELETE' });
             const data = await res.json();
             if (data.status === 'ok') {
                 log('Deleted ' + name, 'success');

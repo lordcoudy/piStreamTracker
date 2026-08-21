@@ -28,7 +28,8 @@ camera.py                     tracker.py  or  web.py
 - Web UI: overlay or raw-camera proxy, zoom, horizon preview, recordings
 - Local H.264 (ffmpeg, hardware when available) or camera-side record
 - Stream reconnects after a camera reboot; status shows `stream_lost`
-- Optional `camera.token` on `/record/*`; cap on concurrent `/stream` clients
+- Optional Bearer token on every `/record/*` operation; cap on concurrent `/stream` clients
+- Camera-mode recordings remain downloadable/deletable from the tracker UI; local fallback is automatic
 
 ## Setup
 
@@ -55,7 +56,11 @@ sudo ./run_cam.sh --configure-network      # 192.168.100.1/24
 sudo ./run_tracker.sh --configure-network  # 192.168.100.2/24
 ```
 
-Scripts accept `venv/` (what `setup.sh` creates) or `.venv/`.
+These privileged commands configure the interface and exit. Start the application afterward as
+a normal user; the launch scripts deliberately refuse to run the Python services as root.
+
+Scripts accept `venv/` (what `setup.sh` creates) or `.venv/`, can be launched from any
+working directory, and accept tracker flags in any order.
 
 ## Run
 
@@ -95,15 +100,17 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 |---------|----------------|
 | Start / Stop | Connects to the camera stream, then tracks. Start fails if the stream is down. |
 | Reset | Clears the tracker and homes the EV3; auto-track is held for `ev3.home_hold` seconds |
-| Record / Screenshot | Local files under `tracker.output_dir`, or camera Pi if `recording_mode: camera` |
+| Record / Screenshot | Local files under `tracker.output_dir`, or camera Pi if `recording_mode: camera`; an unreachable camera recorder falls back locally |
 | Tracking overlay | Off = proxy the camera MJPEG (lowest delay). On = annotated preview at `preview_max_fps` / `preview_max_edge` |
 | Auto-Level | Rotate the **preview** to level shoulders/hips; motors still use the raw box |
 | D-pad / Zoom | Manual pan/tilt; digital zoom on the preview only |
-| Recordings | Lists `.mp4` / `.avi` / stills. Camera-mode lists files via `GET /record/list` on the camera Pi |
+| Recordings | Lists, downloads, and deletes `.mp4` / `.avi` / stills from both Pis. Active recordings cannot be deleted. |
 
 The tracking status dot turns yellow while the stream is reconnecting (`stream_lost`).
 
 By default the UI and camera server bind to `tracker_ip` / `camera_ip`. Set `host: "0.0.0.0"` only if you need another NIC; anyone who can reach the port can move motors and delete recordings.
+The web server rejects cross-origin browser control requests and sends clickjacking/MIME-sniffing
+protections, but it is still a trusted-LAN control surface rather than an Internet-facing service.
 
 ## Configuration
 
@@ -150,6 +157,10 @@ presets:
   quality: {detection_interval: 4,  process_scale: 0.6,  movenet_threads: 4}
 ```
 
+Configuration is validated at startup; unsafe values such as a zero detection interval, invalid
+ports, unknown recording backends, or malformed section types fail immediately with a clear error.
+Set `PISTREAM_CAMERA_TOKEN` to override `camera.token` without storing the secret in `config.yaml`.
+
 ## CLI
 
 ```bash
@@ -193,7 +204,7 @@ No Pi or EV3 required. GitHub Actions runs the same on Python 3.12.
 | Stream dies mid-talk | Wait: capture reconnects with backoff. Yellow status = `stream_lost`. Do not need a second Start unless you clicked Stop |
 | EV3 not found | USB cable, `ev3-dc` installed, udev rule; re-plug the brick / re-login after `plugdev` |
 | EV3 permission denied | `setup.sh` udev (`idVendor=0694`); user in `plugdev` |
-| Record Refresh empty | `recording_mode: local` files are on the Pi 5. `camera` mode lists the 3B+ via `/record/list` |
+| Camera recordings unavailable | Check the camera server and token. The UI still shows local screenshots/fallback recordings and reports that camera files are unavailable. |
 | Bind / “address already in use” | Something else on 5000/8000, or `host` is an IP that is not assigned yet |
 | Network | `ping 192.168.100.1`. Launch scripts do not flush `eth0` |
 

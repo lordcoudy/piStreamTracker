@@ -205,8 +205,8 @@ class AsyncDetector:
 
         # Pre-allocate scaled buffer once
         if process_scale < 1.0:
-            sh = int(frame_height * process_scale)
-            sw = int(frame_width * process_scale)
+            sh = max(1, int(frame_height * process_scale))
+            sw = max(1, int(frame_width * process_scale))
             self._scaled_buf = np.empty((sh, sw, 3), dtype=np.uint8)
         else:
             self._scaled_buf = None
@@ -236,11 +236,16 @@ class AsyncDetector:
 
     def get_result(self) -> Optional[dict]:
         """Return the latest detection result, or *None* if nothing new."""
+        _, result = self.poll_result()
+        return result
+
+    def poll_result(self) -> tuple[bool, Optional[dict]]:
+        """Return ``(is_new, result)`` so a new negative result is observable."""
         with self._result_lock:
             if self._new_result:
                 self._new_result = False
-                return self._result
-        return None
+                return True, self._result
+        return False, None
 
     @property
     def busy(self) -> bool:

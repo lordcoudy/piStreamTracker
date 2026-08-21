@@ -1,30 +1,32 @@
 """Object tracker, HumanTracker, shift log, CLI."""
 
 import argparse
+import json
 import logging
 import time
 import urllib.request
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from typing import Optional
 
 import cv2
 import numpy as np
 
+from pistream.camera_auth import auth_headers
 from pistream.capture import VideoCapture
 from pistream.config import apply_cli_overrides, configure_logging, load_config
 from pistream.detect import AsyncDetector, PoseDetector
 from pistream.horizon import tilt_degrees
 from pistream.motors import MotorController
-from pistream.camera_auth import auth_headers
 from pistream.preview import accept_new_frame, capped_recording_fps
 from pistream.record import _RecordingThread
 
 logger = logging.getLogger(__name__)
 
 REINIT_IOU = 0.3
+DETECTION_MISS_LIMIT = 3
 
 
 def bbox_iou(a: tuple, b: tuple) -> float:
@@ -140,7 +142,7 @@ class HumanTracker:
         self.detection_interval = det['interval']
         self.process_scale = det['scale']
         self.output_dir = Path(tracker_cfg['output_dir'])
-        self.output_dir.mkdir(exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.recording_fps: float = float(tracker_cfg.get('recording_fps', 30))
 
         # Components
@@ -160,8 +162,11 @@ class HumanTracker:
         self.current_detection = None
         self._last_keypoints = None
         self._last_confidence = 0.5
+        self._detection_misses = 0
         self.frame_count = 0
         self._rec_thread: Optional[_RecordingThread] = None
+        self._recording_backend: Optional[str] = None
+        self._record_lock = RLock()
         self._fps_count = 0
         self._fps_time = time.monotonic()
         self._fps = 0.0
@@ -217,10 +222,12 @@ class HumanTracker:
         self.frame_count += 1
 
         # --- 1. Pick up async detection result (non-blocking) ---------------
+        result_ready = False
         det_result = None
         if self._async_detector is not None:
-            det_result = self._async_detector.get_result()
+            result_ready, det_result = self._async_detector.poll_result()
         if det_result:
+            self._detection_misses = 0
             iou = None
             if self.tracker.active and self.current_detection:
                 iou = bbox_iou(self.current_detection['bbox'], det_result['bbox'])
@@ -229,6 +236,13 @@ class HumanTracker:
             self._last_keypoints = det_result.get('keypoints')
             self._last_confidence = det_result.get('confidence', 0.5)
             self.current_detection = det_result
+        elif result_ready and self.tracker.active:
+            self._detection_misses += 1
+            if self._detection_misses >= DETECTION_MISS_LIMIT:
+                self.tracker.reset()
+                self.current_detection = None
+                self._last_keypoints = None
+                self._detection_misses = 0
 
         # --- 2. Submit frame for detection when needed ----------------------
         #   • Periodically (every N frames) to refresh the pose estimate
@@ -259,6 +273,7 @@ class HumanTracker:
         if detection:
             self._update_aim(detection)
         else:
+            self.current_detection = None
             self.motors.stop()
 
         annotated = self._draw(frame.copy(), detection)
@@ -344,6 +359,16 @@ class HumanTracker:
 
         return frame
 
+    def reset_tracking(self, home: bool = True) -> None:
+        """Clear all target state and optionally return the camera to home."""
+        self.tracker.reset()
+        self.current_detection = None
+        self._last_keypoints = None
+        self._detection_misses = 0
+        self.motors.stop()
+        if home:
+            self.motors.move_to_home()
+
     def start_recording(self):
         """Start video recording.
 
@@ -353,31 +378,52 @@ class HumanTracker:
         In 'camera' mode: triggers hardware H.264 recording on Pi 3B+
         via HTTP API — zero CPU cost on the tracker Pi.
         """
-        if self.recording:
-            return
+        with self._record_lock:
+            if self.recording:
+                return True
 
-        if self.recording_mode == 'camera':
-            try:
-                req = urllib.request.Request(
-                    f"{self._camera_base_url}/record/start",
-                    method='POST', data=b'',
-                    headers=auth_headers(self._camera_token),
-                )
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    import json
-                    info = json.loads(resp.read())
-                self.recording = True
-                logger.info(f"Camera-side recording started: {info.get('file')}")
-            except Exception as e:
-                logger.error(f"Failed to start camera recording: {e}")
-                logger.info("Falling back to local recording")
-                self._start_local_recording()
-        else:
-            self._start_local_recording()
+            if self.recording_mode == 'camera':
+                try:
+                    req = urllib.request.Request(
+                        f"{self._camera_base_url}/record/start",
+                        method='POST', data=b'',
+                        headers=auth_headers(self._camera_token),
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        info = json.loads(resp.read())
+                    if not info.get('recording'):
+                        raise RuntimeError("camera did not confirm recording")
+                    self._recording_backend = 'camera'
+                    self.recording = True
+                    logger.info(f"Camera-side recording started: {info.get('file')}")
+                    return True
+                except Exception as e:
+                    logger.error(f"Failed to start camera recording: {e}")
+                    try:
+                        req = urllib.request.Request(
+                            f"{self._camera_base_url}/record/status",
+                            headers=auth_headers(self._camera_token),
+                        )
+                        with urllib.request.urlopen(req, timeout=3) as resp:
+                            status = json.loads(resp.read())
+                        if status.get('recording'):
+                            self._recording_backend = 'camera'
+                            self.recording = True
+                            logger.warning(
+                                "Camera start response failed, but status confirms recording"
+                            )
+                            return True
+                    except Exception as status_exc:
+                        logger.warning(f"Could not reconcile camera recording state: {status_exc}")
+                    logger.info("Falling back to local recording")
+            return self._start_local_recording()
 
     def _start_local_recording(self):
         """Start local ffmpeg-based recording on tracker Pi."""
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if self.capture is None:
+            logger.error("Cannot record before the camera stream is connected")
+            return False
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = self.output_dir / f"rec_{ts}.mp4"
         encoder = self.config['tracker'].get('recording_encoder', 'auto')
 
@@ -385,43 +431,78 @@ class HumanTracker:
         if source_fps <= 1.0:
             source_fps = float((self.config.get('camera') or {}).get('framerate') or 30)
         fps = capped_recording_fps(self.recording_fps, source_fps)
-        self._rec_thread = _RecordingThread(
-            str(path), self.capture.width, self.capture.height,
-            fps, encoder=encoder,
-        )
-        self._rec_thread.start()
+        recorder = None
+        try:
+            recorder = _RecordingThread(
+                str(path), self.capture.width, self.capture.height,
+                fps, encoder=encoder,
+            )
+            recorder.start()
+        except Exception as exc:
+            if recorder is not None:
+                recorder.stop()
+            logger.error(f"Could not start local recording: {exc}")
+            self._rec_thread = None
+            self._recording_backend = None
+            self.recording = False
+            return False
+        self._rec_thread = recorder
+        self._recording_backend = 'local'
         self.recording = True
-        logger.info(f"Recording: {path}  ({fps:.0f} fps, source {source_fps:.0f})")
+        logger.info(
+            f"Recording: {recorder.output_path}  ({fps:.0f} fps, source {source_fps:.0f})"
+        )
+        return True
 
     def stop_recording(self):
         """Stop video recording."""
-        if not self.recording:
-            return
-        self.recording = False
+        with self._record_lock:
+            if not self.recording:
+                return True
+            backend = self._recording_backend
 
-        if self.recording_mode == 'camera':
-            try:
-                req = urllib.request.Request(
-                    f"{self._camera_base_url}/record/stop",
-                    method='POST', data=b'',
-                    headers=auth_headers(self._camera_token),
-                )
-                urllib.request.urlopen(req, timeout=5)
-                logger.info("Camera-side recording stopped")
-            except Exception as e:
-                logger.warning(f"Failed to stop camera recording: {e}")
+            if backend == 'camera':
+                try:
+                    req = urllib.request.Request(
+                        f"{self._camera_base_url}/record/stop",
+                        method='POST', data=b'',
+                        headers=auth_headers(self._camera_token),
+                    )
+                    with urllib.request.urlopen(req, timeout=5):
+                        pass
+                    logger.info("Camera-side recording stopped")
+                except Exception as e:
+                    logger.warning(f"Failed to stop camera recording: {e}")
+                    return False
 
-        if self._rec_thread:
-            self._rec_thread.stop()
-            self._rec_thread = None
-        logger.info("Recording stopped")
+            if self._rec_thread:
+                self._rec_thread.stop()
+                self._rec_thread = None
+            self.recording = False
+            self._recording_backend = None
+            logger.info("Recording stopped")
+            return True
 
     def screenshot(self, frame: np.ndarray):
         """Save screenshot."""
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = self.output_dir / f"screenshot_{ts}.jpg"
-        cv2.imwrite(str(path), frame)
+        if not cv2.imwrite(str(path), frame):
+            raise OSError(f"Could not write screenshot: {path}")
         logger.info(f"Screenshot: {path}")
+        return path
+
+    @property
+    def records_locally(self) -> bool:
+        with self._record_lock:
+            return self.recording and self._recording_backend == 'local'
+
+    @property
+    def local_recording_path(self) -> Optional[Path]:
+        with self._record_lock:
+            if not self.records_locally or self._rec_thread is None:
+                return None
+            return Path(self._rec_thread.output_path)
 
     @property
     def fps(self) -> float:
@@ -439,13 +520,15 @@ class HumanTracker:
 
     def write_frame(self, frame: Optional[np.ndarray]):
         """Feed the latest clean (un-annotated) frame to the recording thread."""
-        if frame is not None and self.recording and self._rec_thread:
-            self._rec_thread.update_frame(frame)
+        with self._record_lock:
+            if frame is not None and self.records_locally and self._rec_thread:
+                self._rec_thread.update_frame(frame)
 
     def run(self, display: bool = True, auto_record: bool = False):
         """Main processing loop."""
         if not self.connect():
             logger.error("Failed to connect to stream")
+            self.cleanup()
             return
 
         self.running = True
@@ -465,7 +548,7 @@ class HumanTracker:
 
                 rec_frame = (
                     frame.copy()
-                    if self.recording and self.recording_mode != 'camera'
+                    if self.records_locally
                     else None
                 )
                 self.write_frame(rec_frame)
@@ -499,10 +582,7 @@ class HumanTracker:
                     elif key == ord('s'):
                         self.screenshot(annotated)
                     elif key == ord('d'):
-                        self.tracker.reset()
-                        self.current_detection = None
-                        self._last_keypoints = None
-                        self.motors.move_to_home()
+                        self.reset_tracking(home=True)
                         logger.info("Detection reset + camera homed")
                     elif key == ord('e'):
                         self.motors.disconnect() if self.motors.connected else self.motors.connect()
@@ -598,8 +678,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    config = load_config(args.config)
-    apply_cli_overrides(config, args)
+    try:
+        config = load_config(args.config)
+        apply_cli_overrides(config, args)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Configuration error: {exc}") from exc
     configure_logging(config)
 
     tracker = HumanTracker(config)
