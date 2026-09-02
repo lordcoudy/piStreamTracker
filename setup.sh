@@ -210,6 +210,12 @@ if [[ $EUID -eq 0 ]]; then
     exit 1
 fi
 
+if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+    ver=$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo unknown)
+    print_error "Python 3.11+ required (found ${ver}). Raspberry Pi OS Bookworm's python3 is 3.11."
+    exit 1
+fi
+
 echo -e "${BLUE}"
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║                    piStreamTracker Setup                     ║"

@@ -208,7 +208,8 @@ Web-only: `--host`, `--port`.
 .venv/bin/ruff check pistream tests tracker.py web.py camera.py ev3_usb.py
 ```
 
-No Pi or EV3 required. GitHub Actions runs the same on Python 3.12.
+No Pi or EV3 required. GitHub Actions runs the same on Python 3.11 and 3.12.
+Raspberry Pi OS Bookworm's system `python3` is 3.11.
 
 ## Troubleshooting
 

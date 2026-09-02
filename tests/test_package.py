@@ -53,6 +53,12 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertIn('style.css', body)
         self.assertIn('app.js', body)
 
+    def test_requires_python_allows_bookworm_3_11(self):
+        """Raspberry Pi OS Bookworm's python3 is 3.11.2; pip install -e . must accept it."""
+        text = Path(__file__).resolve().parents[1].joinpath('pyproject.toml').read_text()
+        self.assertRegex(text, r'requires-python\s*=\s*">=3\.11"')
+        self.assertNotRegex(text, r'requires-python\s*=\s*">=3\.12"')
+
 
 if __name__ == '__main__':
     unittest.main()
