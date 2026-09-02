@@ -18,7 +18,7 @@ from pistream.camera_auth import auth_headers
 from pistream.capture import VideoCapture
 from pistream.config import apply_cli_overrides, configure_logging, load_config
 from pistream.detect import AsyncDetector, PoseDetector
-from pistream.horizon import tilt_degrees
+from pistream import horizon
 from pistream.motors import MotorController
 from pistream.preview import accept_new_frame, capped_recording_fps
 from pistream.record import _RecordingThread
@@ -174,9 +174,18 @@ class HumanTracker:
         # Digital zoom (1.0 = no zoom, up to 4.0)
         self.zoom_level: float = 1.0
 
-        # Horizon stabilization
-        self.horizon_correction: bool = False
-        self._horizon_angle_ema: float = 0.0  # exponential moving average of tilt
+        # Horizon stabilization (software roll from pose keypoints)
+        hcfg = tracker_cfg.get('horizon') or {}
+        self.horizon_correction: bool = bool(hcfg.get('enabled', False))
+        self._horizon_cfg = {
+            'max_angle': float(hcfg.get('max_angle', 20)),
+            'ema_alpha': float(hcfg.get('ema_alpha', 0.15)),
+            'min_apply': float(hcfg.get('min_apply', 0.5)),
+            'fill_crop': bool(hcfg.get('fill_crop', True)),
+        }
+        self._horizon_ema: float = 0.0
+        self._horizon_M: Optional[np.ndarray] = None
+        self._leveled_frame: Optional[np.ndarray] = None
 
         # Recording mode: 'local' (Pi 5) or 'camera' (Pi 3B+)
         self.recording_mode = tracker_cfg.get('recording_mode', 'local')
@@ -276,8 +285,10 @@ class HumanTracker:
             self.current_detection = None
             self.motors.stop()
 
-        annotated = self._draw(frame.copy(), detection)
-        annotated = self._apply_horizon_preview(annotated, detection)
+        angle = self._update_horizon(detection)
+        leveled = self._level_frame(frame, angle)
+        self._leveled_frame = leveled
+        annotated = self._draw(leveled.copy(), detection, angle)
         annotated = self._apply_zoom(annotated)
         return annotated, detection
 
@@ -292,30 +303,39 @@ class HumanTracker:
             self._shift_logger.log(shift_x, shift_y)
         self.motors.update(shift_x, shift_y)
 
-    def _compute_horizon_correction(self, detection: Optional[dict]) -> float:
-        """EMA-smoothed tilt in degrees from shoulder/hip keypoints."""
-        if not self.horizon_correction or detection is None:
-            return 0.0
+    def _update_horizon(self, detection: Optional[dict]) -> float:
+        """EMA roll from pose keypoints. Holds last angle when the person is lost."""
+        raw = None
+        if detection is not None:
+            raw = horizon.estimate_roll_deg(
+                detection.get('keypoints'),
+                self.detector.keypoint_threshold,
+            )
+        self._horizon_ema = horizon.step_angle(
+            self.horizon_correction, raw, self._horizon_ema,
+            alpha=self._horizon_cfg['ema_alpha'],
+            max_angle=self._horizon_cfg['max_angle'],
+        )
+        return self._horizon_ema
 
-        raw = tilt_degrees(detection.get('keypoints'), self.detector.keypoint_threshold)
-        if raw is None:
-            return self._horizon_angle_ema
+    def reset_horizon(self) -> None:
+        """Snap leveling angle to zero (toggle off, home, detection reset)."""
+        self._horizon_ema = 0.0
+        self._horizon_M = None
 
-        alpha = 0.15
-        self._horizon_angle_ema = alpha * raw + (1 - alpha) * self._horizon_angle_ema
-        return self._horizon_angle_ema
-
-    def _apply_horizon_preview(self, frame: np.ndarray, detection: Optional[dict]) -> np.ndarray:
-        """Rotate the already-annotated preview so overlay stays on the person."""
-        angle = self._compute_horizon_correction(detection)
-        if abs(angle) <= 0.5:
-            return frame
-        h_fr, w_fr = frame.shape[:2]
-        matrix = cv2.getRotationMatrix2D((w_fr / 2, h_fr / 2), -angle, 1.0)
-        frame = cv2.warpAffine(frame, matrix, (w_fr, h_fr),
-                               borderMode=cv2.BORDER_REPLICATE)
-        cv2.putText(frame, f"H:{angle:+.1f}", (w_fr // 2 - 30, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 1)
+    def _level_frame(self, frame: np.ndarray, angle: float) -> np.ndarray:
+        """Rotate the raw frame so recordings and overlay share the same warp."""
+        min_apply = self._horizon_cfg['min_apply']
+        fill_crop = self._horizon_cfg['fill_crop']
+        if self.horizon_correction and abs(angle) >= min_apply:
+            h_fr, w_fr = frame.shape[:2]
+            self._horizon_M = horizon.level_affine(
+                w_fr, h_fr, angle, fill_crop=fill_crop
+            )
+            return horizon.warp_level(
+                frame, angle, fill_crop=fill_crop, min_apply=min_apply,
+            )
+        self._horizon_M = None
         return frame
 
     def _apply_zoom(self, frame: np.ndarray) -> np.ndarray:
@@ -331,27 +351,55 @@ class HumanTracker:
         cropped = frame[y1:y1 + crop_h, x1:x1 + crop_w]
         return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    def _draw(self, frame: np.ndarray, detection: Optional[dict]) -> np.ndarray:
-        """Draw tracking overlay on an unrotated frame."""
+    def _draw(self, frame: np.ndarray, detection: Optional[dict],
+              angle: float = 0.0) -> np.ndarray:
+        """Draw tracking overlay on an already-leveled frame."""
         cx, cy = self.capture.width // 2, self.capture.height // 2
+
+        if self.horizon_correction:
+            cv2.putText(frame, f"H:{angle:+.1f}", (cx - 30, 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 1)
 
         cv2.line(frame, (cx - 10, cy), (cx + 10, cy), (255, 0, 0), 1)
         cv2.line(frame, (cx, cy - 10), (cx, cy + 10), (255, 0, 0), 1)
 
         if detection:
-            x, y, w, h = detection['bbox']
-            tx, ty = x + w // 2, y + h // 4
+            x0, y0, w0, h0 = detection['bbox']
+            tx, ty = x0 + w0 // 2, y0 + h0 // 4
             shift_x, shift_y = tx - cx, ty - cy
+            M = self._horizon_M
+            kp = detection.get('keypoints')
+            kp_xy = None
+
+            if M is not None:
+                corners = np.array([
+                    [x0, y0], [x0 + w0, y0],
+                    [x0 + w0, y0 + h0], [x0, y0 + h0],
+                ], dtype=np.float64)
+                tc = horizon.transform_points(corners, M)
+                x1, y1 = tc.min(axis=0)
+                x2, y2 = tc.max(axis=0)
+                x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
+                p = horizon.transform_points(
+                    np.array([[tx, ty]], dtype=np.float64), M
+                )[0]
+                tx, ty = int(p[0]), int(p[1])
+                if kp is not None:
+                    kp_xy = horizon.transform_points(np.asarray(kp)[:, :2], M)
+            else:
+                x, y, w, h = x0, y0, w0, h0
+                if kp is not None:
+                    kp_xy = np.asarray(kp)[:, :2]
 
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             cv2.line(frame, (x, y + h // 2), (x + w, y + h // 2), (0, 180, 0), 1)
             cv2.circle(frame, (tx, ty), 4, (0, 0, 255), -1)
             cv2.line(frame, (cx, cy), (tx, ty), (255, 255, 0), 1)
 
-            kp = detection.get('keypoints')
-            if kp is not None:
-                for px, py, conf in kp:
-                    if conf >= self.detector.keypoint_threshold:
+            if kp is not None and kp_xy is not None:
+                kp_arr = np.asarray(kp)
+                for i, (px, py) in enumerate(kp_xy):
+                    if kp_arr[i, 2] >= self.detector.keypoint_threshold:
                         cv2.circle(frame, (int(px), int(py)), 3, (255, 0, 255), -1)
 
             cv2.putText(frame, f"x={shift_x:+d} y={shift_y:+d}", (x, y - 8),
@@ -366,6 +414,7 @@ class HumanTracker:
         self._last_keypoints = None
         self._detection_misses = 0
         self.motors.stop()
+        self.reset_horizon()
         if home:
             self.motors.move_to_home()
 
@@ -519,10 +568,16 @@ class HumanTracker:
             self._fps_time = now
 
     def write_frame(self, frame: Optional[np.ndarray]):
-        """Feed the latest clean (un-annotated) frame to the recording thread."""
+        """Feed the latest clean (un-annotated, possibly leveled) frame to the recorder."""
         with self._record_lock:
             if frame is not None and self.records_locally and self._rec_thread:
                 self._rec_thread.update_frame(frame)
+
+    def recording_frame(self) -> Optional[np.ndarray]:
+        """Snapshot of the clean leveled frame for local recording."""
+        if not self.records_locally or self._leveled_frame is None:
+            return None
+        return self._leveled_frame.copy()
 
     def run(self, display: bool = True, auto_record: bool = False):
         """Main processing loop."""
@@ -546,13 +601,8 @@ class HumanTracker:
                     time.sleep(0.002)
                     continue
 
-                rec_frame = (
-                    frame.copy()
-                    if self.records_locally
-                    else None
-                )
-                self.write_frame(rec_frame)
                 annotated, _ = self.process_frame(frame)
+                self.write_frame(self.recording_frame())
                 self.update_fps()
 
                 if display:

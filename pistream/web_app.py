@@ -431,6 +431,8 @@ def api_settings():
             trk.detection_interval = values['interval']
         if 'horizon' in values:
             trk.horizon_correction = values['horizon']
+            if not trk.horizon_correction:
+                trk.reset_horizon()
 
     return jsonify({'status': 'ok'})
 
@@ -690,11 +692,6 @@ def _run_tracker_loop(trk: HumanTracker):
                 time.sleep(0.002)
                 continue
 
-            rec_frame = (
-                frame.copy()
-                if trk.records_locally
-                else None
-            )
             annotated, _ = trk.process_frame(frame)
 
             with _frame_lock:
@@ -702,7 +699,7 @@ def _run_tracker_loop(trk: HumanTracker):
                 _latest_seq += 1
 
             trk.update_fps()
-            trk.write_frame(rec_frame)
+            trk.write_frame(trk.recording_frame())
 
     except Exception as e:
         logger.error(f"Tracker loop error: {e}")

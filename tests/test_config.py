@@ -96,6 +96,25 @@ class ConfigValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'camera must be a mapping'):
                 load_config(str(path))
 
+    def test_horizon_defaults_are_present(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('tracker:\n  output_dir: recordings\n')
+            config = load_config(str(path))
+        h = config['tracker']['horizon']
+        self.assertFalse(h['enabled'])
+        self.assertEqual(h['max_angle'], 20)
+        self.assertEqual(h['ema_alpha'], 0.15)
+        self.assertEqual(h['min_apply'], 0.5)
+        self.assertTrue(h['fill_crop'])
+
+    def test_invalid_horizon_max_angle_is_rejected(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('tracker:\n  horizon:\n    max_angle: 180\n')
+            with self.assertRaisesRegex(ValueError, 'horizon.max_angle'):
+                load_config(str(path))
+
     def test_environment_camera_token_overrides_file(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / 'config.yaml'

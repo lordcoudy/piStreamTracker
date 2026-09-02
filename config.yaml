@@ -44,6 +44,15 @@ tracker:
   #               uses Pi's hardware H.264 encoder, saves files on the camera Pi)
   recording_mode: "local"
 
+  # Software horizon (pose keypoints → rotate + fill-crop). No IMU.
+  # Live preview and local recordings; camera-side H.264 is not leveled.
+  horizon:
+    enabled: false
+    max_angle: 20        # clamp, degrees
+    ema_alpha: 0.15
+    min_apply: 0.5       # skip warp below this
+    fill_crop: true      # scale up so rotation does not show borders
+
   # Detection settings (runs asynchronously — main loop never blocks)
   detection:
     interval: 10          # Re-detect every N frames (async, no FPS impact)

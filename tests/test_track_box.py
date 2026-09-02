@@ -40,8 +40,18 @@ class DetectionLossTests(unittest.TestCase):
         human._shift_logger = None
         human.capture = SimpleNamespace(width=64, height=48)
         human.motors = SimpleNamespace(update=lambda *_: None, stop=lambda: None)
-        human._draw = lambda frame, _detection: frame
-        human._apply_horizon_preview = lambda frame, _detection: frame
+        human.detector = SimpleNamespace(keypoint_threshold=0.3)
+        human.horizon_correction = False
+        human._horizon_cfg = {
+            'max_angle': 20.0,
+            'ema_alpha': 0.15,
+            'min_apply': 0.5,
+            'fill_crop': True,
+        }
+        human._horizon_ema = 0.0
+        human._horizon_M = None
+        human._leveled_frame = None
+        human._draw = lambda frame, _detection, _angle=0.0: frame
         human._apply_zoom = lambda frame: frame
         return human
 

@@ -28,13 +28,13 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertTrue((root / 'config.yaml').is_file())
         self.assertTrue((root / 'tracker.py').is_file())
 
-    def test_process_frame_aims_then_draws_then_levels(self):
+    def test_process_frame_aims_then_levels_then_draws(self):
         src = (self.pkg / 'track.py').read_text()
         aim = src.index('self._update_aim(')
+        level = src.index('leveled = self._level_frame(')
         draw = src.index('annotated = self._draw(')
-        horizon = src.index('annotated = self._apply_horizon_preview(')
-        self.assertLess(aim, draw)
-        self.assertLess(draw, horizon)
+        self.assertLess(aim, level)
+        self.assertLess(level, draw)
 
     def test_index_serves_extracted_template(self):
         from pistream.web_app import app

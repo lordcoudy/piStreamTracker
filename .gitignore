@@ -27,3 +27,5 @@ models/*.tflite
 
 # Recordings
 recordings/
+
+models/

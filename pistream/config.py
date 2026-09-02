@@ -37,6 +37,13 @@ def default_config() -> dict:
             'recording_fps': 30,
             'recording_encoder': 'auto',
             'recording_mode': 'local',
+            'horizon': {
+                'enabled': False,
+                'max_angle': 20,
+                'ema_alpha': 0.15,
+                'min_apply': 0.5,
+                'fill_crop': True,
+            },
             'detection': {'interval': 10, 'scale': 0.4, 'confidence': 0.5, 'keypoint_threshold': 0.3},
             'movenet': {'model_path': None, 'threads': None}
         },
@@ -170,6 +177,21 @@ def validate_config(config: dict) -> dict:
         raise ValueError(
             "tracker.recording_encoder must be auto, h264_v4l2m2m, libx264, or mjpg"
         )
+
+    horizon = _mapping(tracker.setdefault('horizon', {}), 'tracker.horizon')
+    horizon['enabled'] = _boolean(horizon.get('enabled', False), 'tracker.horizon.enabled')
+    horizon['max_angle'] = _bounded_number(
+        horizon.get('max_angle', 20), 'tracker.horizon.max_angle', 0, 90
+    )
+    horizon['ema_alpha'] = _bounded_number(
+        horizon.get('ema_alpha', 0.15), 'tracker.horizon.ema_alpha', 0, 1
+    )
+    horizon['min_apply'] = _bounded_number(
+        horizon.get('min_apply', 0.5), 'tracker.horizon.min_apply', 0, 90
+    )
+    horizon['fill_crop'] = _boolean(
+        horizon.get('fill_crop', True), 'tracker.horizon.fill_crop'
+    )
 
     detection['interval'] = _positive_int(detection.get('interval'), 'tracker.detection.interval')
     detection['scale'] = _bounded_number(detection.get('scale'), 'tracker.detection.scale', 0.05, 1)
