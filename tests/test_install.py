@@ -1,17 +1,27 @@
 """Installer CLI: role, network target, argparse."""
 
 import unittest
+from io import StringIO
+from pathlib import Path
 
 from pistream.install import (
     InstallError,
+    RunAction,
+    WriteAction,
+    cmd_network,
     detect_network_backend,
     detect_pi_model,
+    execute_actions,
     network_target,
     parse_args,
     parse_nmcli_connections,
     plan_networkd_actions,
     plan_nm_actions,
+    plan_service_actions,
+    plan_udev_actions,
     render_networkd_file,
+    render_udev_rule,
+    render_unit_file,
     resolve_role,
     ssh_on_interface,
 )
@@ -199,4 +209,127 @@ class SshGuardTests(unittest.TestCase):
 
     def test_missing_env(self):
         self.assertFalse(ssh_on_interface(None, {'192.168.100.1'}))
+
+
+class UnitFileTests(unittest.TestCase):
+    def test_camera_unit(self):
+        body = render_unit_file(
+            description='piStreamTracker Camera Server',
+            user='pi',
+            work_dir='/opt/piStreamTracker',
+            python='/opt/piStreamTracker/venv/bin/python',
+            script='/opt/piStreamTracker/camera.py',
+        )
+        self.assertIn('User=pi', body)
+        self.assertIn('WorkingDirectory=/opt/piStreamTracker', body)
+        self.assertIn(
+            'ExecStart=/opt/piStreamTracker/venv/bin/python /opt/piStreamTracker/camera.py',
+            body,
+        )
+        self.assertIn('After=network-online.target', body)
+
+    def test_service_plan_enable(self):
+        actions = plan_service_actions(
+            role='tracker',
+            user='pi',
+            work_dir='/repo',
+            python='/repo/venv/bin/python',
+            enable=True,
+        )
+        writes = [a for a in actions if isinstance(a, WriteAction)]
+        self.assertEqual(writes[0].path, '/etc/systemd/system/pitracker.service')
+        self.assertIn('web.py', writes[0].content)
+        joined = [' '.join(a.argv) for a in actions if isinstance(a, RunAction)]
+        self.assertTrue(any('daemon-reload' in j for j in joined))
+        self.assertTrue(any('enable' in j and '--now' in j for j in joined))
+
+
+class UdevTests(unittest.TestCase):
+    def test_rule_vendor(self):
+        rule = render_udev_rule()
+        self.assertIn('idVendor}=="0694"', rule)
+        self.assertIn('GROUP="plugdev"', rule)
+
+    def test_plan_includes_usermod(self):
+        actions = plan_udev_actions('milord')
+        joined = [' '.join(a.argv) for a in actions if isinstance(a, RunAction)]
+        self.assertTrue(any('usermod' in j and 'milord' in j for j in joined))
+
+
+class ExecuteActionsTests(unittest.TestCase):
+    def test_dry_run_does_not_run(self):
+        calls = []
+        writes = []
+        out = StringIO()
+        execute_actions(
+            [RunAction(('nmcli', 'connection', 'up', 'x')), WriteAction('/tmp/a', 'hi')],
+            dry_run=True,
+            run=lambda *a, **k: calls.append((a, k)),
+            write_file=lambda p, c: writes.append((p, c)),
+            stdout=out,
+        )
+        self.assertEqual(calls, [])
+        self.assertEqual(writes, [])
+        self.assertIn('nmcli', out.getvalue())
+        self.assertIn('/tmp/a', out.getvalue())
+
+    def test_run_prefixes_sudo(self):
+        calls = []
+        execute_actions(
+            [RunAction(('nmcli', 'connection', 'up', 'x'))],
+            dry_run=False,
+            run=lambda argv, **k: calls.append(argv),
+            write_file=lambda p, c: None,
+            stdout=StringIO(),
+        )
+        self.assertEqual(calls[0][:2], ('sudo', 'nmcli'))
+
+
+class InstallModuleTests(unittest.TestCase):
+    def test_install_module_has_no_heavy_imports(self):
+        source = Path(__file__).resolve().parents[1] / 'pistream' / 'install.py'
+        text = source.read_text()
+        self.assertNotIn('cv2', text)
+        self.assertNotIn('picamera2', text)
+        self.assertNotIn('flask', text.lower())
+
+
+class CmdNetworkTests(unittest.TestCase):
+    def test_non_linux_skips(self):
+        out = StringIO()
+        args = parse_args(['--dry-run', 'network', '--role', 'camera'])
+        rc = cmd_network(args, stdout=out, platform='darwin')
+        self.assertEqual(rc, 0)
+        self.assertIn('not Linux', out.getvalue())
+
+    def test_linux_nm_dry_run_uses_config_ip(self):
+        out = StringIO()
+        calls = []
+        args = parse_args(['--dry-run', 'network', '--role', 'camera'])
+        rc = cmd_network(
+            args,
+            load_cfg=lambda: {
+                'network': {
+                    'camera_ip': '192.168.100.1',
+                    'tracker_ip': '192.168.100.2',
+                    'interface': 'eth0',
+                    'subnet': 24,
+                }
+            },
+            is_active=lambda name: name == 'NetworkManager',
+            list_connections=lambda: [
+                ('Wired connection 1', 'eth0', '802-3-ethernet'),
+            ],
+            run=lambda *a, **k: calls.append((a, k)),
+            write_file=lambda p, c: None,
+            stdout=out,
+            platform='linux',
+            model_text='Raspberry Pi 3 Model B Plus',
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [])
+        self.assertIn('192.168.100.1/24', out.getvalue())
+        self.assertIn('never-default', out.getvalue())
+
+
 
