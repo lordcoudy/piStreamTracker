@@ -114,6 +114,12 @@ class ParseArgsTests(unittest.TestCase):
         self.assertEqual(args.role, 'tracker')
         self.assertEqual(args.interface, 'end0')
 
+    def test_dry_run_after_subcommand(self):
+        args = parse_args(['install', '--role', 'camera', '--dry-run'])
+        self.assertTrue(args.dry_run)
+        self.assertEqual(args.command, 'install')
+        self.assertEqual(args.role, 'camera')
+
     def test_missing_command_exits(self):
         with self.assertRaises(SystemExit):
             parse_args([])

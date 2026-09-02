@@ -19,6 +19,19 @@ dev = [
     "ruff>=0.6",
 ]
 
+[project.scripts]
+pistream-install = "pistream.install:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["pistream*"]
+
+[tool.setuptools.package-data]
+pistream = ["templates/*", "static/*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

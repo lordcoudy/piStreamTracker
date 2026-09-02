@@ -11,18 +11,22 @@ set -e
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 
-# Optional one-shot network config (do not use if SSH is on eth0)
 if [[ "${1:-}" == "--configure-network" ]]; then
     shift
-    if [[ $EUID -ne 0 ]]; then
-        echo "Network config requires root: sudo $0 --configure-network" >&2
+    if [[ $EUID -eq 0 ]]; then
+        echo "Refusing to run as root. Use: $0 --configure-network" >&2
+        echo "The installer will sudo only for nmcli/networkd." >&2
         exit 1
     fi
-    echo "Configuring eth0 as 192.168.100.1/24 (no flush of other addresses)..."
-    ip addr add 192.168.100.1/24 dev eth0 2>/dev/null || true
-    ip link set eth0 up
-    echo "Network configured. Re-run $0 as a normal user to start the camera server."
-    exit 0
+    PY="$SCRIPT_DIR/venv/bin/python"
+    if [[ ! -x "$PY" ]]; then
+        PY="$SCRIPT_DIR/.venv/bin/python"
+    fi
+    if [[ ! -x "$PY" ]]; then
+        echo "No venv. Run ./setup.sh --camera first." >&2
+        exit 1
+    fi
+    exec "$PY" -m pistream.install network --role camera "$@"
 fi
 
 if [[ $EUID -eq 0 ]]; then

@@ -33,6 +33,9 @@ camera.py                     tracker.py  or  web.py
 
 ## Setup
 
+Install from this git repo (not a `.deb` or PyPI package). `pip install -e .` only
+installs Python deps; it does not configure ethernet, udev, or systemd.
+
 **Pi 3B+**
 
 ```bash
@@ -49,15 +52,27 @@ cd piStreamTracker
 ./setup.sh --tracker
 ```
 
-Setup can write systemd-networkd for `eth0` and an EV3 udev rule. Alternatively, once:
+`./setup.sh --camera` / `--tracker` is non-interactive: apt + venv + pip, ethernet
+IPs from `config.yaml` via NetworkManager (Bookworm/Trixie), EV3 udev on the tracker,
+and `pitracker.service` enabled. Wi-Fi is left alone; ethernet is `ipv4.never-default`
+so SSH/internet on wlan0 keep the default route.
 
 ```bash
-sudo ./run_cam.sh --configure-network      # 192.168.100.1/24
-sudo ./run_tracker.sh --configure-network  # 192.168.100.2/24
+./setup.sh --camera --skip-network
+./setup.sh --tracker --skip-service --skip-udev
+./setup.sh --tracker --dry-run
+./setup.sh status
+./setup.sh network --role camera
 ```
 
-These privileged commands configure the interface and exit. Start the application afterward as
-a normal user; the launch scripts deliberately refuse to run the Python services as root.
+Re-apply ethernet later without wrapping the whole script in sudo:
+
+```bash
+./run_cam.sh --configure-network      # 192.168.100.1 from config.yaml
+./run_tracker.sh --configure-network  # 192.168.100.2 from config.yaml
+```
+
+The installer sudoes only `nmcli` / networkd / systemd / udev. Do not run Python as root.
 
 Scripts accept `venv/` (what `setup.sh` creates) or `.venv/`, can be launched from any
 working directory, and accept tracker flags in any order.
@@ -166,6 +181,7 @@ Set `PISTREAM_CAMERA_TOKEN` to override `camera.token` without storing the secre
 ```bash
 python tracker.py --help
 python web.py --help
+python -m pistream.install --help
 ```
 
 Shared flags: `--config`, `--url`, `--output-dir`, `--detection-interval`, `--process-scale`, `--confidence`, `--movenet-threads`, `--no-ev3`, `--preset`.
@@ -206,7 +222,7 @@ No Pi or EV3 required. GitHub Actions runs the same on Python 3.12.
 | EV3 permission denied | `setup.sh` udev (`idVendor=0694`); user in `plugdev` |
 | Camera recordings unavailable | Check the camera server and token. The UI still shows local screenshots/fallback recordings and reports that camera files are unavailable. |
 | Bind / “address already in use” | Something else on 5000/8000, or `host` is an IP that is not assigned yet |
-| Network | `ping 192.168.100.1`. Launch scripts do not flush `eth0` |
+| Network | `ping 192.168.100.1`. `./setup.sh status`. Bookworm/Trixie uses NetworkManager; install `network-manager` or pass `--skip-network`. Remove leftover `/etc/systemd/network/10-eth0.network` from older setup.sh if it fights NM. |
 
 ## Layout
 
@@ -217,10 +233,11 @@ piStreamTracker/
 ├── web.py               # Flask entry
 ├── camera.py            # Camera Pi server
 ├── ev3_usb.py           # Shim → pistream.ev3_usb
-├── setup.sh
+├── setup.sh             # Bootstrap apt/venv; exec python -m pistream.install
 ├── run_cam.sh
 ├── run_tracker.sh
 ├── pistream/            # Application package
+│   ├── install.py       # Installer CLI (network, udev, systemd)
 │   ├── capture.py       # Threaded MJPEG capture + reconnect
 │   ├── detect.py        # MoveNet + async worker
 │   ├── track.py         # HumanTracker, MOSSE, CLI

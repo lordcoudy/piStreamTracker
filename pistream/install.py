@@ -71,8 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog='pistream-install',
         description='Install piStreamTracker network, udev, and systemd units',
     )
-    parser.add_argument('--config', default='config.yaml', help='Config file')
-    parser.add_argument('--dry-run', action='store_true', help='Print actions without sudo')
+    parser.add_argument('--config', default=argparse.SUPPRESS, help='Config file')
+    parser.add_argument('--dry-run', action='store_true', default=argparse.SUPPRESS,
+                        help='Print actions without sudo')
     sub = parser.add_subparsers(dest='command', required=True)
 
     inst = sub.add_parser('install', help='Full automatic install (network + service + udev)')
@@ -96,7 +97,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    return build_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--config', default='config.yaml')
+    pre.add_argument('--dry-run', action='store_true')
+    known, rest = pre.parse_known_args(argv)
+    args = build_parser().parse_args(rest)
+    args.config = known.config
+    args.dry_run = known.dry_run
+    return args
 
 
 @dataclass(frozen=True)
@@ -332,7 +341,8 @@ def execute_actions(
     if run is None:
         run = subprocess.run
     if write_file is None:
-        write_file = lambda path, content: _sudo_write(path, content, run=run)
+        def write_file(path: str, content: str, _run: Callable[..., Any] = run) -> None:
+            _sudo_write(path, content, run=_run)
     for action in actions:
         if isinstance(action, WriteAction):
             if dry_run:
