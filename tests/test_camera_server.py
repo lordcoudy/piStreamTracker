@@ -127,3 +127,9 @@ class CameraServerTests(unittest.TestCase):
         body = handler.wfile.getvalue()
         self.assertTrue(body.startswith(b'{'), body)
         self.assertIn(b'not found', body.lower())
+
+    def test_camera_busy_hint_points_at_pitracker_service(self):
+        hint = self.camera.camera_busy_hint('192.168.100.1', 8000)
+        self.assertIn('pitracker.service', hint)
+        self.assertIn('http://192.168.100.1:8000/stream', hint)
+        self.assertIn('systemctl stop pitracker', hint)

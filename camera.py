@@ -366,6 +366,16 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def camera_busy_hint(ip: str, port: int) -> str:
+    """How to recover when libcamera is already held (usually pitracker.service)."""
+    return (
+        f'Camera device is busy (another process holds libcamera). '
+        f'After ./setup.sh --camera, pitracker.service already streams at '
+        f'http://{ip}:{port}/stream. Check: sudo systemctl status pitracker. '
+        f'To run camera.py yourself: sudo systemctl stop pitracker'
+    )
+
+
 class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
     """Threaded HTTP server with tuning for low-latency streaming."""
     allow_reuse_address = True
@@ -384,8 +394,11 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
 def main():
     logger.info("Initializing Raspberry Pi Camera...")
 
-    # Initialize camera
-    picam2 = Picamera2()
+    try:
+        picam2 = Picamera2()
+    except RuntimeError:
+        logger.error(camera_busy_hint(CAMERA_IP, PORT))
+        raise
     video_config = picam2.create_video_configuration(
         main={"size": (WIDTH, HEIGHT)},
         controls={"FrameRate": FRAMERATE},

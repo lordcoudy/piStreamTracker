@@ -222,7 +222,8 @@ Raspberry Pi OS Bookworm's system `python3` is 3.11.
 | EV3 not found | USB cable, `ev3-dc` installed, udev rule; re-plug the brick / re-login after `plugdev` |
 | EV3 permission denied | `setup.sh` udev (`idVendor=0694`); user in `plugdev` |
 | Camera recordings unavailable | Check the camera server and token. The UI still shows local screenshots/fallback recordings and reports that camera files are unavailable. |
-| Bind / “address already in use” | Something else on 5000/8000, or `host` is an IP that is not assigned yet |
+| Bind / “address already in use” | Something else on 5000/8000, or `host` is an IP that is not assigned yet. After setup, `pitracker.service` may already own the port: `sudo systemctl status pitracker` |
+| Camera busy / pipeline handler in use | Another process holds libcamera. After `./setup.sh --camera`, that is `pitracker.service` (stream already at `http://192.168.100.1:8000/stream`). `sudo systemctl status pitracker`. To run `./run_cam.sh` yourself: `sudo systemctl stop pitracker` |
 | Network | `ping 192.168.100.1`. `./setup.sh status`. Bookworm/Trixie uses NetworkManager; install `network-manager` or pass `--skip-network`. Remove leftover `/etc/systemd/network/10-eth0.network` from older setup.sh if it fights NM. |
 
 ## Layout

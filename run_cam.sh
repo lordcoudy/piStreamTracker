@@ -34,6 +34,18 @@ if [[ $EUID -eq 0 ]]; then
     exit 1
 fi
 
+if command -v systemctl >/dev/null 2>&1; then
+    state=$(systemctl is-active pitracker 2>/dev/null || true)
+    if [[ "$state" == "active" || "$state" == "activating" ]]; then
+        echo "pitracker.service is already running and holds the camera."
+        echo "  Stream: http://192.168.100.1:8000/stream  (IPs in config.yaml)"
+        echo "  Status: sudo systemctl status pitracker"
+        echo "  Logs:   journalctl -u pitracker -e"
+        echo "  Manual: sudo systemctl stop pitracker && $0"
+        exit 0
+    fi
+fi
+
 # Activate virtual environment
 if [[ -z "${VIRTUAL_ENV}" ]]; then
     if [[ -d "venv" ]]; then
