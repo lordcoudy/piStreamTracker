@@ -241,6 +241,11 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                 return
             self._send_recording(path.removeprefix('/record/files/'))
 
+        elif path.startswith('/record/'):
+            if not self._authorized():
+                return
+            self._json_response({'error': 'not found'}, 404)
+
         else:
             self.send_error(404)
 
@@ -253,7 +258,7 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlsplit(self.path).path)
-        if path in ('/record/start', '/record/stop') and not self._authorized():
+        if path.startswith('/record/') and not self._authorized():
             return
         if path == '/record/start':
             if not self.recorder:
@@ -277,15 +282,21 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                 logger.exception('Could not stop camera recording')
                 self._json_response({'error': str(exc)}, 500)
 
+        elif path.startswith('/record/'):
+            self._json_response({'error': 'not found'}, 404)
+
         else:
             self.send_error(404)
 
     def do_DELETE(self):
         path = unquote(urlsplit(self.path).path)
-        if not path.startswith('/record/files/'):
+        if not path.startswith('/record/'):
             self.send_error(404)
             return
         if not self._authorized():
+            return
+        if not path.startswith('/record/files/'):
+            self._json_response({'error': 'not found'}, 404)
             return
         try:
             file_path = self._recording_path(path.removeprefix('/record/files/'))

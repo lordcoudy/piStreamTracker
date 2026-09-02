@@ -1,6 +1,5 @@
 """Recording file listing and path safety."""
 
-import json
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -8,6 +7,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from pistream.camera_auth import auth_headers
+from pistream.jsonutil import load_json_object
 
 RECORDING_SUFFIXES = {'.avi', '.jpg', '.png', '.txt', '.mp4'}
 
@@ -54,8 +54,8 @@ def fetch_remote_recordings(base_url: str, token: str = '') -> list:
         headers=auth_headers(token or None),
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-    files = data.get('files') if isinstance(data, dict) else None
+        data = load_json_object(resp.read())
+    files = data.get('files')
     return files if isinstance(files, list) else []
 
 

@@ -4,8 +4,10 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from pistream.jsonutil import load_json_object
 from pistream.recordings import (
     RECORDING_SUFFIXES,
+    fetch_remote_recordings,
     is_recording_file,
     list_recording_files,
     safe_recording_path,
@@ -82,6 +84,37 @@ class SafeRecordingPathTests(unittest.TestCase):
             (rec / 'nested').mkdir(parents=True)
             with self.assertRaises(ValueError):
                 safe_recording_path(rec, 'nested/clip.mp4')
+
+
+class LoadJsonObjectTests(unittest.TestCase):
+    def test_parses_object(self):
+        self.assertEqual(load_json_object(b'{"files":[]}'), {'files': []})
+
+    def test_rejects_html(self):
+        with self.assertRaises(ValueError):
+            load_json_object(b'<!doctype html><title>404</title>')
+
+    def test_rejects_json_array(self):
+        with self.assertRaises(ValueError):
+            load_json_object(b'[]')
+
+
+class FetchRemoteRecordingsJsonTests(unittest.TestCase):
+    def test_html_body_raises_value_error(self):
+        class Resp:
+            def read(self):
+                return b'<!doctype html>'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        from unittest.mock import patch
+        with patch('pistream.recordings.urllib.request.urlopen', return_value=Resp()):
+            with self.assertRaises(ValueError):
+                fetch_remote_recordings('http://camera:8000', 'secret')
 
 
 if __name__ == '__main__':

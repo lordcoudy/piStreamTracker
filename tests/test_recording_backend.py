@@ -82,3 +82,24 @@ class RecordingBackendTests(unittest.TestCase):
 
             self.assertTrue(tracker.recording)
             self.assertEqual(tracker._recording_backend, 'camera')
+
+    def test_html_camera_start_body_falls_back_to_local(self):
+        class HtmlResp:
+            def read(self):
+                return b'<html>nope</html>'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with TemporaryDirectory() as tmp:
+            tracker = tracker_shell(tmp)
+            recorder = FakeRecordingThread(str(Path(tmp) / 'fallback.avi'))
+            with (
+                patch('pistream.track.urllib.request.urlopen', return_value=HtmlResp()),
+                patch('pistream.track._RecordingThread', return_value=recorder),
+            ):
+                self.assertTrue(tracker.start_recording())
+                self.assertEqual(tracker._recording_backend, 'local')

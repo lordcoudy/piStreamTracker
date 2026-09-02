@@ -215,3 +215,62 @@ class WebInputValidationTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 400)
+
+    def test_unknown_api_path_returns_json(self):
+        from pistream import web_app
+
+        response = web_app.app.test_client().get('/api/does-not-exist')
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(response.is_json)
+        self.assertEqual(response.get_json()['status'], 'error')
+
+    def test_wrong_method_returns_json(self):
+        from pistream import web_app
+
+        response = web_app.app.test_client().get('/api/start')
+        self.assertEqual(response.status_code, 405)
+        self.assertTrue(response.is_json)
+        self.assertEqual(response.get_json()['status'], 'error')
+
+    def test_unhandled_api_exception_returns_json(self):
+        from pistream import web_app
+
+        with patch.object(web_app, '_tracker', side_effect=RuntimeError('boom')):
+            response = web_app.app.test_client().get('/api/status')
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(response.is_json)
+        self.assertEqual(response.get_json()['status'], 'error')
+        self.assertNotIn('boom', response.get_json()['message'])
+
+    def test_invalid_json_body_is_reported(self):
+        from pistream import web_app
+
+        response = web_app.app.test_client().post(
+            '/api/settings',
+            data='{not json',
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['message'], 'Invalid JSON')
+
+    def test_status_serializes_numpy_bbox_shift(self):
+        import numpy as np
+        from pistream import web_app
+
+        tracker = SimpleNamespace(
+            running=True,
+            recording=False,
+            fps=1.5,
+            zoom_level=np.float64(1.0),
+            horizon_correction=False,
+            current_detection={'bbox': np.array([10, 20, 30, 40], dtype=np.int32)},
+            capture=SimpleNamespace(width=640, height=480, stream_lost=False),
+            motors=SimpleNamespace(connected=False),
+        )
+        with patch.object(web_app, '_lifecycle', SimpleNamespace(tracker=tracker)):
+            response = web_app.app.test_client().get('/api/status')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertIsInstance(payload['shift_x'], int)
+        self.assertIsInstance(payload['shift_y'], int)
+        self.assertIsInstance(payload['fps'], float)

@@ -18,13 +18,23 @@
                     opts.body = JSON.stringify(data);
                 }
                 const res = await fetch('/api/' + endpoint, opts);
-                const payload = await res.json();
+                const text = await res.text();
+                let payload;
+                try {
+                    payload = text ? JSON.parse(text) : {};
+                } catch (e) {
+                    log('API error: invalid JSON (' + res.status + ')', 'error');
+                    return { status: 'error', message: 'Invalid JSON from server', httpOk: false, httpStatus: res.status };
+                }
+                if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+                    return { status: 'error', message: 'Unexpected API response', httpOk: false, httpStatus: res.status };
+                }
                 payload.httpOk = res.ok;
                 payload.httpStatus = res.status;
                 return payload;
             } catch (e) {
                 log('API error: ' + e.message, 'error');
-                return null;
+                return { status: 'error', message: e.message, httpOk: false, httpStatus: 0 };
             }
         }
 
@@ -144,37 +154,38 @@
 
         async function updateStatus() {
             const res = await api('status');
-            if (res) {
-                isTracking = res.running;
-                isRecording = res.recording;
-                const trackingDot = document.getElementById('status-tracking');
-                if (res.running && res.stream_lost) {
-                    trackingDot.className = 'dot yellow';
-                } else {
-                    trackingDot.className = 'dot ' + (isTracking ? 'green' : 'red');
-                }
-                document.getElementById('status-ev3').className = 'dot ' + (res.ev3_connected ? 'green' : 'red');
-                document.getElementById('ev3-toggle').checked = res.ev3_connected;
-                document.getElementById('info-fps').textContent = res.fps.toFixed(1);
-                document.getElementById('info-detection').textContent = res.detected ? 'Yes' : 'No';
-                if (res.shift_x !== null) {
-                    document.getElementById('info-shift-x').textContent = res.shift_x;
-                    document.getElementById('info-shift-y').textContent = res.shift_y;
-                } else {
-                    document.getElementById('info-shift-x').textContent = '--';
-                    document.getElementById('info-shift-y').textContent = '--';
-                }
-                if (res.zoom !== undefined) {
-                    document.getElementById('zoom-value').textContent = res.zoom.toFixed(2) + 'x';
-                }
-                if (res.horizon !== undefined) {
-                    document.getElementById('horizon-toggle').checked = res.horizon;
-                }
-                if (res.overlay !== undefined) {
-                    document.getElementById('overlay-toggle').checked = res.overlay;
-                }
-                updateUI();
+            if (!res || typeof res.running !== 'boolean' || typeof res.fps !== 'number') {
+                return;
             }
+            isTracking = res.running;
+            isRecording = res.recording;
+            const trackingDot = document.getElementById('status-tracking');
+            if (res.running && res.stream_lost) {
+                trackingDot.className = 'dot yellow';
+            } else {
+                trackingDot.className = 'dot ' + (isTracking ? 'green' : 'red');
+            }
+            document.getElementById('status-ev3').className = 'dot ' + (res.ev3_connected ? 'green' : 'red');
+            document.getElementById('ev3-toggle').checked = res.ev3_connected;
+            document.getElementById('info-fps').textContent = res.fps.toFixed(1);
+            document.getElementById('info-detection').textContent = res.detected ? 'Yes' : 'No';
+            if (res.shift_x !== null) {
+                document.getElementById('info-shift-x').textContent = res.shift_x;
+                document.getElementById('info-shift-y').textContent = res.shift_y;
+            } else {
+                document.getElementById('info-shift-x').textContent = '--';
+                document.getElementById('info-shift-y').textContent = '--';
+            }
+            if (res.zoom !== undefined) {
+                document.getElementById('zoom-value').textContent = res.zoom.toFixed(2) + 'x';
+            }
+            if (res.horizon !== undefined) {
+                document.getElementById('horizon-toggle').checked = res.horizon;
+            }
+            if (res.overlay !== undefined) {
+                document.getElementById('overlay-toggle').checked = res.overlay;
+            }
+            updateUI();
         }
 
         // --- Recordings ---
@@ -256,9 +267,8 @@
         async function deleteRecording(name, source = 'local') {
             if (!confirm('Delete ' + name + '?')) return;
             const query = source === 'camera' ? '?source=camera' : '';
-            const res = await fetch('/api/recordings/' + encodeURIComponent(name) + query, { method: 'DELETE' });
-            const data = await res.json();
-            if (data.status === 'ok') {
+            const data = await api('recordings/' + encodeURIComponent(name) + query, 'DELETE');
+            if (data && data.status === 'ok') {
                 log('Deleted ' + name, 'success');
                 loadRecordings();
             } else {

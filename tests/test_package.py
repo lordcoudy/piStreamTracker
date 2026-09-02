@@ -22,6 +22,13 @@ class PackageLayoutTests(unittest.TestCase):
         js = (self.pkg / 'static' / 'app.js').read_text()
         self.assertIn('function toggleOverlay', js)
 
+    def test_api_helper_parses_json_defensively(self):
+        js = (self.pkg / 'static' / 'app.js').read_text()
+        self.assertIn('JSON.parse', js)
+        self.assertIn('Invalid JSON', js)
+        self.assertIn("typeof res.running !== 'boolean'", js)
+        self.assertIn("typeof res.fps !== 'number'", js)
+
     def test_project_root_finds_config(self):
         from pistream.config import project_root
         root = project_root()

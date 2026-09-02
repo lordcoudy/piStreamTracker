@@ -100,3 +100,30 @@ class CameraServerTests(unittest.TestCase):
 
         self.assertTrue(recorder.recording)
         self.assertIsNotNone(recorder.current_file)
+
+    def test_unknown_record_path_returns_json(self):
+        handler = self.handler()
+        handler.path = '/record/not-a-route'
+        handler._authorized = lambda: True
+        handler.do_GET()
+        body = handler.wfile.getvalue()
+        self.assertTrue(body.startswith(b'{'), body)
+        self.assertIn(b'not found', body.lower())
+
+    def test_unknown_record_post_returns_json(self):
+        handler = self.handler()
+        handler.path = '/record/nope'
+        handler._authorized = lambda: True
+        handler.do_POST()
+        body = handler.wfile.getvalue()
+        self.assertTrue(body.startswith(b'{'), body)
+        self.assertIn(b'not found', body.lower())
+
+    def test_unknown_record_delete_returns_json(self):
+        handler = self.handler()
+        handler.path = '/record/nope'
+        handler._authorized = lambda: True
+        handler.do_DELETE()
+        body = handler.wfile.getvalue()
+        self.assertTrue(body.startswith(b'{'), body)
+        self.assertIn(b'not found', body.lower())

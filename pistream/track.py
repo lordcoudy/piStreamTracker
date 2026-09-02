@@ -1,7 +1,6 @@
 """Object tracker, HumanTracker, shift log, CLI."""
 
 import argparse
-import json
 import logging
 import time
 import urllib.request
@@ -15,6 +14,7 @@ import cv2
 import numpy as np
 
 from pistream.camera_auth import auth_headers
+from pistream.jsonutil import load_json_object
 from pistream.capture import VideoCapture
 from pistream.config import apply_cli_overrides, configure_logging, load_config
 from pistream.detect import AsyncDetector, PoseDetector
@@ -439,7 +439,7 @@ class HumanTracker:
                         headers=auth_headers(self._camera_token),
                     )
                     with urllib.request.urlopen(req, timeout=5) as resp:
-                        info = json.loads(resp.read())
+                        info = load_json_object(resp.read())
                     if not info.get('recording'):
                         raise RuntimeError("camera did not confirm recording")
                     self._recording_backend = 'camera'
@@ -454,7 +454,7 @@ class HumanTracker:
                             headers=auth_headers(self._camera_token),
                         )
                         with urllib.request.urlopen(req, timeout=3) as resp:
-                            status = json.loads(resp.read())
+                            status = load_json_object(resp.read())
                         if status.get('recording'):
                             self._recording_backend = 'camera'
                             self.recording = True

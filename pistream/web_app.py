@@ -4,6 +4,7 @@ Web Interface for piStreamTracker
 Simple Flask-based control panel for the tracking system
 """
 
+import json
 import logging
 import math
 import time
@@ -26,6 +27,7 @@ from flask import (
     send_from_directory,
     stream_with_context,
 )
+from werkzeug.exceptions import HTTPException
 
 from pistream.config import apply_cli_overrides, configure_logging, load_config, web_bind_host
 from pistream.lifecycle import TrackerLifecycle
@@ -74,9 +76,17 @@ def _clear_latest_frame() -> None:
         _latest_seq += 1
 
 
-def _json_object() -> Optional[dict]:
-    data = request.get_json(silent=True)
-    return data if isinstance(data, dict) else None
+def _json_object() -> tuple[Optional[dict], Optional[str]]:
+    raw = request.get_data(cache=True)
+    if not raw:
+        return None, 'Expected a JSON object'
+    try:
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, 'Invalid JSON'
+    if not isinstance(data, dict):
+        return None, 'Expected a JSON object'
+    return data, None
 
 
 def _finite(value, name: str) -> float:
@@ -130,6 +140,21 @@ def add_security_headers(response):
     response.headers.setdefault('X-Frame-Options', 'DENY')
     response.headers.setdefault('Referrer-Policy', 'no-referrer')
     return response
+
+
+@app.errorhandler(HTTPException)
+def api_http_error(exc: HTTPException):
+    if has_request_context() and request.path.startswith('/api/'):
+        return _error(exc.name, int(exc.code or 500))
+    return exc
+
+
+@app.errorhandler(Exception)
+def api_unhandled_error(exc: Exception):
+    if has_request_context() and request.path.startswith('/api/'):
+        logger.exception('Unhandled API error')
+        return _error('Internal server error', 500)
+    raise exc
 
 
 
@@ -249,26 +274,27 @@ def api_status():
     trk = _tracker()
     if trk:
         detection = trk.current_detection if trk.running else None
+        bbox = detection.get('bbox') if detection else None
         shift_x = shift_y = None
-        if detection:
-            x, y, w, h = detection['bbox']
-            cx = trk.capture.width // 2 if trk.capture else 640
-            cy = trk.capture.height // 2 if trk.capture else 480
-            shift_x = x + w // 2 - cx
-            shift_y = y + h // 4 - cy
+        if bbox is not None and len(bbox) == 4:
+            x, y, w, h = (int(v) for v in bbox)
+            cx = int(trk.capture.width // 2) if trk.capture else 640
+            cy = int(trk.capture.height // 2) if trk.capture else 480
+            shift_x = int(x + w // 2 - cx)
+            shift_y = int(y + h // 4 - cy)
 
         stream_lost = bool(trk.capture and trk.capture.stream_lost)
         return jsonify({
-            'running': trk.running,
-            'recording': trk.recording,
-            'ev3_connected': trk.motors.connected,
-            'fps': trk.fps,
+            'running': bool(trk.running),
+            'recording': bool(trk.recording),
+            'ev3_connected': bool(trk.motors.connected),
+            'fps': float(trk.fps),
             'detected': detection is not None,
             'shift_x': shift_x,
             'shift_y': shift_y,
-            'zoom': trk.zoom_level,
-            'horizon': trk.horizon_correction,
-            'overlay': _overlay_enabled,
+            'zoom': float(trk.zoom_level),
+            'horizon': bool(trk.horizon_correction),
+            'overlay': bool(_overlay_enabled),
             'stream_lost': stream_lost,
         })
 
@@ -276,13 +302,13 @@ def api_status():
         'running': False,
         'recording': False,
         'ev3_connected': False,
-        'fps': 0,
+        'fps': 0.0,
         'detected': False,
         'shift_x': None,
         'shift_y': None,
         'zoom': 1.0,
         'horizon': False,
-        'overlay': _overlay_enabled,
+        'overlay': bool(_overlay_enabled),
         'stream_lost': False,
     })
 
@@ -364,8 +390,10 @@ def api_ev3():
     """Toggle EV3 connection."""
     trk = _active_tracker()
     if trk:
-        data = _json_object()
-        if data is None or not isinstance(data.get('enabled'), bool):
+        data, err = _json_object()
+        if err:
+            return _error(err)
+        if not isinstance(data.get('enabled'), bool):
             return _error('enabled must be a boolean')
         if data.get('enabled', False):
             if not trk.motors.connect():
@@ -381,9 +409,9 @@ def api_settings():
     """Update settings. Overlay can change before tracking starts."""
     global _overlay_enabled
 
-    data = _json_object()
-    if data is None:
-        return _error('Expected a JSON object')
+    data, err = _json_object()
+    if err:
+        return _error(err)
     allowed = {'overlay', 'ev3_speed', 'ev3_deadzone', 'confidence', 'interval', 'horizon'}
     unknown = set(data) - allowed
     if unknown:
@@ -446,9 +474,9 @@ def api_motor_move():
     if not trk.motors.connected:
         return _error('EV3 not connected', 409)
 
-    data = _json_object()
-    if data is None:
-        return _error('Expected a JSON object')
+    data, err = _json_object()
+    if err:
+        return _error(err)
     direction = data.get('direction')
     if direction not in {'left', 'right', 'up', 'down'}:
         return _error('direction must be left, right, up, or down')
@@ -478,9 +506,9 @@ def api_zoom():
     if not trk:
         return _error('Tracker not running', 409)
 
-    data = _json_object()
-    if data is None:
-        return _error('Expected a JSON object')
+    data, err = _json_object()
+    if err:
+        return _error(err)
     action = data.get('action', '')
     level = data.get('level')
 
