@@ -4,10 +4,16 @@ import unittest
 
 from pistream.install import (
     InstallError,
+    detect_network_backend,
     detect_pi_model,
     network_target,
     parse_args,
+    parse_nmcli_connections,
+    plan_networkd_actions,
+    plan_nm_actions,
+    render_networkd_file,
     resolve_role,
+    ssh_on_interface,
 )
 
 
@@ -100,3 +106,97 @@ class ParseArgsTests(unittest.TestCase):
     def test_missing_command_exits(self):
         with self.assertRaises(SystemExit):
             parse_args([])
+
+
+class NmcliParseTests(unittest.TestCase):
+    def test_splits_name_device_type(self):
+        text = (
+            'Wired connection 1:eth0:802-3-ethernet\n'
+            'Wi-Fi:wlan0:802-11-wireless\n'
+        )
+        rows = parse_nmcli_connections(text)
+        self.assertEqual(
+            rows,
+            [
+                ('Wired connection 1', 'eth0', '802-3-ethernet'),
+                ('Wi-Fi', 'wlan0', '802-11-wireless'),
+            ],
+        )
+
+
+class PlanNmActionsTests(unittest.TestCase):
+    def test_modifies_existing_ethernet_never_default(self):
+        actions = plan_nm_actions(
+            'eth0',
+            '192.168.100.1',
+            24,
+            [
+                ('Wired connection 1', 'eth0', '802-3-ethernet'),
+                ('Wi-Fi', 'wlan0', '802-11-wireless'),
+            ],
+        )
+        joined = [' '.join(a.argv) for a in actions]
+        self.assertTrue(any('connection modify' in j and 'Wired connection 1' in j for j in joined))
+        self.assertTrue(any('ipv4.never-default yes' in j for j in joined))
+        self.assertTrue(any('192.168.100.1/24' in j for j in joined))
+        self.assertTrue(any('connection up' in j and 'Wired connection 1' in j for j in joined))
+        self.assertFalse(any('Wi-Fi' in j for j in joined))
+
+    def test_adds_profile_when_no_ethernet(self):
+        actions = plan_nm_actions('eth0', '192.168.100.2', 24, [
+            ('Wi-Fi', 'wlan0', '802-11-wireless'),
+        ])
+        joined = [' '.join(a.argv) for a in actions]
+        self.assertTrue(any('connection add' in j and 'pistream-eth' in j for j in joined))
+        self.assertTrue(any('ifname eth0' in j for j in joined))
+        self.assertTrue(any('connection up' in j and 'pistream-eth' in j for j in joined))
+
+
+class NetworkdTests(unittest.TestCase):
+    def test_unit_file_contents(self):
+        body = render_networkd_file('eth0', '192.168.100.2', 24)
+        self.assertIn('Name=eth0', body)
+        self.assertIn('Address=192.168.100.2/24', body)
+
+    def test_plan_writes_and_restarts(self):
+        actions = plan_networkd_actions('eth0', '192.168.100.2', 24)
+        writes = [a for a in actions if getattr(a, 'path', None)]
+        runs = [a for a in actions if getattr(a, 'argv', None)]
+        self.assertEqual(writes[0].path, '/etc/systemd/network/10-pistream.network')
+        self.assertIn('systemctl', runs[0].argv)
+        self.assertIn('restart', runs[0].argv)
+        self.assertIn('systemd-networkd', runs[0].argv)
+
+
+class BackendTests(unittest.TestCase):
+    def test_prefers_networkmanager(self):
+        self.assertEqual(
+            detect_network_backend(lambda n: n == 'NetworkManager'),
+            'networkmanager',
+        )
+
+    def test_falls_back_to_networkd(self):
+        self.assertEqual(
+            detect_network_backend(lambda n: n == 'systemd-networkd'),
+            'networkd',
+        )
+
+    def test_neither_raises(self):
+        with self.assertRaises(InstallError):
+            detect_network_backend(lambda n: False)
+
+
+class SshGuardTests(unittest.TestCase):
+    def test_server_ip_on_iface(self):
+        self.assertTrue(
+            ssh_on_interface('10.0.0.8 12345 192.168.100.1 22', {'192.168.100.1'})
+        )
+
+    def test_unrelated_ssh(self):
+        self.assertFalse(
+            ssh_on_interface('10.0.0.8 12345 192.168.1.20 22', {'192.168.100.1'})
+        )
+
+    def test_missing_env(self):
+        self.assertFalse(ssh_on_interface(None, {'192.168.100.1'}))
+
