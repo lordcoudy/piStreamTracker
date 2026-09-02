@@ -541,7 +541,44 @@ def cmd_install(
     return 0
 
 
-def cmd_status(args: argparse.Namespace, **_kwargs: Any) -> int:
+def cmd_status(
+    args: argparse.Namespace,
+    *,
+    stdout: TextIO | None = None,
+    work_dir: Path | None = None,
+    model_text: str | None = None,
+    udev_path: str = '/etc/udev/rules.d/99-ev3.rules',
+    service_active: Callable[[], bool] | None = None,
+    **_kwargs: Any,
+) -> int:
+    if stdout is None:
+        stdout = sys.stdout
+    from pistream.config import project_root
+    root = Path(work_dir) if work_dir is not None else project_root()
+    config = _load_config(args.config)
+    net = config.get('network') or {}
+    model = model_text if model_text is not None else read_pi_model()
+    model_id = detect_pi_model(model)
+    print(f'Pi model: {model or "n/a"} ({model_id})', file=stdout)
+    try:
+        print(f'Auto role: {resolve_role("auto", model_id)}', file=stdout)
+    except InstallError:
+        print('Auto role: n/a (pass --role camera or --role tracker)', file=stdout)
+    print(f'camera_ip: {net.get("camera_ip")}', file=stdout)
+    print(f'tracker_ip: {net.get("tracker_ip")}', file=stdout)
+    print(f'interface: {net.get("interface", "eth0")}', file=stdout)
+    print(f'subnet: {net.get("subnet", 24)}', file=stdout)
+    print(f'python: {resolve_python(root)}', file=stdout)
+    udev = Path(udev_path)
+    print(f'udev: {"present" if udev.is_file() else "missing"} ({udev})', file=stdout)
+    try:
+        if service_active is not None:
+            active = service_active()
+        else:
+            active = _systemctl_is_active('pitracker')
+        print(f'pitracker.service: {"active" if active else "inactive"}', file=stdout)
+    except OSError:
+        print('pitracker.service: n/a', file=stdout)
     return 0
 
 

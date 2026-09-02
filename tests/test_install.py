@@ -9,6 +9,7 @@ from pistream.install import (
     RunAction,
     WriteAction,
     cmd_network,
+    cmd_status,
     detect_network_backend,
     detect_pi_model,
     execute_actions,
@@ -330,6 +331,29 @@ class CmdNetworkTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIn('192.168.100.1/24', out.getvalue())
         self.assertIn('never-default', out.getvalue())
+
+
+class StatusTests(unittest.TestCase):
+    def test_status_mentions_ips(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config_path = tmp_path / 'config.yaml'
+            config_path.write_text(
+                'network:\n'
+                '  camera_ip: "192.168.100.1"\n'
+                '  tracker_ip: "192.168.100.2"\n'
+                '  interface: eth0\n'
+                '  subnet: "24"\n'
+            )
+            out = StringIO()
+            args = parse_args(['--config', str(config_path), 'status'])
+            rc = cmd_status(args, stdout=out, work_dir=tmp_path)
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn('192.168.100.1', text)
+            self.assertIn('192.168.100.2', text)
+
 
 
 

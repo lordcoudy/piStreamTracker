@@ -124,6 +124,28 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(config['camera']['token'], 'env-secret')
 
 
+class NetworkFieldTests(unittest.TestCase):
+    def test_rejects_interface_with_spaces(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text(
+                'network:\n  camera_ip: "192.168.100.1"\n'
+                '  tracker_ip: "192.168.100.2"\n  interface: "eth 0"\n'
+            )
+            with self.assertRaisesRegex(ValueError, 'interface'):
+                load_config(str(path))
+
+    def test_subnet_string_coerced(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text(
+                'network:\n  camera_ip: "192.168.100.1"\n'
+                '  tracker_ip: "192.168.100.2"\n  subnet: "24"\n'
+            )
+            cfg = load_config(str(path))
+            self.assertEqual(cfg['network']['subnet'], 24)
+
+
 class WebBindHostTests(unittest.TestCase):
     def test_falls_back_to_tracker_ip(self):
         self.assertEqual(web_bind_host(_base()), '192.168.100.2')

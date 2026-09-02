@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,12 @@ def project_root() -> Path:
 
 def default_config() -> dict:
     return {
-        'network': {'camera_ip': '192.168.100.1', 'tracker_ip': '192.168.100.2'},
+        'network': {
+            'camera_ip': '192.168.100.1',
+            'tracker_ip': '192.168.100.2',
+            'interface': 'eth0',
+            'subnet': '24',
+        },
         'camera': {
             'host': None,
             'port': 8000,
@@ -249,6 +255,22 @@ def validate_config(config: dict) -> dict:
         value = network.get(key)
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f'network.{key} must be a non-empty string')
+    iface = network.get('interface', 'eth0')
+    if (
+        not isinstance(iface, str)
+        or not iface.strip()
+        or not re.fullmatch(r'[A-Za-z0-9._-]+', iface.strip())
+    ):
+        raise ValueError('network.interface must be a non-empty interface name')
+    network['interface'] = iface.strip()
+    raw_subnet = network.get('subnet', 24)
+    try:
+        prefix = int(str(raw_subnet).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError('network.subnet must be an integer prefix length') from exc
+    if not 1 <= prefix <= 32:
+        raise ValueError('network.subnet must be between 1 and 32')
+    network['subnet'] = prefix
     level = log_config.get('level')
     if not isinstance(level, str) or level.upper() not in {
         'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
