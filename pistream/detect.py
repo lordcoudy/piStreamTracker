@@ -49,15 +49,25 @@ class PoseDetector:
     def _init_model(self, model_path: Optional[str]):
         """Initialize TFLite interpreter."""
         try:
-            path = self._get_model(model_path)
-            if not path:
-                return
-
             # Try tflite-runtime first (faster on Pi)
             try:
                 from tflite_runtime.interpreter import Interpreter
             except ImportError:
-                from tensorflow.lite.python.interpreter import Interpreter
+                try:
+                    from ai_edge_litert.interpreter import Interpreter
+                except ImportError:
+                    try:
+                        from tensorflow.lite.python.interpreter import Interpreter
+                    except ImportError as exc:
+                        raise ImportError(
+                            'No TensorFlow Lite interpreter is installed. On a desktop, run '
+                            'pip install -e ".[desktop]"; on Raspberry Pi, install '
+                            'tflite-runtime in the tracker environment.'
+                        ) from exc
+
+            path = self._get_model(model_path)
+            if not path:
+                return
 
             try:
                 self._interpreter = Interpreter(model_path=path, num_threads=self.threads)

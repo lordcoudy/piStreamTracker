@@ -22,5 +22,4 @@ tflite-runtime; platform_machine == "aarch64" or platform_machine == "armv7l"
 # Web Interface
 flask>=2.0.0
 
-# Optional: Full TensorFlow for development on x86
-# tensorflow>=2.10.0; platform_machine == "x86_64"
+# Desktop inference runtime: pip install -e ".[desktop]"

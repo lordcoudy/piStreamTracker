@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: pip install pytest ruff pyyaml flask opencv-contrib-python "numpy<2"
+        run: pip install -e ".[dev,desktop]"
       - name: Ruff
         run: ruff check pistream tests tracker.py web.py camera.py
       - name: Tests
