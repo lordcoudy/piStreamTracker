@@ -35,6 +35,8 @@ def estimate_roll_deg(
         dy = float(ry - ly)
         if abs(dx) <= _MIN_DX:
             continue
+        if dx < 0:
+            dx, dy = -dx, -dy
         angles.append(math.degrees(math.atan2(dy, dx)))
 
     if not angles:
@@ -80,7 +82,7 @@ def level_affine(
 ) -> np.ndarray:
     cx, cy = width / 2.0, height / 2.0
     scale = fill_crop_scale(angle_deg, width, height) if fill_crop else 1.0
-    return cv2.getRotationMatrix2D((cx, cy), -angle_deg, scale)
+    return cv2.getRotationMatrix2D((cx, cy), angle_deg, scale)
 
 
 def transform_points(points_xy: np.ndarray, M: np.ndarray) -> np.ndarray:
