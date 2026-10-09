@@ -79,6 +79,11 @@ class _RecordingThread:
         self._frame: Optional[np.ndarray] = None
         self._lock = Lock()
         self._stop = Event()
+        self.finished = Event()
+        self.closed = Event()
+        self._error: Optional[str] = None
+        self._error_lock = Lock()
+        self._close_lock = Lock()
         self._thread: Optional[Thread] = None
         self._proc: Optional[subprocess.Popen] = None
         self._cv_writer: Optional[cv2.VideoWriter] = None
@@ -145,6 +150,7 @@ class _RecordingThread:
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            bufsize=0,
         )
         # Drain stderr in a background thread to prevent pipe-buffer
         # deadlock — ffmpeg writes progress/stats continuously and if
@@ -172,38 +178,86 @@ class _RecordingThread:
         self._thread.start()
 
     def stop(self):
-        """Stop the recording thread and flush/close the writer."""
-        self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=max(self._interval * 4, 2.0))
+        """Close resources with bounded waits; retain ownership if still live."""
+        with self._close_lock:
+            if self.closed.is_set():
+                return True
+            self._stop.set()
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=2.0)
+            if self._thread and self._thread.is_alive():
+                self._fail('Recording writer did not stop in time')
+                if self._proc is None or not self._kill_encoder():
+                    return False
+                self._thread.join(timeout=2.0)
+                if self._thread.is_alive():
+                    return False
+            self.finished.set()
 
-        if self._proc and self._proc.stdin:
-            try:
-                self._proc.stdin.close()
-                self._proc.wait(timeout=10)
-            except Exception as e:
-                logger.debug(f"ffmpeg close: {e}")
-                self._proc.kill()
+            if self._proc:
                 try:
-                    self._proc.wait(timeout=2)
+                    if self._proc.stdin:
+                        self._proc.stdin.close()
+                    self._proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    logger.warning("ffmpeg did not exit after being killed")
+                    self._fail('ffmpeg did not finish recording in time')
+                    if not self._kill_encoder():
+                        return False
+                except (OSError, ValueError) as exc:
+                    self._fail(f'Could not close ffmpeg recording: {exc}')
+                    if not self._kill_encoder():
+                        return False
+                    return False
+                if self._proc.returncode:
+                    self._fail(self._encoder_error(self._proc.returncode))
 
-        if self._stderr_thread and self._stderr_thread.is_alive():
-            self._stderr_thread.join(timeout=2.0)
-
-        # Log ffmpeg exit status
-        if self._proc and self._proc.returncode and self._proc.returncode != 0:
-            tail = self._stderr_lines[-20:]
-            logger.warning(
-                f"ffmpeg exited with code {self._proc.returncode}:\n"
-                + "\n".join(tail)
-            )
-
-        if self._cv_writer:
-            self._cv_writer.release()
+            if self._stderr_thread and self._stderr_thread.is_alive():
+                self._stderr_thread.join(timeout=2.0)
+                if self._stderr_thread.is_alive():
+                    self._fail('ffmpeg stderr reader did not stop in time')
+                    return False
+            if self._proc and self._proc.stderr:
+                self._proc.stderr.close()
+            if self._cv_writer:
+                try:
+                    self._cv_writer.release()
+                except Exception as exc:
+                    self._fail(f'Could not close recording output: {exc}')
+                    return False
+                self._cv_writer = None
+            self.closed.set()
+            return True
 
     # ---- internal ----------------------------------------------------
+
+    def _fail(self, message: str) -> None:
+        with self._error_lock:
+            if self._error is None:
+                self._error = message
+                logger.warning(message)
+        self._stop.set()
+
+    def _encoder_error(self, code: int) -> str:
+        tail = '\n'.join(self._stderr_lines[-10:])
+        return f'ffmpeg exited with code {code}' + (f':\n{tail}' if tail else '')
+
+    def _encoder_alive(self) -> bool:
+        if self._proc is not None:
+            code = self._proc.poll()
+            if code is not None:
+                self._fail(self._encoder_error(code))
+                return False
+        return True
+
+    def _kill_encoder(self) -> bool:
+        try:
+            if self._proc.poll() is None:
+                self._proc.kill()
+            self._proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._fail(f'ffmpeg did not exit after being killed: {exc}')
+            return False
+        return True
 
     def _drain_stderr(self):
         """Read ffmpeg stderr continuously to prevent pipe-buffer deadlock."""
@@ -219,49 +273,57 @@ class _RecordingThread:
     def _write(self, frame: np.ndarray):
         """Write one frame to whichever backend is active."""
         if self._proc and self._proc.stdin:
-            # Detect ffmpeg death early before attempting write
-            if self._proc.poll() is not None:
-                tail = self._stderr_lines[-10:]
-                logger.warning(
-                    f"ffmpeg died (exit {self._proc.returncode}) — stopping recording\n"
-                    + "\n".join(tail)
-                )
-                self._stop.set()
+            if not self._encoder_alive():
                 return
             try:
-                self._proc.stdin.write(frame.tobytes())
-            except (BrokenPipeError, OSError, ValueError):
-                tail = self._stderr_lines[-10:]
-                logger.warning(
-                    "ffmpeg pipe broken — stopping recording\n"
-                    + "\n".join(tail)
-                )
-                self._stop.set()
+                remaining = memoryview(frame.tobytes())
+                while remaining:
+                    written = self._proc.stdin.write(remaining)
+                    if not written:
+                        raise OSError('ffmpeg pipe did not accept frame bytes')
+                    remaining = remaining[written:]
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                self._fail(f'ffmpeg input failed: {exc}')
         elif self._cv_writer:
             self._cv_writer.write(frame)
 
     def _run(self):
-        next_tick = time.monotonic()
-        while not self._stop.is_set():
-            now = time.monotonic()
-            sleep_for = next_tick - now
-            if sleep_for > 0 and self._stop.wait(sleep_for):
-                break
-            if self._stop.is_set():
-                break
+        try:
+            next_tick = time.monotonic()
+            while not self._stop.is_set():
+                now = time.monotonic()
+                sleep_for = next_tick - now
+                if sleep_for > 0 and self._stop.wait(sleep_for):
+                    break
+                if self._stop.is_set() or not self._encoder_alive():
+                    break
 
-            # Skip missed ticks instead of burst-writing duplicate frames
-            # after a stall in ffmpeg or the scheduler.
-            now = time.monotonic()
-            next_tick = max(next_tick + self._interval, now + self._interval)
+                # Skip missed ticks instead of burst-writing duplicate frames.
+                now = time.monotonic()
+                next_tick = max(next_tick + self._interval, now + self._interval)
 
-            with self._lock:
-                frame = self._frame
-            if frame is not None:
-                self._write(frame)
+                with self._lock:
+                    frame = self._frame
+                if frame is not None:
+                    self._write(frame)
+        except Exception as exc:
+            self._fail(f'Recording writer failed: {exc}')
+        finally:
+            self.finished.set()
+
+    @property
+    def error(self) -> Optional[str]:
+        with self._error_lock:
+            return self._error
 
     @property
     def ready(self) -> bool:
+        if self.error is not None or self.finished.is_set() or self.closed.is_set():
+            return False
         if self._proc is not None:
-            return self._proc.poll() is None and self._proc.stdin is not None
+            return (
+                self._proc.poll() is None
+                and self._proc.stdin is not None
+                and not self._proc.stdin.closed
+            )
         return self._cv_writer is not None and self._cv_writer.isOpened()
