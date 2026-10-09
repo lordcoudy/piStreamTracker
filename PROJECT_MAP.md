@@ -210,7 +210,7 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 | Mocked browser recovery and mobile layout | [browser_ui.cjs](tests/browser_ui.cjs), [web_ui_fixture.py](tests/web_ui_fixture.py) |
 
 Baseline on 2026-10-09: 172 tests passed; Ruff passed on Python 3.12.12.
-After these fixes, a fresh Python 3.12 desktop environment passed 228 tests and
+After these fixes, a fresh Python 3.12 desktop environment passed 231 tests and
 25 subtests; Ruff and Chromium checks at 390/900/1200px also passed.
 [CI](.github/workflows/ci.yml) runs Ubuntu with Python 3.11/3.12, installing
 the declared `.[dev,desktop]` dependencies.

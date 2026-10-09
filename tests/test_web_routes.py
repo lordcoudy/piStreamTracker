@@ -3,6 +3,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, RLock, Thread
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.parse import quote
@@ -198,6 +199,125 @@ class WebShutdownRouteTests(unittest.TestCase):
         )
         values.update(changes)
         return SimpleNamespace(**values)
+
+    def assert_cleanup_response_does_not_wait_for_writer(self, endpoint, expected_status,
+                                                       status_poll=False):
+        from pistream import web_app
+        from pistream.lifecycle import TrackerLifecycle
+        from pistream.record import _RecordingThread
+        from pistream.track import HumanTracker
+
+        closing = Event()
+        finish_close = Event()
+        loop_started = Event()
+
+        class GatedVideoWriter:
+            failed_once = False
+
+            def isOpened(self):
+                return True
+
+            def release(self):
+                closing.set()
+                finish_close.wait(3)
+                if not self.failed_once:
+                    self.failed_once = True
+                    raise OSError('Encoder failed while finalizing the file')
+
+        with patch('pistream.record.cv2.VideoWriter', return_value=GatedVideoWriter()):
+            recorder = _RecordingThread('lecture.mp4', 64, 48, 30, encoder='mjpg')
+        tracker = HumanTracker.__new__(HumanTracker)
+        tracker._record_lock = RLock()
+        tracker._recording = True
+        tracker._recording_backend = 'local'
+        tracker._rec_thread = recorder
+        tracker._recording_error = None
+        tracker.remote_stop_pending = False
+        tracker._cleaned = False
+        tracker._async_detector = None
+        tracker._shift_logger = None
+        tracker.motors = Mock()
+        tracker.capture = SimpleNamespace(stop=Mock())
+        tracker.running = False
+        tracker.current_detection = None
+        tracker._fps = 0.0
+        tracker.zoom_level = 1.0
+        tracker.horizon_correction = False
+        tracker.connect = Mock(return_value=True)
+
+        def loop(trk):
+            loop_started.set()
+            while trk.running:
+                finish_close.wait(0.001)
+
+        lifecycle = TrackerLifecycle(lambda: tracker, loop, join_timeout=0.01)
+        completed = Event()
+        responses = []
+
+        def request(path, signal=None):
+            response = web_app.app.test_client().post(path)
+            responses.append((path, response.status_code))
+            if signal:
+                signal.set()
+
+        with patch.object(web_app, '_lifecycle', lifecycle):
+            self.assertEqual(lifecycle.start()['status'], 'ok')
+            self.assertTrue(loop_started.wait(1))
+            stop_request = Thread(
+                target=request, args=('/api/stop', completed if endpoint == 'stop' else None)
+            )
+            start_request = None
+            poll_request = None
+            getter_patch = None
+            stop_request.start()
+            try:
+                self.assertTrue(closing.wait(1))
+                if status_poll:
+                    reading_error = Event()
+                    read_error = HumanTracker.recording_error.fget
+
+                    def recording_error(trk):
+                        reading_error.set()
+                        return read_error(trk)
+
+                    getter_patch = patch.object(
+                        HumanTracker, 'recording_error', property(recording_error)
+                    )
+                    getter_patch.start()
+                    poll_request = Thread(
+                        target=lambda: web_app.app.test_client().get('/api/status')
+                    )
+                    poll_request.start()
+                    self.assertTrue(reading_error.wait(1))
+                if endpoint == 'start':
+                    start_request = Thread(target=request, args=('/api/start', completed))
+                    start_request.start()
+                self.assertTrue(completed.wait(0.5), 'HTTP control waited for encoder finalization')
+                self.assertIn(('/api/' + endpoint, expected_status), responses)
+            finally:
+                finish_close.set()
+                stop_request.join(2)
+                if start_request:
+                    start_request.join(2)
+                if poll_request:
+                    poll_request.join(2)
+                if getter_patch:
+                    getter_patch.stop()
+                if lifecycle.thread:
+                    lifecycle.thread.join(2)
+                response = web_app.app.test_client().post('/api/stop')
+                self.assertEqual(response.status_code, 200)
+                self.assertIsNone(lifecycle.tracker)
+                self.assertIn('finalizing', web_app._last_recording_error)
+
+    def test_stopping_response_returns_before_local_writer_closes(self):
+        self.assert_cleanup_response_does_not_wait_for_writer('stop', 202)
+
+    def test_start_conflict_returns_before_local_writer_closes(self):
+        self.assert_cleanup_response_does_not_wait_for_writer('start', 409)
+
+    def test_start_conflict_returns_while_status_poll_waits_for_writer(self):
+        self.assert_cleanup_response_does_not_wait_for_writer('start', 409, status_poll=True)
 
     def test_status_preserves_pending_camera_stop_without_retrying_it(self):
         from pistream import web_app

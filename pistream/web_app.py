@@ -76,8 +76,12 @@ def _remember_recording_error(trk: Optional[HumanTracker], revision: Optional[in
     global _last_recording_error
     with _recording_error_lock:
         current = trk is _tracker() if revision is None else revision == _recording_error_revision
-        error = getattr(trk, 'recording_error', None) if trk and current else None
-        if error:
+        expected_revision = _recording_error_revision if revision is None else revision
+    # A writer may hold its own lock throughout finalization; control routes must
+    # remain able to read the cache revision while status waits for that writer.
+    error = getattr(trk, 'recording_error', None) if trk and current else None
+    with _recording_error_lock:
+        if error and expected_revision == _recording_error_revision:
             _last_recording_error = error
         return _last_recording_error
 
@@ -369,9 +373,13 @@ def api_start():
     if _lifecycle is None:
         return jsonify({'status': 'error', 'message': 'Web app not initialized'}), 500
     try:
-        _remember_recording_error(_tracker())
+        trk = _tracker()
+        with _recording_error_lock:
+            error_revision = _recording_error_revision
         _clear_latest_frame()
         result = _lifecycle.start()
+        if result['status'] not in {'stopping', 'recording_stop_pending', 'already_running'}:
+            _remember_recording_error(trk, error_revision)
         if result['status'] in {'recording_stop_pending', 'stopping'}:
             return jsonify(result), 409
         if result['status'] == 'error':
@@ -391,8 +399,10 @@ def api_stop():
     with _recording_error_lock:
         error_revision = _recording_error_revision
     result = _lifecycle.stop()
-    # Cleanup can discover an encoder failure just before lifecycle drops the owner.
-    _remember_recording_error(trk, error_revision)
+    if result['status'] != 'stopping':
+        # Live cleanup retains its owner; reading its error would wait on the writer lock.
+        # Capture final errors only when this request can release the owner.
+        _remember_recording_error(trk, error_revision)
     _clear_latest_frame()
     status = {'stopping': 202, 'recording_stop_pending': 503}.get(result['status'], 200)
     return jsonify(result), status
