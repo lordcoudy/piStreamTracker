@@ -65,6 +65,10 @@ so SSH/internet on wlan0 keep the default route.
 ./setup.sh network --role camera
 ```
 
+For a custom configuration, pass `--config "/absolute/path/site config.yaml"` to
+the installer. Generated services pass that resolved path to either `camera.py`
+or `web.py`; relative output directories still use the checkout as their base.
+
 Re-apply ethernet later without wrapping the whole script in sudo:
 
 ```bash
@@ -101,11 +105,17 @@ Tracker Pi:
 Laptop (no Pi / no EV3):
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev,desktop]"
 .venv/bin/python scripts/fake_mjpeg.py          # :8000
 .venv/bin/python web.py --host 127.0.0.1 --port 5000 --no-ev3 \
   --url http://127.0.0.1:8000/stream
 ```
+
+The `desktop` extra installs LiteRT 2.3 on supported desktops, or TensorFlow 2.16
+on Intel macOS. The detector tries TFLite Runtime, LiteRT, then TensorFlow. Pi
+installation keeps the existing TFLite Runtime dependency. MoveNet downloads on
+first use; the synthetic stream exercises controls and transport, not pose quality.
 
 ## Web UI
 
@@ -122,6 +132,17 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 | Recordings | Lists, downloads, and deletes `.mp4` / `.avi` / stills from both Pis. Active recordings cannot be deleted. |
 
 The tracking status dot turns yellow while the stream is reconnecting (`stream_lost`).
+
+Stop immediately releases tracking resources and makes one camera-stop request.
+If the camera does not return JSON `recording: false`, the UI keeps a warning and
+shows **Retry camera stop**. Start stays disabled until confirmation; each click
+retries once, and status polling never retries. A failed **Stop Rec** while tracking
+continues can also be retried with **Stop Rec**. Keep the web process running to
+retain this recovery state; it is held in memory.
+
+Local encoder failures clear the recording indicator and remain visible until a
+new recording starts successfully. Files stay protected from deletion until the
+writer closes, including while tracking is stopping.
 
 By default the UI and camera server bind to `tracker_ip` / `camera_ip`. Set `host: "0.0.0.0"` only if you need another NIC; anyone who can reach the port can move motors and delete recordings.
 The web server rejects cross-origin browser control requests and sends clickjacking/MIME-sniffing
@@ -190,6 +211,8 @@ Tracker-only: `--no-display`, `--auto-record`.
 
 Web-only: `--host`, `--port`.
 
+Camera: `--config` (loaded before recording directories and server settings are created).
+
 ### OpenCV window keys
 
 | Key | Action |
@@ -200,16 +223,31 @@ Web-only: `--host`, `--port`.
 | `d` | Reset tracker + home EV3 |
 | `e` | Connect / disconnect EV3 |
 
+Keyboard controls remain available during a stream outage. Screenshots use the
+last displayed frame; before the first frame, the CLI reports that none is available.
+After an unconfirmed camera stop, tracking, capture and motors stop while the
+window stays open for **R** to retry once or **Q** to force quit. Headless terminals
+accept `retry` or `quit`; an unavailable OpenCV window also falls back to terminal
+input. Confirmation exits normally; force quit, terminal EOF,
+or headless operation without a terminal exits nonzero with recovery instructions.
+An underlying tracking error also exits nonzero after recovery.
+
 ## Tests and CI
 
 ```bash
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e ".[dev,desktop]"
 .venv/bin/pytest
 .venv/bin/ruff check pistream tests tracker.py web.py camera.py ev3_usb.py
 ```
 
 No Pi or EV3 required. GitHub Actions runs the same on Python 3.11 and 3.12.
 Raspberry Pi OS Bookworm's system `python3` is 3.11.
+
+Optional browser checks use an existing Node/Playwright installation: run
+`.venv/bin/python tests/web_ui_fixture.py` and, in another terminal,
+`node tests/browser_ui.cjs`. `PLAYWRIGHT_MODULE` and `PLAYWRIGHT_EXECUTABLE` can
+select an existing installation and Chromium executable. The fixture uses mocked
+hardware and checks manual retry, warnings, controls and responsive layout.
 
 ## Troubleshooting
 
@@ -222,6 +260,8 @@ Raspberry Pi OS Bookworm's system `python3` is 3.11.
 | EV3 not found | USB cable, `ev3-dc` installed, udev rule; re-plug the brick / re-login after `plugdev` |
 | EV3 permission denied | `setup.sh` udev (`idVendor=0694`); user in `plugdev` |
 | Camera recordings unavailable | Check the camera server and token. The UI still shows local screenshots/fallback recordings and reports that camera files are unavailable. |
+| Camera stop unconfirmed | Restore camera connectivity/token, then explicitly retry Stop in the web UI or R / `retry` in CLI recovery. A forced exit leaves the stop unresolved; confirm manually with `/record/stop`. |
+| Local recording failed | Check encoder logs, storage and ffmpeg availability. The error remains visible until a successful recording restart. |
 | Bind / “address already in use” | Something else on 5000/8000, or `host` is an IP that is not assigned yet. After setup, `pitracker.service` may already own the port: `sudo systemctl status pitracker` |
 | Camera busy / pipeline handler in use | Another process holds libcamera. After `./setup.sh --camera`, that is `pitracker.service` (stream already at `http://192.168.100.1:8000/stream`). `sudo systemctl status pitracker`. To run `./run_cam.sh` yourself: `sudo systemctl stop pitracker` |
 | Network | `ping 192.168.100.1`. `./setup.sh status`. Bookworm/Trixie uses NetworkManager; install `network-manager` or pass `--skip-network`. Remove leftover `/etc/systemd/network/10-eth0.network` from older setup.sh if it fights NM. |
