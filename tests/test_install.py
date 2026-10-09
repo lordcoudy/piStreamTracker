@@ -1,14 +1,18 @@
 """Installer CLI: role, network target, argparse."""
 
+import os
+import shlex
 import unittest
 from io import StringIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from pistream.install import (
     InstallError,
     RunAction,
     WriteAction,
     cmd_network,
+    cmd_service,
     cmd_status,
     detect_network_backend,
     detect_pi_model,
@@ -219,6 +223,38 @@ class SshGuardTests(unittest.TestCase):
 
 
 class UnitFileTests(unittest.TestCase):
+    def test_service_preserves_custom_config_for_both_roles_with_spaces(self):
+        with TemporaryDirectory() as tmp:
+            root = (Path(tmp) / 'repo with spaces').resolve()
+            config_path = Path(tmp) / 'deployment configs' / 'custom camera.yaml'
+            config_path.parent.mkdir()
+            config_path.write_text('camera:\n  port: 8123\n')
+            relative_config = os.path.relpath(config_path)
+            python = str(root / 'venv with spaces' / 'bin' / 'python')
+            for role, script in [('camera', 'camera.py'), ('tracker', 'web.py')]:
+                with self.subTest(role=role):
+                    writes = []
+                    args = parse_args([
+                        '--config', relative_config, 'service', '--role', role, '--no-enable',
+                    ])
+                    rc = cmd_service(
+                        args, platform='linux', work_dir=root, python=python, user='pi',
+                        run=lambda *_args, **_kwargs: None,
+                        write_file=lambda path, content: writes.append((path, content)),
+                        stdout=StringIO(),
+                    )
+                    self.assertEqual(rc, 0)
+                    lines = writes[0][1].splitlines()
+                    command = next(line.removeprefix('ExecStart=') for line in lines
+                                   if line.startswith('ExecStart='))
+                    self.assertTrue(command.startswith(':'))
+                    self.assertEqual(shlex.split(command.removeprefix(':')), [
+                        python, str(root / script), '--config', str(config_path.resolve()),
+                    ])
+                    directory = next(line.removeprefix('WorkingDirectory=') for line in lines
+                                     if line.startswith('WorkingDirectory='))
+                    self.assertEqual(directory, str(root))
+
     def test_camera_unit(self):
         body = render_unit_file(
             description='piStreamTracker Camera Server',
@@ -229,11 +265,23 @@ class UnitFileTests(unittest.TestCase):
         )
         self.assertIn('User=pi', body)
         self.assertIn('WorkingDirectory=/opt/piStreamTracker', body)
-        self.assertIn(
-            'ExecStart=/opt/piStreamTracker/venv/bin/python /opt/piStreamTracker/camera.py',
-            body,
-        )
+        command = next(line.removeprefix('ExecStart=') for line in body.splitlines()
+                       if line.startswith('ExecStart='))
+        self.assertEqual(shlex.split(command.removeprefix(':')), [
+            '/opt/piStreamTracker/venv/bin/python', '/opt/piStreamTracker/camera.py',
+            '--config', '/opt/piStreamTracker/config.yaml',
+        ])
         self.assertIn('After=network-online.target', body)
+
+    def test_unit_paths_escape_systemd_specifiers_and_environment_variables(self):
+        body = render_unit_file(
+            description='Camera', user='pi', work_dir='/repo%name $literal',
+            python='/repo%name $literal/bin/python', script='/repo%name $literal/camera.py',
+            config_path='/configs/a "quoted" \\ path%name ${CONFIG}.yaml',
+        )
+        self.assertIn('WorkingDirectory=/repo%%name $literal\n', body)
+        self.assertIn('ExecStart=:"/repo%%name $literal/bin/python"', body)
+        self.assertIn('"/configs/a \\"quoted\\" \\\\ path%%name ${CONFIG}.yaml"', body)
 
     def test_service_plan_enable(self):
         actions = plan_service_actions(
@@ -359,7 +407,3 @@ class StatusTests(unittest.TestCase):
             text = out.getvalue()
             self.assertIn('192.168.100.1', text)
             self.assertIn('192.168.100.2', text)
-
-
-
-

@@ -4,6 +4,7 @@ Camera Streaming Server for piStreamTracker
 Streams MJPEG video from Raspberry Pi Camera to network
 """
 
+import argparse
 import io
 import json
 import logging
@@ -32,27 +33,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Load configuration
-config = load_config()
-camera_cfg = config.get('camera', {})
-network_cfg = config.get('network', {})
-
-# Settings with defaults
-HOST = camera_bind_host(config)
-PORT = camera_cfg.get('port', 8000)
-WIDTH = camera_cfg.get('resolution', {}).get('width', 1280)
-HEIGHT = camera_cfg.get('resolution', {}).get('height', 960)
-FRAMERATE = camera_cfg.get('framerate', 30)
-JPEG_QUALITY = camera_cfg.get('jpeg_quality', 80)
-CAMERA_IP = network_cfg.get('camera_ip', '192.168.100.1')
-OUTPUT_DIR = Path(camera_cfg.get('recording_dir', 'recordings'))
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-CAMERA_TOKEN = camera_cfg.get('token') or ''
-STREAM_LIMIT = StreamLimiter(max_clients=int(camera_cfg.get('max_stream_clients') or 4))
+# Initialized by main before the camera or HTTP server starts.
+HOST = PORT = WIDTH = HEIGHT = FRAMERATE = JPEG_QUALITY = CAMERA_IP = None
+OUTPUT_DIR = None
+CAMERA_TOKEN = ''
+STREAM_LIMIT = None
+HTML_PAGE = ''
 
 
-# HTML page template
-HTML_PAGE = f"""<!DOCTYPE html>
+def configure_camera(config_path: str) -> None:
+    """Load startup settings before creating their dependent resources."""
+    global HOST, PORT, WIDTH, HEIGHT, FRAMERATE, JPEG_QUALITY, CAMERA_IP
+    global OUTPUT_DIR, CAMERA_TOKEN, STREAM_LIMIT, HTML_PAGE
+    config = load_config(config_path)
+    camera_cfg = config['camera']
+    HOST = camera_bind_host(config)
+    PORT = camera_cfg['port']
+    WIDTH = camera_cfg['resolution']['width']
+    HEIGHT = camera_cfg['resolution']['height']
+    FRAMERATE = camera_cfg['framerate']
+    JPEG_QUALITY = camera_cfg['jpeg_quality']
+    CAMERA_IP = config['network']['camera_ip']
+    OUTPUT_DIR = Path(camera_cfg['recording_dir'])
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    CAMERA_TOKEN = camera_cfg.get('token') or ''
+    STREAM_LIMIT = StreamLimiter(max_clients=camera_cfg['max_stream_clients'])
+    HTML_PAGE = render_html_page()
+
+
+def render_html_page() -> str:
+    return f"""<!DOCTYPE html>
 <html>
 <head>
     <title>Pi Camera Stream</title>
@@ -391,7 +401,14 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
         super().server_bind()
 
 
-def main():
+def main(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description='Raspberry Pi camera streaming server')
+    parser.add_argument('--config', default='config.yaml', help='Config file path')
+    args = parser.parse_args(argv)
+    try:
+        configure_camera(args.config)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f'Configuration error: {exc}') from exc
     logger.info("Initializing Raspberry Pi Camera...")
 
     try:
