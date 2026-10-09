@@ -40,12 +40,13 @@
                         <button id="btn-stop" class="danger" onclick="stopTracking()" disabled>Stop</button>
                         <button id="btn-reset" class="secondary" onclick="resetDetection()">Reset</button>
                     </div>
+                    <div id="recording-warning" class="recording-warning" role="status" hidden></div>
                 </div>
 
                 <div class="panel">
                     <h3>Recording</h3>
                     <div class="btn-group">
-                        <button id="btn-record" onclick="toggleRecording()">Record</button>
+                        <button id="btn-record" onclick="toggleRecording()" disabled>Record</button>
                         <button onclick="takeScreenshot()">Screenshot</button>
                     </div>
                 </div>

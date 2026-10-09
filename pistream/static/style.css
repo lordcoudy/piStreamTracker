@@ -32,6 +32,9 @@
             gap: 6px;
             font-size: 0.85rem;
         }
+        @media (max-width: 600px) {
+            header { align-items: flex-start; flex-direction: column; gap: 12px; }
+        }
         .dot {
             width: 10px;
             height: 10px;
@@ -43,7 +46,7 @@
 
         .main-grid {
             display: grid;
-            grid-template-columns: 1fr 300px;
+            grid-template-columns: minmax(0, 1fr) var(--controls-width, 300px);
             gap: 20px;
         }
         @media (max-width: 900px) {
@@ -92,6 +95,16 @@
             letter-spacing: 0.5px;
         }
 
+        .recording-warning {
+            margin-top: 12px;
+            padding: 10px;
+            border: 1px solid #fbbf24;
+            border-radius: 4px;
+            color: #fbbf24;
+            font-size: 0.85rem;
+            line-height: 1.4;
+        }
+
         .btn-group {
             display: flex;
             gap: 8px;
@@ -108,13 +121,13 @@
             transition: background 0.2s;
         }
         button:hover { background: #2563eb; }
-        button:disabled { background: #475569; cursor: not-allowed; }
         button.danger { background: #ef4444; }
         button.danger:hover { background: #dc2626; }
         button.success { background: #22c55e; }
         button.success:hover { background: #16a34a; }
         button.secondary { background: #475569; }
         button.secondary:hover { background: #64748b; }
+        button:disabled, button:disabled:hover { background: #475569; cursor: not-allowed; }
 
         .slider-group {
             margin-bottom: 12px;

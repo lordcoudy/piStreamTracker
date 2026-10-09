@@ -58,6 +58,9 @@ _latest_frame: Optional[np.ndarray] = None
 _latest_seq: int = 0
 _overlay_enabled: bool = True
 _config: dict = {}
+_recording_error_lock = Lock()
+_last_recording_error: Optional[str] = None
+_recording_error_revision = 0
 
 
 def _tracker() -> Optional[HumanTracker]:
@@ -67,6 +70,50 @@ def _tracker() -> Optional[HumanTracker]:
 def _active_tracker() -> Optional[HumanTracker]:
     trk = _tracker()
     return trk if trk is not None and trk.running and trk.capture is not None else None
+
+
+def _remember_recording_error(trk: Optional[HumanTracker], revision: Optional[int] = None):
+    global _last_recording_error
+    with _recording_error_lock:
+        current = trk is _tracker() if revision is None else revision == _recording_error_revision
+        error = getattr(trk, 'recording_error', None) if trk and current else None
+        if error:
+            _last_recording_error = error
+        return _last_recording_error
+
+
+def _clear_recording_error():
+    global _last_recording_error, _recording_error_revision
+    with _recording_error_lock:
+        _last_recording_error = None
+        _recording_error_revision += 1
+
+
+def _recording_status(trk: Optional[HumanTracker]) -> dict:
+    pending = bool(trk and getattr(trk, 'remote_stop_pending', False))
+    error = _remember_recording_error(trk)
+    stopping = bool(_lifecycle and getattr(_lifecycle, 'stopping', False))
+    if pending:
+        if trk.running:
+            warning = ('Camera recording stop is unconfirmed. Press Stop Rec to retry, '
+                       'or Stop to stop tracking.')
+        else:
+            warning = ('Tracking has stopped. Camera recording stop is unconfirmed. '
+                       'Press Stop again to retry.')
+    elif error:
+        warning = f'Recording failed: {error}'
+        if trk and not trk.running and getattr(trk, 'cleanup_pending', False):
+            warning += '. Tracker cleanup is unfinished. Press Stop again to retry.'
+    elif trk and not trk.running and getattr(trk, 'cleanup_pending', False):
+        warning = 'Tracker cleanup is unfinished. Press Stop again to retry.'
+    else:
+        warning = None
+    return {
+        'recording_error': error,
+        'recording_stop_pending': pending,
+        'stopping': stopping,
+        'warning': warning,
+    }
 
 
 def _clear_latest_frame() -> None:
@@ -272,6 +319,7 @@ def video_feed():
 def api_status():
     """Get current tracker status."""
     trk = _tracker()
+    recording_status = _recording_status(trk)
     if trk:
         detection = trk.current_detection if trk.running else None
         bbox = detection.get('bbox') if detection else None
@@ -296,6 +344,7 @@ def api_status():
             'horizon': bool(trk.horizon_correction),
             'overlay': bool(_overlay_enabled),
             'stream_lost': stream_lost,
+            **recording_status,
         })
 
     return jsonify({
@@ -310,6 +359,7 @@ def api_status():
         'horizon': False,
         'overlay': bool(_overlay_enabled),
         'stream_lost': False,
+        **recording_status,
     })
 
 
@@ -319,8 +369,11 @@ def api_start():
     if _lifecycle is None:
         return jsonify({'status': 'error', 'message': 'Web app not initialized'}), 500
     try:
+        _remember_recording_error(_tracker())
         _clear_latest_frame()
         result = _lifecycle.start()
+        if result['status'] in {'recording_stop_pending', 'stopping'}:
+            return jsonify(result), 409
         if result['status'] == 'error':
             return jsonify(result), 503
         return jsonify(result)
@@ -334,9 +387,15 @@ def api_stop():
     """Stop tracking."""
     if _lifecycle is None:
         return jsonify({'status': 'ok'})
+    trk = _tracker()
+    with _recording_error_lock:
+        error_revision = _recording_error_revision
     result = _lifecycle.stop()
+    # Cleanup can discover an encoder failure just before lifecycle drops the owner.
+    _remember_recording_error(trk, error_revision)
     _clear_latest_frame()
-    return jsonify(result), (202 if result['status'] == 'stopping' else 200)
+    status = {'stopping': 202, 'recording_stop_pending': 503}.get(result['status'], 200)
+    return jsonify(result), status
 
 
 @app.route('/api/reset', methods=['POST'])
@@ -358,10 +417,13 @@ def api_record():
         if was_recording:
             if trk.stop_recording():
                 return jsonify({'status': 'ok', 'recording': False})
-            return _error('Camera did not confirm that recording stopped', 503)
+            if getattr(trk, 'remote_stop_pending', False):
+                return _error('Camera did not confirm that recording stopped', 503)
+            return _error('Recording cleanup is unfinished. Press Stop again to retry.', 503)
         else:
             trk.start_recording()
         if trk.recording:
+            _clear_recording_error()
             return jsonify({'status': 'ok', 'recording': True})
         return _error('Could not start recording', 503)
     return _error('Tracker not running', 409)
@@ -582,7 +644,7 @@ def _camera_http_error(exc: urllib.error.HTTPError):
 @app.route('/api/recordings')
 def api_recordings():
     """List local artifacts plus camera files when camera recording is configured."""
-    trk = _active_tracker()
+    trk = _tracker()
     active_path = trk.local_recording_path if trk is not None else None
     active_name = active_path.name if active_path is not None else None
     files = [
@@ -690,7 +752,7 @@ def api_recordings_delete(filename):
     if not file_path.exists():
         return jsonify({'status': 'error', 'message': 'File not found'}), 404
 
-    trk = _active_tracker()
+    trk = _tracker()
     active_path = trk.local_recording_path if trk is not None else None
     if active_path is not None and file_path == active_path.resolve():
         return _error('Cannot delete an active recording', 409)
@@ -743,6 +805,7 @@ def run_web(config: dict, host: str = '0.0.0.0', port: int = 5000):
     """Run the web interface."""
     global _config, _lifecycle, _overlay_enabled
     _config = config
+    _clear_recording_error()
     _overlay_enabled = bool((config.get('web') or {}).get('overlay', True))
     _lifecycle = TrackerLifecycle(lambda: HumanTracker(_config), _run_tracker_loop)
 
