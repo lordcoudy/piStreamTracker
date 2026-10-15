@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import sys
 import time
 import urllib.request
 from collections import deque
@@ -167,6 +168,8 @@ class HumanTracker:
         self._rec_thread: Optional[_RecordingThread] = None
         self._recording_backend: Optional[str] = None
         self._record_lock = RLock()
+        self._recording_error: Optional[str] = None
+        self.remote_stop_pending = False
         self._fps_count = 0
         self._fps_time = time.monotonic()
         self._fps = 0.0
@@ -195,6 +198,7 @@ class HumanTracker:
         # Async detector (created in connect() once we know frame size)
         self._async_detector: Optional[AsyncDetector] = None
         self._cleaned = False
+        self._cleanup_ok = True
 
         # Shift logger
         self._shift_logger = None
@@ -428,8 +432,12 @@ class HumanTracker:
         via HTTP API — zero CPU cost on the tracker Pi.
         """
         with self._record_lock:
+            if self.remote_stop_pending or self._cleaned:
+                return False
             if self.recording:
                 return True
+            if self._rec_thread is not None and not self.stop_recording():
+                return False
 
             if self.recording_mode == 'camera':
                 try:
@@ -444,8 +452,14 @@ class HumanTracker:
                         raise RuntimeError("camera did not confirm recording")
                     self._recording_backend = 'camera'
                     self.recording = True
+                    self._recording_error = None
                     logger.info(f"Camera-side recording started: {info.get('file')}")
                     return True
+                except KeyboardInterrupt:
+                    self._recording_backend = 'camera'
+                    self.recording = True
+                    self.remote_stop_pending = True
+                    raise
                 except Exception as e:
                     logger.error(f"Failed to start camera recording: {e}")
                     try:
@@ -458,10 +472,16 @@ class HumanTracker:
                         if status.get('recording'):
                             self._recording_backend = 'camera'
                             self.recording = True
+                            self._recording_error = None
                             logger.warning(
                                 "Camera start response failed, but status confirms recording"
                             )
                             return True
+                    except KeyboardInterrupt:
+                        self._recording_backend = 'camera'
+                        self.recording = True
+                        self.remote_stop_pending = True
+                        raise
                     except Exception as status_exc:
                         logger.warning(f"Could not reconcile camera recording state: {status_exc}")
                     logger.info("Falling back to local recording")
@@ -491,13 +511,16 @@ class HumanTracker:
             if recorder is not None:
                 recorder.stop()
             logger.error(f"Could not start local recording: {exc}")
-            self._rec_thread = None
-            self._recording_backend = None
+            self._rec_thread = recorder if recorder is not None and not recorder.closed.is_set() else None
+            self._recording_backend = 'local' if self._rec_thread is not None else None
             self.recording = False
+            if self._recording_error is None:
+                self._recording_error = str(exc)
             return False
         self._rec_thread = recorder
         self._recording_backend = 'local'
         self.recording = True
+        self._recording_error = None
         logger.info(
             f"Recording: {recorder.output_path}  ({fps:.0f} fps, source {source_fps:.0f})"
         )
@@ -506,26 +529,35 @@ class HumanTracker:
     def stop_recording(self):
         """Stop video recording."""
         with self._record_lock:
-            if not self.recording:
+            if not self.recording and self._rec_thread is None and not self.remote_stop_pending:
                 return True
             backend = self._recording_backend
 
             if backend == 'camera':
+                self.remote_stop_pending = True
                 try:
                     req = urllib.request.Request(
                         f"{self._camera_base_url}/record/stop",
                         method='POST', data=b'',
                         headers=auth_headers(self._camera_token),
                     )
-                    with urllib.request.urlopen(req, timeout=5):
-                        pass
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        info = load_json_object(resp.read())
+                    if info.get('recording') is not False:
+                        raise RuntimeError('Camera did not confirm that recording stopped')
                     logger.info("Camera-side recording stopped")
-                except Exception as e:
+                    self.remote_stop_pending = False
+                except (Exception, KeyboardInterrupt) as e:
                     logger.warning(f"Failed to stop camera recording: {e}")
+                    self.remote_stop_pending = True
                     return False
 
             if self._rec_thread:
-                self._rec_thread.stop()
+                self._remember_writer_error()
+                if not self._rec_thread.stop():
+                    self._remember_writer_error()
+                    return False
+                self._remember_writer_error()
                 self._rec_thread = None
             self.recording = False
             self._recording_backend = None
@@ -542,6 +574,38 @@ class HumanTracker:
         return path
 
     @property
+    def recording(self) -> bool:
+        with self._record_lock:
+            if not self._recording:
+                return False
+            if self._recording_backend == 'local':
+                writer = self._rec_thread
+                return bool(writer is not None and not writer.finished.is_set()
+                            and writer.error is None and writer.ready)
+            return True
+
+    @recording.setter
+    def recording(self, active: bool) -> None:
+        self._recording = bool(active)
+
+    def _remember_writer_error(self) -> None:
+        if self._rec_thread is not None and self._rec_thread.error and self._recording_error is None:
+            self._recording_error = self._rec_thread.error
+
+    @property
+    def recording_error(self) -> Optional[str]:
+        with self._record_lock:
+            self._remember_writer_error()
+            return self._recording_error
+
+    @property
+    def cleanup_pending(self) -> bool:
+        with self._record_lock:
+            return self.remote_stop_pending or (
+                self._rec_thread is not None and not self._rec_thread.closed.is_set()
+            )
+
+    @property
     def records_locally(self) -> bool:
         with self._record_lock:
             return self.recording and self._recording_backend == 'local'
@@ -549,7 +613,7 @@ class HumanTracker:
     @property
     def local_recording_path(self) -> Optional[Path]:
         with self._record_lock:
-            if not self.records_locally or self._rec_thread is None:
+            if self._rec_thread is None or self._rec_thread.closed.is_set():
                 return None
             return Path(self._rec_thread.output_path)
 
@@ -579,87 +643,152 @@ class HumanTracker:
             return None
         return self._leveled_frame.copy()
 
-    def run(self, display: bool = True, auto_record: bool = False):
-        """Main processing loop."""
-        if not self.connect():
-            logger.error("Failed to connect to stream")
-            self.cleanup()
-            return
+    def _show_tracking_frame(self, annotated: np.ndarray) -> None:
+        cv2.putText(annotated, f"FPS: {self.fps:.1f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        ev3_text = "EV3: ON" if self.motors.connected else "EV3: OFF"
+        ev3_color = (0, 255, 0) if self.motors.connected else (0, 0, 255)
+        cv2.putText(annotated, ev3_text, (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, ev3_color, 2)
+        if self.tracker.tracker_type:
+            cv2.putText(annotated, f"Tracker: {self.tracker.tracker_type}", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        if self.recording:
+            cv2.circle(annotated, (self.capture.width - 20, 20), 8, (0, 0, 255), -1)
+        cv2.imshow('Human Tracker', annotated)
 
-        self.running = True
-        if auto_record:
-            self.start_recording()
-
-        logger.info("Tracking started. Keys: q=quit, r=record, s=screenshot, d=reset, e=EV3")
-
+    def run(self, display: bool = True, auto_record: bool = False) -> int:
+        """Track until stopped, then retain interactive remote-stop recovery."""
         try:
-            prev_frame = None
-            while self.running:
-                ret, frame = self.capture.read()
-                prev_frame, is_new = accept_new_frame(prev_frame, ret, frame)
-                if not is_new:
-                    time.sleep(0.002)
-                    continue
+            last_annotated = None
+            exit_status = 0
+            try:
+                if not self.connect():
+                    logger.error("Failed to connect to stream")
+                    return 1
+                self.running = True
+                if auto_record:
+                    self.start_recording()
+                logger.info("Tracking started. Keys: q=quit, r=record, s=screenshot, d=reset, e=EV3")
+                prev_frame = None
+                while self.running:
+                    ret, frame = self.capture.read()
+                    prev_frame, is_new = accept_new_frame(prev_frame, ret, frame)
+                    if is_new:
+                        annotated, _ = self.process_frame(frame)
+                        self.write_frame(self.recording_frame())
+                        self.update_fps()
+                        if display:
+                            last_annotated = annotated
+                            self._show_tracking_frame(annotated)
+                    else:
+                        time.sleep(0.002)
 
-                annotated, _ = self.process_frame(frame)
-                self.write_frame(self.recording_frame())
-                self.update_fps()
+                    if display:
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('q'):
+                            break
+                        elif key == ord('r'):
+                            self.stop_recording() if self.recording else self.start_recording()
+                        elif key == ord('s'):
+                            if last_annotated is not None:
+                                self.screenshot(last_annotated)
+                            else:
+                                logger.warning("No displayed frame available for screenshot")
+                        elif key == ord('d'):
+                            self.reset_tracking(home=True)
+                            logger.info("Detection reset + camera homed")
+                        elif key == ord('e'):
+                            self.motors.disconnect() if self.motors.connected else self.motors.connect()
+            except KeyboardInterrupt:
+                logger.info("Interrupted")
+            except Exception:
+                logger.exception("Tracking failed")
+                exit_status = 1
+            finally:
+                if self.cleanup() is False:
+                    exit_status = 1
+            if self.remote_stop_pending:
+                result = self._recover_camera_stop(display=display, frame=last_annotated)
+                return result or exit_status or int(self.cleanup_pending)
+            return exit_status or int(self.cleanup_pending)
 
-                if display:
-                    # Status overlay
-                    cv2.putText(annotated, f"FPS: {self.fps:.1f}", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-                    ev3_text = "EV3: ON" if self.motors.connected else "EV3: OFF"
-                    ev3_color = (0, 255, 0) if self.motors.connected else (0, 0, 255)
-                    cv2.putText(annotated, ev3_text, (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, ev3_color, 2)
-
-                    if self.tracker.tracker_type:
-                        cv2.putText(annotated, f"Tracker: {self.tracker.tracker_type}", (10, 90),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-
-                    if self.recording:
-                        cv2.circle(annotated, (self.capture.width - 20, 20), 8, (0, 0, 255), -1)
-
-                    cv2.imshow('Human Tracker', annotated)
-
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord('r'):
-                        self.stop_recording() if self.recording else self.start_recording()
-                    elif key == ord('s'):
-                        self.screenshot(annotated)
-                    elif key == ord('d'):
-                        self.reset_tracking(home=True)
-                        logger.info("Detection reset + camera homed")
-                    elif key == ord('e'):
-                        self.motors.disconnect() if self.motors.connected else self.motors.connect()
-
-        except KeyboardInterrupt:
-            logger.info("Interrupted")
         finally:
-            self.cleanup()
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                logger.debug("OpenCV window cleanup unavailable", exc_info=True)
+
+    def _recover_camera_stop(self, display: bool, frame: Optional[np.ndarray] = None) -> int:
+        """Retry only on user input, keeping an unconfirmed camera recording owned."""
+        warning = "Tracking stopped; camera recording stop is unconfirmed."
+        logger.warning(warning)
+        recovery_frame = None
+        while self.remote_stop_pending:
+            if not display and not sys.stdin.isatty():
+                logger.error("No interactive input; stop the camera recorder manually via /record/stop")
+                return 1
+            try:
+                if display:
+                    if recovery_frame is None:
+                        recovery_frame = np.zeros((160, 640, 3), dtype=np.uint8)
+                        cv2.putText(recovery_frame, warning, (10, 40),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 180, 255), 1)
+                        cv2.putText(recovery_frame, 'R: retry camera stop   Q: force quit', (10, 90),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        if frame is not None:
+                            h, w = frame.shape[:2]
+                            preview = cv2.resize(frame, (640, max(1, int(h * 640 / w))))
+                            recovery_frame = np.vstack((recovery_frame, preview))
+                    cv2.imshow('Camera Recording Recovery', recovery_frame)
+                    key = cv2.waitKey(50) & 0xFF
+                    action = 'retry' if key in (ord('r'), ord('R')) else (
+                        'quit' if key in (ord('q'), ord('Q')) else ''
+                    )
+                else:
+                    action = input('Camera stop unconfirmed: retry or quit? ').strip().lower()
+            except cv2.error as exc:
+                logger.warning("Camera stop recovery display failed; using terminal input: %s", exc)
+                display = False
+                continue
+            except (EOFError, KeyboardInterrupt):
+                action = 'quit'
+            if action == 'quit':
+                logger.error("Exiting with camera recording stop still unconfirmed")
+                return 1
+            if action == 'retry':
+                try:
+                    self.stop_recording()
+                except KeyboardInterrupt:
+                    logger.warning("Camera stop retry interrupted; confirmation is still pending")
+        return 0
 
     def cleanup(self):
-        """Release all resources. Safe to call more than once."""
+        """Release local resources and make one recording-stop attempt."""
         if self._cleaned:
-            return
+            return self._cleanup_ok
         self._cleaned = True
+        self._cleanup_ok = True
         logger.info("Cleaning up...")
         self.running = False
-        if self._async_detector:
-            self._async_detector.stop()
-            self._async_detector = None
-        self.motors.disconnect()
+        actions = [
+            ('detector', self._async_detector, 'stop'),
+            ('motors', self.motors, 'disconnect'),
+            ('capture', self.capture, 'stop'),
+            ('shift log', self._shift_logger, 'flush'),
+        ]
+        for name, resource, method in actions:
+            if resource is None:
+                continue
+            try:
+                getattr(resource, method)()
+            except (Exception, KeyboardInterrupt):
+                self._cleanup_ok = False
+                logger.exception("Could not clean up %s", name)
+        self._async_detector = None
+        self.capture = None
         self.stop_recording()
-        if self.capture:
-            self.capture.stop()
-            self.capture = None
-        if self._shift_logger:
-            self._shift_logger.flush()
-        cv2.destroyAllWindows()
+        return self._cleanup_ok
 
 
 # =============================================================================
@@ -736,7 +865,7 @@ def main():
     configure_logging(config)
 
     tracker = HumanTracker(config)
-    tracker.run(display=not args.no_display, auto_record=args.auto_record)
+    raise SystemExit(tracker.run(display=not args.no_display, auto_record=args.auto_record))
 
 
 if __name__ == "__main__":

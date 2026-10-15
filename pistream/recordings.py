@@ -1,6 +1,5 @@
 """Recording file listing and path safety."""
 
-import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path

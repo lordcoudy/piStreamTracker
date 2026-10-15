@@ -23,7 +23,6 @@ class VideoCapture:
     """Threaded video capture with low-latency buffering and auto-reconnect."""
 
     MAX_FAILURES = 30        # consecutive read failures before reconnect
-    MAX_RECONNECTS = BURST_RECONNECTS
 
     def __init__(self, source: str, buffer_size: int = 2):
         self.source = source

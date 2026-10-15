@@ -111,14 +111,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 @dataclass(frozen=True)
 class RunAction:
     argv: tuple[str, ...]
-    description: str = ''
 
 
 @dataclass(frozen=True)
 class WriteAction:
     path: str
     content: str
-    description: str = ''
 
 
 Action = RunAction | WriteAction
@@ -175,26 +173,25 @@ def plan_nm_actions(
             argv=(
                 'nmcli', 'connection', 'add', 'type', 'ethernet',
                 'con-name', 'pistream-eth', 'ifname', interface,
+                'connection.autoconnect', 'yes',
                 'ipv4.method', 'manual', 'ipv4.addresses', cidr,
                 'ipv4.never-default', 'yes',
             ),
-            description=f'Create ethernet profile pistream-eth on {interface}',
         ))
         chosen = 'pistream-eth'
     else:
         actions.append(RunAction(
             argv=(
                 'nmcli', 'connection', 'modify', chosen,
+                'connection.autoconnect', 'yes',
                 'ipv4.method', 'manual',
                 'ipv4.addresses', cidr,
                 'ipv4.gateway', '',
                 'ipv4.never-default', 'yes',
             ),
-            description=f'Set static {cidr} on {chosen} ({interface})',
         ))
     actions.append(RunAction(
         argv=('nmcli', 'connection', 'up', chosen),
-        description=f'Bring up {chosen}',
     ))
     return actions
 
@@ -214,11 +211,9 @@ def plan_networkd_actions(interface: str, address: str, prefix: int) -> list[Act
         WriteAction(
             path='/etc/systemd/network/10-pistream.network',
             content=render_networkd_file(interface, address, prefix),
-            description='Write systemd-networkd config',
         ),
         RunAction(
             argv=('systemctl', 'restart', 'systemd-networkd'),
-            description='Restart systemd-networkd',
         ),
     ]
 
@@ -243,6 +238,14 @@ def ssh_on_interface(ssh_connection: str | None, interface_ips: set[str]) -> boo
     return parts[2] in interface_ips
 
 
+def _systemd_argument(value: str) -> str:
+    """Quote one ExecStart argument, including literal unit specifiers."""
+    value = value.replace('%', '%%')
+    value = value.replace('\\', '\\\\').replace('"', '\\"')
+    value = value.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+    return f'"{value}"'
+
+
 def render_unit_file(
     *,
     description: str,
@@ -250,7 +253,14 @@ def render_unit_file(
     work_dir: str,
     python: str,
     script: str,
+    config_path: str | None = None,
 ) -> str:
+    config_path = config_path if config_path is not None else str(Path(work_dir) / 'config.yaml')
+    command = ' '.join(_systemd_argument(arg) for arg in (python, script, '--config', config_path))
+    if any(char in work_dir for char in ('\n', '\r', '\0')):
+        raise InstallError('Service working directory must not contain line breaks or NUL')
+    # WorkingDirectory is a scalar path: quotes would become part of its name.
+    directory = work_dir.replace('%', '%%')
     return (
         '[Unit]\n'
         f'Description={description}\n'
@@ -260,11 +270,12 @@ def render_unit_file(
         '[Service]\n'
         'Type=simple\n'
         f'User={user}\n'
-        f'WorkingDirectory={work_dir}\n'
+        f'WorkingDirectory={directory}\n'
         'Environment=OPENBLAS_NUM_THREADS=2\n'
         'Environment=OMP_NUM_THREADS=2\n'
         'Environment=MKL_NUM_THREADS=2\n'
-        f'ExecStart={python} {script}\n'
+        # ':' disables environment expansion for literal paths, including argv[0].
+        f'ExecStart=:{command}\n'
         'Restart=always\n'
         'RestartSec=5\n'
         '\n'
@@ -284,6 +295,7 @@ def plan_service_actions(
     work_dir: str,
     python: str,
     enable: bool,
+    config_path: str | None = None,
 ) -> list[Action]:
     script_name = 'camera.py' if role == 'camera' else 'web.py'
     description = (
@@ -301,16 +313,15 @@ def plan_service_actions(
                 work_dir=work_dir,
                 python=python,
                 script=script,
+                config_path=config_path,
             ),
-            description='Write pitracker.service',
         ),
-        RunAction(('systemctl', 'daemon-reload'), 'Reload systemd'),
+        RunAction(('systemctl', 'daemon-reload')),
     ]
     if enable:
         actions.append(
             RunAction(
                 ('systemctl', 'enable', '--now', 'pitracker'),
-                'Enable and start pitracker',
             )
         )
     return actions
@@ -321,10 +332,9 @@ def plan_udev_actions(username: str) -> list[Action]:
         WriteAction(
             path='/etc/udev/rules.d/99-ev3.rules',
             content=render_udev_rule(),
-            description='Install EV3 udev rule',
         ),
-        RunAction(('udevadm', 'control', '--reload-rules'), 'Reload udev rules'),
-        RunAction(('usermod', '-aG', 'plugdev,video', username), 'Add user to plugdev,video'),
+        RunAction(('udevadm', 'control', '--reload-rules')),
+        RunAction(('usermod', '-aG', 'plugdev,video', username)),
     ]
 
 
@@ -483,7 +493,7 @@ def cmd_service(
         print('Skipping systemd service (not Linux).', file=stdout)
         return 0
     from pistream.config import project_root
-    root = work_dir if work_dir is not None else project_root()
+    root = (work_dir if work_dir is not None else project_root()).resolve()
     role = _resolved_role(args, model_text)
     actions = plan_service_actions(
         role=role,
@@ -491,6 +501,7 @@ def cmd_service(
         work_dir=str(root),
         python=python if python is not None else resolve_python(Path(root)),
         enable=not bool(getattr(args, 'no_enable', False)),
+        config_path=str(Path(args.config).resolve()),
     )
     execute_actions(
         actions,
@@ -537,17 +548,11 @@ def cmd_install(
     role = _resolved_role(args, model_text)
     args.role = role
     if not getattr(args, 'skip_network', False):
-        rc = cmd_network(args, **kwargs)
-        if rc:
-            return rc
+        cmd_network(args, **kwargs)
     if role == 'tracker' and not getattr(args, 'skip_udev', False):
-        rc = cmd_udev(args, **kwargs)
-        if rc:
-            return rc
+        cmd_udev(args, **kwargs)
     if not getattr(args, 'skip_service', False):
-        rc = cmd_service(args, **kwargs)
-        if rc:
-            return rc
+        cmd_service(args, **kwargs)
     return 0
 
 
@@ -613,4 +618,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
-

@@ -1,5 +1,9 @@
         let isTracking = false;
         let isRecording = false;
+        let isStopping = false;
+        let recordingStopPending = false;
+        let controlRequestPending = false;
+        let lastWarning = null;
 
         function log(message, type = 'info') {
             const logEl = document.getElementById('log-output');
@@ -24,39 +28,67 @@
                     payload = text ? JSON.parse(text) : {};
                 } catch (e) {
                     log('API error: invalid JSON (' + res.status + ')', 'error');
-                    return { status: 'error', message: 'Invalid JSON from server', httpOk: false, httpStatus: res.status };
+                    return { status: 'error', message: 'Invalid JSON from server' };
                 }
                 if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
-                    return { status: 'error', message: 'Unexpected API response', httpOk: false, httpStatus: res.status };
+                    return { status: 'error', message: 'Unexpected API response' };
                 }
-                payload.httpOk = res.ok;
-                payload.httpStatus = res.status;
                 return payload;
             } catch (e) {
                 log('API error: ' + e.message, 'error');
-                return { status: 'error', message: e.message, httpOk: false, httpStatus: 0 };
+                return { status: 'error', message: e.message };
             }
         }
 
         async function startTracking() {
+            if (controlRequestPending) return;
+            controlRequestPending = true;
+            updateUI();
             log('Starting tracker...');
-            const res = await api('start', 'POST');
-            if (res && (res.status === 'ok' || res.status === 'already_running')) {
-                isTracking = true;
+            try {
+                const res = await api('start', 'POST');
+                if (res && (res.status === 'ok' || res.status === 'already_running')) {
+                    isTracking = true;
+                    log('Tracking started', 'success');
+                } else {
+                    log('Start failed: ' + ((res && res.message) || 'unknown error'), 'error');
+                }
+                await updateStatus();
+            } finally {
+                controlRequestPending = false;
                 updateUI();
-                log('Tracking started', 'success');
-            } else {
-                log('Start failed: ' + ((res && res.message) || 'unknown error'), 'error');
             }
         }
 
         async function stopTracking() {
+            if (controlRequestPending) return;
+            controlRequestPending = true;
+            updateUI();
             log('Stopping tracker...');
-            const res = await api('stop', 'POST');
-            if (res && (res.status === 'ok' || res.status === 'stopping')) {
-                isTracking = false;
+            try {
+                const res = await api('stop', 'POST');
+                if (res && res.status === 'ok') {
+                    isTracking = false;
+                    isRecording = false;
+                    isStopping = false;
+                    recordingStopPending = false;
+                    showRecordingWarning(null);
+                    log('Tracking stopped', 'success');
+                } else if (res && res.status === 'stopping') {
+                    isTracking = false;
+                    isStopping = true;
+                    log('Tracker cleanup is still in progress.');
+                } else if (res && res.status === 'recording_stop_pending') {
+                    isTracking = false;
+                    recordingStopPending = true;
+                    showRecordingWarning('Tracking has stopped. Camera recording stop is unconfirmed. Press Stop again to retry.');
+                } else {
+                    log('Stop failed: ' + ((res && res.message) || 'unknown error'), 'error');
+                }
+                await updateStatus();
+            } finally {
+                controlRequestPending = false;
                 updateUI();
-                log(res.status === 'stopping' ? 'Tracker is stopping…' : 'Tracking stopped', 'success');
             }
         }
 
@@ -112,12 +144,19 @@
                 updateUI();
                 log(isRecording ? 'Recording started' : 'Recording stopped', 'success');
             } else if (res) log('Recording failed: ' + (res.message || 'unknown error'), 'error');
+            await updateStatus();
+            if (!isRecording && document.getElementById('rec-body').classList.contains('open')) {
+                setTimeout(loadRecordings, 500);
+            }
         }
 
         async function takeScreenshot() {
             const res = await api('screenshot', 'POST');
             if (res && res.status === 'ok') log('Screenshot: ' + res.path, 'success');
             else if (res) log('Screenshot failed: ' + (res.message || 'unknown error'), 'error');
+            if (document.getElementById('rec-body').classList.contains('open')) {
+                setTimeout(loadRecordings, 500);
+            }
         }
 
         async function toggleEV3() {
@@ -145,11 +184,21 @@
         }
 
         function updateUI() {
-            document.getElementById('btn-start').disabled = isTracking;
-            document.getElementById('btn-stop').disabled = !isTracking;
+            document.getElementById('btn-start').disabled = isTracking || isStopping || recordingStopPending || controlRequestPending;
+            document.getElementById('btn-stop').disabled = !(isTracking || isStopping || recordingStopPending) || controlRequestPending;
+            document.getElementById('btn-stop').textContent = recordingStopPending && !isTracking ? 'Retry camera stop' : 'Stop';
+            document.getElementById('btn-record').disabled = !isTracking || isStopping || controlRequestPending;
             document.getElementById('btn-record').textContent = isRecording ? 'Stop Rec' : 'Record';
             document.getElementById('btn-record').className = isRecording ? 'danger' : '';
             document.getElementById('status-recording').className = 'dot ' + (isRecording ? 'red' : 'yellow');
+        }
+
+        function showRecordingWarning(warning) {
+            const element = document.getElementById('recording-warning');
+            element.textContent = warning || '';
+            element.hidden = !warning;
+            if (warning && warning !== lastWarning) log(warning, 'error');
+            lastWarning = warning || null;
         }
 
         async function updateStatus() {
@@ -159,6 +208,9 @@
             }
             isTracking = res.running;
             isRecording = res.recording;
+            isStopping = Boolean(res.stopping);
+            recordingStopPending = Boolean(res.recording_stop_pending);
+            showRecordingWarning(res.warning || null);
             const trackingDot = document.getElementById('status-tracking');
             if (res.running && res.stream_lost) {
                 trackingDot.className = 'dot yellow';
@@ -285,12 +337,7 @@
                 root.style.setProperty('--stream-width', res.width + 'px');
                 root.style.setProperty('--stream-aspect', res.width + '/' + res.height);
                 const ratio = res.width / res.height;
-                const grid = document.querySelector('.main-grid');
-                if (ratio >= 1.6) {
-                    grid.style.gridTemplateColumns = '1fr 280px';
-                } else {
-                    grid.style.gridTemplateColumns = '1fr 300px';
-                }
+                root.style.setProperty('--controls-width', ratio >= 1.6 ? '280px' : '300px');
             }
             if (res.confidence !== undefined) {
                 document.getElementById('conf-slider').value = res.confidence;
@@ -304,22 +351,6 @@
                 document.getElementById('overlay-toggle').checked = res.overlay;
             }
         }
-
-        // --- Auto-refresh recordings after actions ---
-        const _origToggleRecording = toggleRecording;
-        toggleRecording = async function() {
-            await _origToggleRecording();
-            if (!isRecording && document.getElementById('rec-body').classList.contains('open')) {
-                setTimeout(loadRecordings, 500);
-            }
-        };
-        const _origTakeScreenshot = takeScreenshot;
-        takeScreenshot = async function() {
-            await _origTakeScreenshot();
-            if (document.getElementById('rec-body').classList.contains('open')) {
-                setTimeout(loadRecordings, 500);
-            }
-        };
 
         // Poll status every second
         setInterval(updateStatus, 1000);

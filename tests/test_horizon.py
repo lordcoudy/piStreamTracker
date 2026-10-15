@@ -66,6 +66,17 @@ class TiltDegreesTests(unittest.TestCase):
 
 
 class EstimateRollTests(unittest.TestCase):
+    def test_pair_order_does_not_change_roll_or_trigger_outlier_filter(self):
+        for dy in (-10, 0, 10):
+            with self.subTest(dy=dy):
+                expected = math.degrees(math.atan2(dy, 100))
+                kp = _kp({5: (100, dy), 6: (0, 0), 11: (0, 50), 12: (100, 50 + dy)})
+                roll = estimate_roll_deg(kp, 0.3)
+                self.assertAlmostEqual(roll, expected)
+                self.assertAlmostEqual(
+                    step_angle(True, roll, 0, alpha=1, max_angle=20), expected
+                )
+
     def test_level_shoulders_zero_roll(self):
         kp = _kp({5: (40, 50), 6: (80, 50)})
         self.assertAlmostEqual(estimate_roll_deg(kp, 0.3), 0.0, places=2)
@@ -114,6 +125,17 @@ class StepAngleTests(unittest.TestCase):
 
 
 class WarpLevelTests(unittest.TestCase):
+    def test_rotation_levels_positive_and_negative_slopes(self):
+        for dy in (-10, 10):
+            for fill_crop in (False, True):
+                with self.subTest(dy=dy, fill_crop=fill_crop):
+                    angle = math.degrees(math.atan2(dy, 100))
+                    points = transform_points(
+                        np.array([[40, 50], [140, 50 + dy]]),
+                        level_affine(200, 100, angle, fill_crop=fill_crop),
+                    )
+                    self.assertAlmostEqual(points[0, 1], points[1, 1])
+
     def test_fill_crop_identity_at_zero(self):
         self.assertAlmostEqual(fill_crop_scale(0.0, 1280, 960), 1.0, places=6)
 

@@ -60,7 +60,7 @@ def default_config() -> dict:
             'invert': {'x': False, 'y': False}, 'ports': {'pan': 'a', 'tilt': 'b'}
         },
         'web': {
-            'enabled': True, 'host': None, 'port': 5000,
+            'host': None, 'port': 5000,
             'preview_quality': 70, 'preview_max_edge': 640,
             'preview_max_fps': 15, 'overlay': True,
         },
@@ -249,7 +249,6 @@ def validate_config(config: dict) -> dict:
         web.get('preview_max_fps'), 'web.preview_max_fps', 1, 240
     )
     web['overlay'] = _boolean(web.get('overlay'), 'web.overlay')
-    web['enabled'] = _boolean(web.get('enabled'), 'web.enabled')
     web['host'] = _optional_string(web.get('host'), 'web.host')
     for key in ('camera_ip', 'tracker_ip'):
         value = network.get(key)

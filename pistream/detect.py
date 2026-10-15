@@ -18,13 +18,6 @@ logger = logging.getLogger(__name__)
 class PoseDetector:
     """MoveNet Lightning pose detector optimized for Raspberry Pi."""
 
-    KEYPOINTS = [
-        'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
-        'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
-        'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
-        'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
-    ]
-
     # Primary: TFHub redirect (follows 302 to the actual GCS object)
     # Fallback: original GCS direct path (kept in case it is restored)
     MODEL_URLS = [
@@ -49,15 +42,25 @@ class PoseDetector:
     def _init_model(self, model_path: Optional[str]):
         """Initialize TFLite interpreter."""
         try:
-            path = self._get_model(model_path)
-            if not path:
-                return
-
             # Try tflite-runtime first (faster on Pi)
             try:
                 from tflite_runtime.interpreter import Interpreter
             except ImportError:
-                from tensorflow.lite.python.interpreter import Interpreter
+                try:
+                    from ai_edge_litert.interpreter import Interpreter
+                except ImportError:
+                    try:
+                        from tensorflow.lite.python.interpreter import Interpreter
+                    except ImportError as exc:
+                        raise ImportError(
+                            'No TensorFlow Lite interpreter is installed. On a desktop, run '
+                            'pip install -e ".[desktop]"; on Raspberry Pi, install '
+                            'tflite-runtime in the tracker environment.'
+                        ) from exc
+
+            path = self._get_model(model_path)
+            if not path:
+                return
 
             try:
                 self._interpreter = Interpreter(model_path=path, num_threads=self.threads)
@@ -178,7 +181,7 @@ class AsyncDetector:
     """Runs pose detection in a background thread so the main loop never blocks.
 
     The main loop submits frames via :meth:`submit` (non-blocking) and polls
-    for results via :meth:`get_result` (also non-blocking).  The heavy
+    for results via :meth:`poll_result` (also non-blocking).  The heavy
     MoveNet inference happens entirely inside the worker thread.
     """
 
@@ -233,11 +236,6 @@ class AsyncDetector:
         with self._submit_lock:
             self._pending_frame = frame.copy()
         self._has_frame.set()
-
-    def get_result(self) -> Optional[dict]:
-        """Return the latest detection result, or *None* if nothing new."""
-        _, result = self.poll_result()
-        return result
 
     def poll_result(self) -> tuple[bool, Optional[dict]]:
         """Return ``(is_new, result)`` so a new negative result is observable."""
