@@ -28,17 +28,15 @@
                     payload = text ? JSON.parse(text) : {};
                 } catch (e) {
                     log('API error: invalid JSON (' + res.status + ')', 'error');
-                    return { status: 'error', message: 'Invalid JSON from server', httpOk: false, httpStatus: res.status };
+                    return { status: 'error', message: 'Invalid JSON from server' };
                 }
                 if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
-                    return { status: 'error', message: 'Unexpected API response', httpOk: false, httpStatus: res.status };
+                    return { status: 'error', message: 'Unexpected API response' };
                 }
-                payload.httpOk = res.ok;
-                payload.httpStatus = res.status;
                 return payload;
             } catch (e) {
                 log('API error: ' + e.message, 'error');
-                return { status: 'error', message: e.message, httpOk: false, httpStatus: 0 };
+                return { status: 'error', message: e.message };
             }
         }
 
@@ -147,12 +145,18 @@
                 log(isRecording ? 'Recording started' : 'Recording stopped', 'success');
             } else if (res) log('Recording failed: ' + (res.message || 'unknown error'), 'error');
             await updateStatus();
+            if (!isRecording && document.getElementById('rec-body').classList.contains('open')) {
+                setTimeout(loadRecordings, 500);
+            }
         }
 
         async function takeScreenshot() {
             const res = await api('screenshot', 'POST');
             if (res && res.status === 'ok') log('Screenshot: ' + res.path, 'success');
             else if (res) log('Screenshot failed: ' + (res.message || 'unknown error'), 'error');
+            if (document.getElementById('rec-body').classList.contains('open')) {
+                setTimeout(loadRecordings, 500);
+            }
         }
 
         async function toggleEV3() {
@@ -347,22 +351,6 @@
                 document.getElementById('overlay-toggle').checked = res.overlay;
             }
         }
-
-        // --- Auto-refresh recordings after actions ---
-        const _origToggleRecording = toggleRecording;
-        toggleRecording = async function() {
-            await _origToggleRecording();
-            if (!isRecording && document.getElementById('rec-body').classList.contains('open')) {
-                setTimeout(loadRecordings, 500);
-            }
-        };
-        const _origTakeScreenshot = takeScreenshot;
-        takeScreenshot = async function() {
-            await _origTakeScreenshot();
-            if (document.getElementById('rec-body').classList.contains('open')) {
-                setTimeout(loadRecordings, 500);
-            }
-        };
 
         // Poll status every second
         setInterval(updateStatus, 1000);

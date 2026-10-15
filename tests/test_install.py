@@ -146,6 +146,21 @@ class NmcliParseTests(unittest.TestCase):
 
 
 class PlanNmActionsTests(unittest.TestCase):
+    def test_enables_autoconnect_before_activating_new_or_existing_profile(self):
+        for operation, connections in [
+            ('add', []),
+            ('modify', [('Wired connection 1', 'eth0', '802-3-ethernet')]),
+        ]:
+            with self.subTest(operation=operation):
+                actions = plan_nm_actions('eth0', '192.168.100.1', 24, connections)
+                profile_command = actions[0].argv
+                self.assertEqual(profile_command[:3], ('nmcli', 'connection', operation))
+                self.assertIn(
+                    ('connection.autoconnect', 'yes'),
+                    list(zip(profile_command, profile_command[1:])),
+                )
+                self.assertEqual(actions[-1].argv[:3], ('nmcli', 'connection', 'up'))
+
     def test_modifies_existing_ethernet_never_default(self):
         actions = plan_nm_actions(
             'eth0',

@@ -6,7 +6,6 @@ Simple Flask-based control panel for the tracking system
 
 import json
 import logging
-import math
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +29,7 @@ from flask import (
 from werkzeug.exceptions import HTTPException
 
 from pistream.config import apply_cli_overrides, configure_logging, load_config, web_bind_host
+from pistream.config import _bounded_number as _bounded
 from pistream.lifecycle import TrackerLifecycle
 from pistream.preview import accept_new_frame, camera_stream_url, preview_gate, preview_target_size
 from pistream.recordings import (
@@ -138,25 +138,6 @@ def _json_object() -> tuple[Optional[dict], Optional[str]]:
     if not isinstance(data, dict):
         return None, 'Expected a JSON object'
     return data, None
-
-
-def _finite(value, name: str) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f'{name} must be a number')
-    try:
-        number = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f'{name} must be a number') from exc
-    if not math.isfinite(number):
-        raise ValueError(f'{name} must be finite')
-    return number
-
-
-def _bounded(value, name: str, minimum: float, maximum: float) -> float:
-    number = _finite(value, name)
-    if not minimum <= number <= maximum:
-        raise ValueError(f'{name} must be between {minimum:g} and {maximum:g}')
-    return number
 
 
 def _bounded_int(value, name: str, minimum: int, maximum: int) -> int:

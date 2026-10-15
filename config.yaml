@@ -84,7 +84,6 @@ ev3:
 
 # Web Interface Settings
 web:
-  enabled: true
   host: null              # null = bind tracker_ip only (set 0.0.0.0 to listen on all NICs)
   port: 5000
   overlay: true           # false = proxy raw camera MJPEG (no re-encode)

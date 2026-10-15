@@ -111,14 +111,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 @dataclass(frozen=True)
 class RunAction:
     argv: tuple[str, ...]
-    description: str = ''
 
 
 @dataclass(frozen=True)
 class WriteAction:
     path: str
     content: str
-    description: str = ''
 
 
 Action = RunAction | WriteAction
@@ -175,26 +173,25 @@ def plan_nm_actions(
             argv=(
                 'nmcli', 'connection', 'add', 'type', 'ethernet',
                 'con-name', 'pistream-eth', 'ifname', interface,
+                'connection.autoconnect', 'yes',
                 'ipv4.method', 'manual', 'ipv4.addresses', cidr,
                 'ipv4.never-default', 'yes',
             ),
-            description=f'Create ethernet profile pistream-eth on {interface}',
         ))
         chosen = 'pistream-eth'
     else:
         actions.append(RunAction(
             argv=(
                 'nmcli', 'connection', 'modify', chosen,
+                'connection.autoconnect', 'yes',
                 'ipv4.method', 'manual',
                 'ipv4.addresses', cidr,
                 'ipv4.gateway', '',
                 'ipv4.never-default', 'yes',
             ),
-            description=f'Set static {cidr} on {chosen} ({interface})',
         ))
     actions.append(RunAction(
         argv=('nmcli', 'connection', 'up', chosen),
-        description=f'Bring up {chosen}',
     ))
     return actions
 
@@ -214,11 +211,9 @@ def plan_networkd_actions(interface: str, address: str, prefix: int) -> list[Act
         WriteAction(
             path='/etc/systemd/network/10-pistream.network',
             content=render_networkd_file(interface, address, prefix),
-            description='Write systemd-networkd config',
         ),
         RunAction(
             argv=('systemctl', 'restart', 'systemd-networkd'),
-            description='Restart systemd-networkd',
         ),
     ]
 
@@ -320,15 +315,13 @@ def plan_service_actions(
                 script=script,
                 config_path=config_path,
             ),
-            description='Write pitracker.service',
         ),
-        RunAction(('systemctl', 'daemon-reload'), 'Reload systemd'),
+        RunAction(('systemctl', 'daemon-reload')),
     ]
     if enable:
         actions.append(
             RunAction(
                 ('systemctl', 'enable', '--now', 'pitracker'),
-                'Enable and start pitracker',
             )
         )
     return actions
@@ -339,10 +332,9 @@ def plan_udev_actions(username: str) -> list[Action]:
         WriteAction(
             path='/etc/udev/rules.d/99-ev3.rules',
             content=render_udev_rule(),
-            description='Install EV3 udev rule',
         ),
-        RunAction(('udevadm', 'control', '--reload-rules'), 'Reload udev rules'),
-        RunAction(('usermod', '-aG', 'plugdev,video', username), 'Add user to plugdev,video'),
+        RunAction(('udevadm', 'control', '--reload-rules')),
+        RunAction(('usermod', '-aG', 'plugdev,video', username)),
     ]
 
 
@@ -556,17 +548,11 @@ def cmd_install(
     role = _resolved_role(args, model_text)
     args.role = role
     if not getattr(args, 'skip_network', False):
-        rc = cmd_network(args, **kwargs)
-        if rc:
-            return rc
+        cmd_network(args, **kwargs)
     if role == 'tracker' and not getattr(args, 'skip_udev', False):
-        rc = cmd_udev(args, **kwargs)
-        if rc:
-            return rc
+        cmd_udev(args, **kwargs)
     if not getattr(args, 'skip_service', False):
-        rc = cmd_service(args, **kwargs)
-        if rc:
-            return rc
+        cmd_service(args, **kwargs)
     return 0
 
 

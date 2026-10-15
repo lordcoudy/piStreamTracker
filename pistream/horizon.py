@@ -44,11 +44,7 @@ def estimate_roll_deg(
     return float(sum(angles) / len(angles))
 
 
-def tilt_degrees(
-    keypoints: Optional[Sequence[Sequence[float]]], threshold: float
-) -> Optional[float]:
-    """Alias for estimate_roll_deg (kept for existing call sites and tests)."""
-    return estimate_roll_deg(keypoints, threshold)
+tilt_degrees = estimate_roll_deg
 
 
 def step_angle(

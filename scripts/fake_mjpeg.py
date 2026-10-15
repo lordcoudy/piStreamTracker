@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Minimal MJPEG test source (no picamera). GET /stream."""
 
-import io
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Condition

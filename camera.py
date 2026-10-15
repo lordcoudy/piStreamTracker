@@ -9,11 +9,10 @@ import io
 import json
 import logging
 import mimetypes
-import socketserver
 from datetime import datetime
 from http import server
 from pathlib import Path
-from threading import Condition, Lock
+from threading import BoundedSemaphore, Condition, Lock
 from urllib.parse import quote, unquote, urlsplit
 
 from picamera2 import Picamera2
@@ -23,7 +22,6 @@ from picamera2.outputs import FfmpegOutput, FileOutput
 from pistream.camera_auth import extract_bearer, token_ok
 from pistream.config import camera_bind_host, load_config
 from pistream.recordings import is_recording_file, list_recording_files, safe_recording_path
-from pistream.stream_limit import StreamLimiter
 
 # Configure logging
 logging.basicConfig(
@@ -57,7 +55,7 @@ def configure_camera(config_path: str) -> None:
     OUTPUT_DIR = Path(camera_cfg['recording_dir'])
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     CAMERA_TOKEN = camera_cfg.get('token') or ''
-    STREAM_LIMIT = StreamLimiter(max_clients=camera_cfg['max_stream_clients'])
+    STREAM_LIMIT = BoundedSemaphore(camera_cfg['max_stream_clients'])
     HTML_PAGE = render_html_page()
 
 
@@ -135,7 +133,7 @@ class CameraRecorder:
         self.recording = False
         self.current_file: str | None = None
 
-    def start(self, fps: int = 30, bitrate: int = 4_000_000) -> str:
+    def start(self, bitrate: int = 4_000_000) -> str:
         """Start H.264 recording.  Returns the filename."""
         with self._lock:
             if self.recording:
@@ -177,6 +175,8 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = unquote(urlsplit(self.path).path)
+        if path.startswith('/record/') and not self._authorized():
+            return
         if path == '/':
             self.send_response(301)
             self.send_header('Location', '/index.html')
@@ -191,7 +191,7 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.wfile.write(content)
 
         elif path == '/stream':
-            if not STREAM_LIMIT.acquire():
+            if not STREAM_LIMIT.acquire(blocking=False):
                 logger.warning('Stream client cap reached')
                 self.send_error(503, 'Too many stream clients')
                 return
@@ -227,8 +227,6 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                 STREAM_LIMIT.release()
 
         elif path == '/record/list':
-            if not self._authorized():
-                return
             active_name = None
             if self.recorder and self.recorder.recording and self.recorder.current_file:
                 active_name = Path(self.recorder.current_file).name
@@ -239,21 +237,15 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self._json_response({'files': files})
 
         elif path == '/record/status':
-            if not self._authorized():
-                return
             self._json_response({
                 'recording': self.recorder.recording if self.recorder else False,
                 'file': self.recorder.current_file if self.recorder else None,
             })
 
         elif path.startswith('/record/files/'):
-            if not self._authorized():
-                return
             self._send_recording(path.removeprefix('/record/files/'))
 
         elif path.startswith('/record/'):
-            if not self._authorized():
-                return
             self._json_response({'error': 'not found'}, 404)
 
         else:
@@ -386,17 +378,13 @@ def camera_busy_hint(ip: str, port: int) -> str:
     )
 
 
-class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
+class StreamingServer(server.ThreadingHTTPServer):
     """Threaded HTTP server with tuning for low-latency streaming."""
-    allow_reuse_address = True
-    daemon_threads = True
     request_queue_size = 8
-    timeout = 10
 
     def server_bind(self):
         """Override to set socket options for streaming performance."""
         import socket
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         super().server_bind()
 

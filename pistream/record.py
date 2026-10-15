@@ -87,8 +87,6 @@ class _RecordingThread:
         self._thread: Optional[Thread] = None
         self._proc: Optional[subprocess.Popen] = None
         self._cv_writer: Optional[cv2.VideoWriter] = None
-        self._width = width
-        self._height = height
         self._stderr_lines: list[str] = []
         self._stderr_thread: Optional[Thread] = None
         self.output_path = path

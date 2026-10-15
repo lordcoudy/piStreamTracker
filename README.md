@@ -69,12 +69,19 @@ For a custom configuration, pass `--config "/absolute/path/site config.yaml"` to
 the installer. Generated services pass that resolved path to either `camera.py`
 or `web.py`; relative output directories still use the checkout as their base.
 
-Re-apply ethernet later without wrapping the whole script in sudo:
+Configure persistent Ethernet once, or repair it later, from the project directory
+on each Pi without wrapping the whole script in sudo:
 
 ```bash
 ./run_cam.sh --configure-network      # 192.168.100.1 from config.yaml
 ./run_tracker.sh --configure-network  # 192.168.100.2 from config.yaml
 ```
+
+These commands save the static address in the network backend's configuration;
+with NetworkManager they also enable automatic connection at boot and when the
+Ethernet cable is plugged in. A manual `ip address replace ...` / `ip link set ...`
+only changes the running system and is lost at reboot. After rebooting each Pi,
+check `ip -4 address show dev eth0` for its address above.
 
 The installer sudoes only `nmcli` / networkd / systemd / udev. Do not run Python as root.
 

@@ -7,14 +7,9 @@ from typing import Union
 
 
 def load_json_object(raw: Union[bytes, str]) -> dict:
-    if isinstance(raw, bytes):
-        try:
-            raw = raw.decode('utf-8')
-        except UnicodeDecodeError as exc:
-            raise ValueError('response is not valid JSON') from exc
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        data = json.loads(raw.decode('utf-8') if isinstance(raw, bytes) else raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError('response is not valid JSON') from exc
     if not isinstance(data, dict):
         raise ValueError('response is not a JSON object')

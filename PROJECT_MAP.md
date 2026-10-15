@@ -1,7 +1,7 @@
 # piStreamTracker project map
 
 Agent orientation, updated for the recording, recovery, geometry and setup fixes
-on 2026-10-09 (base commit `1da684e`). This is a
+on 2026-10-09 (base commit `1da684e`) and simplification on 2026-10-11. This is a
 navigation aid, not a specification. Source code and tests determine current
 behavior; recheck the relevant section before changing it.
 
@@ -41,7 +41,7 @@ use the source and this map for current ownership.
 | Motors | [motors.py](pistream/motors.py), [motors_math.py](pistream/motors_math.py), [ev3_usb.py](pistream/ev3_usb.py) | USB command serialization, deadzones, speed, home/manual holds; pure axis math; ev3-dc wrapper |
 | Recording | [record.py](pistream/record.py), [recordings.py](pistream/recordings.py) | Timed local writer, encoder probing/fallback, file listing/path confinement, remote file operations |
 | Preview geometry | [preview.py](pistream/preview.py), [horizon.py](pistream/horizon.py) | New-frame/rate gates, resize/FPS caps, pose roll estimation, smoothing, rotate/crop |
-| HTTP helpers | [camera_auth.py](pistream/camera_auth.py), [stream_limit.py](pistream/stream_limit.py), [jsonutil.py](pistream/jsonutil.py) | Bearer token checks, camera stream slots, defensive JSON-object parsing |
+| HTTP helpers | [camera_auth.py](pistream/camera_auth.py), [jsonutil.py](pistream/jsonutil.py) | Bearer token checks, defensive JSON-object parsing; camera stream slots use `threading.BoundedSemaphore` in `camera.py` |
 | Configuration | [config.yaml](config.yaml), [config.py](pistream/config.py) | User settings, built-in defaults, validation, preset/CLI merge, host selection and logging |
 | Installation | [setup.sh](setup.sh), [install.py](pistream/install.py) | apt/venv/pip bootstrap; planned network, systemd and udev operations |
 | Launch wrappers | [run_cam.sh](run_cam.sh), [run_tracker.sh](run_tracker.sh) | Checkout working directory, venv selection, role/preset flags, active-service checks |
@@ -49,7 +49,9 @@ use the source and this map for current ownership.
 | Development source | [fake_mjpeg.py](scripts/fake_mjpeg.py) | Synthetic local MJPEG stream; text frames exercise plumbing, not human detection |
 
 Root [ev3_usb.py](ev3_usb.py) is a compatibility shim. The implementation is in
-the package. Packaging and dependency constraints live in [pyproject.toml](pyproject.toml).
+the package and covers finite-degree motors, encoder positions and LED status.
+Packaging and dependency constraints live in [pyproject.toml](pyproject.toml);
+[requirements.txt](requirements.txt) delegates to it with `-e .` (run pip from the checkout).
 
 ## Tracking and concurrency
 
@@ -131,6 +133,8 @@ an OpenCV writer is never released while its worker is writing.
 
 - Camera: `/stream`; `/record/start`, `/record/stop`, `/record/status`,
   `/record/list`, and `/record/files/<filename>`.
+  The server extends `http.server.ThreadingHTTPServer`; stream slots are acquired
+  without blocking and released when each client disconnects.
 - Tracker: `/`, `/video_feed`; `/api/status`, `/api/config`; start/stop/reset,
   record/screenshot, EV3/manual movement, zoom/settings, and recordings routes.
   Definitions are grouped in `pistream/web_app.py`.
@@ -153,6 +157,8 @@ named preset → explicit CLI flags. `PISTREAM_CAMERA_TOKEN` overrides the YAML
 token. `load_config()` validates startup settings; a missing YAML file uses
 built-in defaults. Most web settings mutate the current tracker only. Overlay
 also changes in-memory web config; UI controls do not write `config.yaml`.
+Web mode is selected by `web.py` or `run_tracker.sh --web`; the unused
+`web.enabled` default and YAML entry have been removed.
 
 Paths to remember: camera `recording_dir`, tracker `output_dir`, optional log
 file, and the downloaded `models/movenet_lightning.tflite`. Relative output,
@@ -164,7 +170,10 @@ Recordings, model cache, logs and virtual environments are gitignored.
 Deployment uses a source checkout and Python >=3.11. `setup.sh` bootstraps
 role-specific dependencies and a system-site-packages venv. Camera libraries
 come from apt. The installer prefers NetworkManager, sets Ethernet static IPs
-with `ipv4.never-default`, and supports networkd fallback. Each device uses
+with `ipv4.never-default` and explicitly enables profile autoconnect, and supports
+networkd fallback. Existing installs can save or repair the Ethernet settings with
+`./run_cam.sh --configure-network` or `./run_tracker.sh --configure-network`;
+manual `ip address` / `ip link` changes do not persist across reboots. Each device uses
 `pitracker.service`: `camera.py` on the camera, `web.py` on the tracker, running
 as a normal user. Tracker udev rules grant EV3 USB access.
 
@@ -204,7 +213,7 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 | CLI controls and camera recovery | [test_tracker_cli.py](tests/test_tracker_cli.py), [test_recording_integration.py](tests/test_recording_integration.py) |
 | Interpreter fallback | [test_detector_runtime.py](tests/test_detector_runtime.py) |
 | Artifact paths and remote files | [test_recordings.py](tests/test_recordings.py), [test_web_routes.py](tests/test_web_routes.py) |
-| Camera API/auth/client slots | [test_camera_server.py](tests/test_camera_server.py), [test_camera_auth.py](tests/test_camera_auth.py), [test_stream_limit.py](tests/test_stream_limit.py) |
+| Camera API/auth/client slots | [test_camera_server.py](tests/test_camera_server.py), [test_camera_auth.py](tests/test_camera_auth.py) |
 | UI/package layout and API errors/validation | [test_package.py](tests/test_package.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Network/service/udev planning | [test_install.py](tests/test_install.py) |
 | Mocked browser recovery and mobile layout | [browser_ui.cjs](tests/browser_ui.cjs), [web_ui_fixture.py](tests/web_ui_fixture.py) |

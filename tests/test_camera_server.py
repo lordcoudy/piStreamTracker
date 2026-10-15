@@ -8,6 +8,7 @@ import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import BoundedSemaphore, Condition
 from unittest.mock import Mock, patch
 
 
@@ -51,6 +52,7 @@ class CameraServerTests(unittest.TestCase):
 
     def handler(self):
         handler = self.camera.StreamingHandler.__new__(self.camera.StreamingHandler)
+        handler.client_address = ('127.0.0.1', 12345)
         handler.wfile = io.BytesIO()
         handler.send_response = lambda _status: None
         handler.send_header = lambda _name, _value: None
@@ -102,7 +104,11 @@ class CameraServerTests(unittest.TestCase):
                 camera.main(['--config', str(config_path)])
             self.assertTrue(output_dir.is_dir())
             self.assertEqual(camera.OUTPUT_DIR, output_dir)
-            self.assertEqual(camera.STREAM_LIMIT.max_clients, 2)
+            self.assertTrue(camera.STREAM_LIMIT.acquire(blocking=False))
+            self.assertTrue(camera.STREAM_LIMIT.acquire(blocking=False))
+            self.assertFalse(camera.STREAM_LIMIT.acquire(blocking=False))
+            camera.STREAM_LIMIT.release()
+            camera.STREAM_LIMIT.release()
             self.assertEqual(camera.CAMERA_TOKEN, 'custom-secret')
             self.assertIn('640 x 360', camera.HTML_PAGE)
             self.assertIn('http://10.10.0.1:8123/stream', camera.HTML_PAGE)
@@ -117,6 +123,41 @@ class CameraServerTests(unittest.TestCase):
         output = self.camera.StreamingOutput()
         self.assertEqual(output.write(b'jpeg'), 4)
         self.assertEqual(output.frame, b'jpeg')
+
+    def test_stream_client_cap_rejects_without_waiting_or_releasing_a_slot(self):
+        handler = self.handler()
+        handler.path = '/stream'
+        handler.send_error = Mock()
+        limiter = Mock()
+        limiter.acquire.return_value = False
+        with patch.object(self.camera, 'STREAM_LIMIT', limiter):
+            handler.do_GET()
+        limiter.acquire.assert_called_once_with(blocking=False)
+        limiter.release.assert_not_called()
+        handler.send_error.assert_called_once_with(503, 'Too many stream clients')
+
+    def test_stream_disconnect_releases_its_slot(self):
+        handler = self.handler()
+        handler.path = '/stream'
+        handler.wfile = Mock()
+        handler.wfile.write.side_effect = BrokenPipeError
+        handler.output = types.SimpleNamespace(condition=Condition(), frame=b'jpeg')
+        limiter = BoundedSemaphore(1)
+        with patch.object(self.camera, 'STREAM_LIMIT', limiter), \
+                patch.object(handler.output.condition, 'wait', return_value=True):
+            handler.do_GET()
+        self.assertTrue(limiter.acquire(blocking=False))
+        self.assertFalse(limiter.acquire(blocking=False))
+
+    def test_every_record_get_path_requires_the_camera_token(self):
+        for path in ('/record/list', '/record/status', '/record/files/clip.mp4', '/record/nope'):
+            with self.subTest(path=path):
+                handler = self.handler()
+                handler.path = path
+                handler.headers = {}
+                with patch.object(self.camera, 'CAMERA_TOKEN', 'secret'):
+                    handler.do_GET()
+                self.assertEqual(handler.wfile.getvalue(), b'{"error": "unauthorized"}')
 
     def test_recording_download_is_limited_to_stat_size(self):
         with TemporaryDirectory() as tmp:
