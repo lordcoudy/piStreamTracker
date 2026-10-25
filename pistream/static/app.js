@@ -4,6 +4,7 @@
         let recordingStopPending = false;
         let controlRequestPending = false;
         let lastWarning = null;
+        let motorBackend = 'ev3';
 
         function log(message, type = 'info') {
             const logEl = document.getElementById('log-output');
@@ -161,12 +162,44 @@
 
         async function toggleEV3() {
             const enabled = document.getElementById('ev3-toggle').checked;
-            const res = await api('ev3', 'POST', { enabled });
+            const res = await api(motorBackend === 'ev3' ? 'ev3' : 'motors', 'POST', { enabled });
             if (res && res.status === 'ok') {
-                log('EV3 ' + (enabled ? 'connected' : 'disconnected'), 'success');
+                log('Motors ' + (enabled ? 'connected' : 'disconnected'), 'success');
             } else {
                 document.getElementById('ev3-toggle').checked = !enabled;
-                if (res) log('EV3 update failed: ' + (res.message || 'unknown error'), 'error');
+                if (res) log('Motor update failed: ' + (res.message || 'unknown error'), 'error');
+            }
+            await updateStatus();
+        }
+
+        function showMotorStatus(motors) {
+            if (!motors) return;
+            motorBackend = motors.backend || motorBackend;
+            const servo = motorBackend === 'gpio_servo';
+            const name = servo ? 'GPIO servos' : motorBackend === 'none' ? 'No motors' : 'EV3';
+            document.getElementById('motor-label').textContent = name;
+            document.getElementById('motor-panel-title').textContent = name + ' Control';
+            document.getElementById('status-ev3').className = 'dot ' + (motors.connected ? 'green' : 'red');
+            document.getElementById('ev3-toggle').checked = Boolean(motors.connected);
+            document.getElementById('ev3-toggle').disabled = !isTracking || motorBackend === 'none';
+            document.getElementById('motor-connection').textContent = motors.connected ? 'Connected' : 'Disconnected';
+            document.getElementById('ev3-settings').hidden = motorBackend !== 'ev3';
+            document.getElementById('servo-status').hidden = !servo;
+            const error = document.getElementById('motor-error');
+            error.textContent = motors.error || '';
+            error.hidden = !motors.error;
+            if (servo) {
+                document.getElementById('servo-calibration').textContent = motors.calibrated
+                    ? 'Calibrated · ' + (motors.mode || 'idle')
+                    : 'Calibration required: automatic motion disabled. Use the calibration utility before tracking.';
+                for (const axis of ['pan', 'tilt']) {
+                    const state = motors[axis] || {};
+                    const degrees = value => typeof value === 'number' ? value.toFixed(1) + '°' : '—';
+                    document.getElementById('servo-' + axis).textContent =
+                        axis[0].toUpperCase() + axis.slice(1) + ': commanded ' + degrees(state.commanded_angle) +
+                        ', target ' + degrees(state.target_angle) +
+                        '; limits ' + degrees(state.min_angle) + ' … ' + degrees(state.max_angle);
+                }
             }
         }
 
@@ -217,8 +250,7 @@
             } else {
                 trackingDot.className = 'dot ' + (isTracking ? 'green' : 'red');
             }
-            document.getElementById('status-ev3').className = 'dot ' + (res.ev3_connected ? 'green' : 'red');
-            document.getElementById('ev3-toggle').checked = res.ev3_connected;
+            showMotorStatus(res.motors || { backend: motorBackend, connected: res.ev3_connected });
             document.getElementById('info-fps').textContent = res.fps.toFixed(1);
             document.getElementById('info-detection').textContent = res.detected ? 'Yes' : 'No';
             if (res.shift_x !== null) {
@@ -349,6 +381,14 @@
             }
             if (res.overlay !== undefined) {
                 document.getElementById('overlay-toggle').checked = res.overlay;
+            }
+            if (res.motors) {
+                showMotorStatus(res.motors);
+                if (res.motors.backend === 'gpio_servo') {
+                    document.getElementById('step-slider').value = 2;
+                    document.getElementById('step-value').textContent = '2';
+                    document.querySelector('.dpad-center').textContent = '2°';
+                }
             }
         }
 

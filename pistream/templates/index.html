@@ -17,7 +17,7 @@
                 </div>
                 <div class="status-item">
                     <span class="dot" id="status-ev3"></span>
-                    <span>EV3</span>
+                    <span id="motor-label">EV3</span>
                 </div>
                 <div class="status-item">
                     <span class="dot" id="status-recording"></span>
@@ -38,7 +38,7 @@
                     <div class="btn-group">
                         <button id="btn-start" class="success" onclick="startTracking()">Start</button>
                         <button id="btn-stop" class="danger" onclick="stopTracking()" disabled>Stop</button>
-                        <button id="btn-reset" class="secondary" onclick="resetDetection()">Reset</button>
+                        <button id="btn-reset" class="secondary" onclick="resetDetection()">Home / Reset</button>
                     </div>
                     <div id="recording-warning" class="recording-warning" role="status" hidden></div>
                 </div>
@@ -52,12 +52,15 @@
                 </div>
 
                 <div class="panel">
-                    <h3>EV3 Motor Control</h3>
+                    <h3 id="motor-panel-title">EV3 Motor Control</h3>
                     <label class="toggle-switch">
                         <span>Motors Enabled</span>
                         <input type="checkbox" id="ev3-toggle" onchange="toggleEV3()">
                         <span class="slider"></span>
                     </label>
+                    <div id="motor-connection" class="motor-note" role="status">Disconnected</div>
+                    <div id="motor-error" class="recording-warning" role="status" hidden></div>
+                    <div id="ev3-settings">
                     <div class="slider-group">
                         <label>
                             <span>Speed Factor</span>
@@ -73,6 +76,13 @@
                         </label>
                         <input type="range" id="deadzone-slider" min="20" max="200" step="10" value="90"
                                onchange="updateSetting('ev3_deadzone', this.value)">
+                    </div>
+                    </div>
+                    <div id="servo-status" class="motor-note" hidden>
+                        <p id="servo-calibration"></p>
+                        <p id="servo-pan"></p>
+                        <p id="servo-tilt"></p>
+                        <p>Angles are commands, without position feedback.</p>
                     </div>
                 </div>
 

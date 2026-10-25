@@ -689,3 +689,106 @@ class WebInputValidationTests(unittest.TestCase):
         self.assertIsInstance(payload['shift_x'], int)
         self.assertIsInstance(payload['shift_y'], int)
         self.assertIsInstance(payload['fps'], float)
+
+
+class WebMotorBackendTests(unittest.TestCase):
+    def tracker(self, connected=True, error=None):
+        state = {
+            'backend': 'gpio_servo', 'connected': connected, 'error': error,
+            'calibrated': False, 'pulse_enabled': False, 'mode': 'idle',
+            'pan': {'commanded_angle': 2.0, 'target_angle': 4.0,
+                    'min_angle': -30.0, 'max_angle': 30.0, 'home': 0.0},
+            'tilt': {'commanded_angle': -1.0, 'target_angle': 0.0,
+                     'min_angle': -15.0, 'max_angle': 15.0, 'home': 0.0},
+        }
+        return SimpleNamespace(
+            running=True, capture=SimpleNamespace(stream_lost=False),
+            recording=False, fps=0.0, current_detection=None,
+            zoom_level=1.0, horizon_correction=False, motor_backend='gpio_servo',
+            motors=SimpleNamespace(
+                connected=connected, status=lambda: state,
+                connect=Mock(return_value=connected), disconnect=Mock(), manual_move=Mock(),
+            ),
+        )
+
+    def test_gpio_status_distinguishes_commanded_target_and_limits(self):
+        from pistream import web_app
+
+        tracker = self.tracker(error='pigpiod disconnected')
+        with patch.object(web_app, '_lifecycle', SimpleNamespace(tracker=tracker)):
+            response = web_app.app.test_client().get('/api/status')
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload['ev3_connected'])
+        self.assertTrue(payload['motor_connected'])
+        self.assertEqual(payload['motor_backend'], 'gpio_servo')
+        self.assertEqual(payload['motor_error'], 'pigpiod disconnected')
+        self.assertEqual(payload['motors']['pan']['commanded_angle'], 2.0)
+        self.assertEqual(payload['motors']['pan']['target_angle'], 4.0)
+        self.assertEqual(payload['motors']['tilt']['min_angle'], -15.0)
+        self.assertFalse(payload['motors']['calibrated'])
+
+    def test_legacy_ev3_route_does_not_toggle_gpio_controller(self):
+        from pistream import web_app
+
+        tracker = self.tracker()
+        with patch.object(web_app, '_lifecycle', SimpleNamespace(tracker=tracker)):
+            response = web_app.app.test_client().post('/api/ev3', json={'enabled': False})
+        self.assertEqual(response.status_code, 409)
+        tracker.motors.disconnect.assert_not_called()
+
+    def test_generic_motor_route_disables_selected_controller(self):
+        from pistream import web_app
+
+        tracker = self.tracker()
+        with patch.object(web_app, '_lifecycle', SimpleNamespace(tracker=tracker)):
+            response = web_app.app.test_client().post('/api/motors', json={'enabled': False})
+        self.assertEqual(response.status_code, 200)
+        tracker.motors.disconnect.assert_called_once_with()
+
+    def test_pwm_daemon_error_is_returned_without_ev3_fallback(self):
+        from pistream import web_app
+
+        tracker = self.tracker(connected=False, error='Cannot connect to pigpiod at localhost')
+        with patch.object(web_app, '_lifecycle', SimpleNamespace(tracker=tracker)):
+            response = web_app.app.test_client().post('/api/motors', json={'enabled': True})
+        self.assertEqual(response.status_code, 503)
+        self.assertIn('pigpiod', response.get_json()['message'])
+
+    def test_ev3_settings_do_not_modify_gpio_servo(self):
+        from pistream import web_app
+
+        tracker = self.tracker()
+        with patch.object(web_app, '_lifecycle', SimpleNamespace(tracker=tracker)):
+            response = web_app.app.test_client().post('/api/settings', json={'ev3_speed': 1.5})
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(hasattr(tracker.motors, 'speed_factor'))
+
+    def test_manual_gpio_commands_use_shared_controller_path(self):
+        from pistream import web_app
+
+        tracker = self.tracker()
+        with patch.object(web_app, '_lifecycle', SimpleNamespace(tracker=tracker)):
+            response = web_app.app.test_client().post(
+                '/api/motor_move', json={'direction': 'up', 'degrees': 2}
+            )
+        self.assertEqual(response.status_code, 200)
+        tracker.motors.manual_move.assert_called_once_with(pan_degrees=0, tilt_degrees=-2)
+
+
+class WebProcessCleanupTests(unittest.TestCase):
+    def test_app_exit_stops_controller_owner_and_restores_signal_handlers(self):
+        import signal
+        from pistream import web_app
+
+        previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        lifecycle = SimpleNamespace(stop=Mock())
+        with (
+            patch.object(web_app, 'TrackerLifecycle', return_value=lifecycle),
+            patch.object(web_app.app, 'run', side_effect=SystemExit(143)),
+        ):
+            with self.assertRaises(SystemExit):
+                web_app.run_web({})
+        lifecycle.stop.assert_called_once_with()
+        for sig, handler in previous.items():
+            self.assertIs(signal.getsignal(sig), handler)

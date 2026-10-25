@@ -110,8 +110,54 @@ async function main() {
         await healthyPage.goto(baseUrl);
         await healthyPage.waitForFunction(() => !document.getElementById('btn-record').disabled);
         assert(await healthyPage.locator('#recording-warning').isHidden());
+
+        const servoPage = await browser.newPage({ viewport: { width: 390, height: 844 } });
+        servoPage.on('pageerror', error => errors.push(error.message));
+        const motors = {
+            backend: 'gpio_servo', connected: true, calibrated: false, mode: 'idle',
+            error: 'pigpiod connection interrupted',
+            pan: { commanded_angle: 2, target_angle: 4, min_angle: -30, max_angle: 30 },
+            tilt: { commanded_angle: -1, target_angle: 0, min_angle: -15, max_angle: 15 },
+        };
+        await servoPage.route('**/api/config', route => route.fulfill({ json: {
+            width: 640, height: 480, motors,
+        } }));
+        await servoPage.route('**/api/status', route => route.fulfill({ json: {
+            running: true, recording: false, fps: 10, shift_x: null, shift_y: null,
+            stopping: false, recording_stop_pending: false, warning: null, motors,
+        } }));
+        await servoPage.goto(baseUrl);
+        await servoPage.waitForFunction(() => document.getElementById('motor-label').textContent === 'GPIO servos');
+        assert(await servoPage.locator('#ev3-settings').isHidden());
+        assert(await servoPage.locator('#servo-status').isVisible());
+        assert.match(await servoPage.locator('#servo-pan').textContent(), /commanded 2.0°.*target 4.0°.*limits -30.0° … 30.0°/);
+        assert.match(await servoPage.locator('#servo-calibration').textContent(), /automatic motion disabled/);
+        assert.match(await servoPage.locator('#motor-error').textContent(), /pigpiod/);
+        assert.equal(await servoPage.locator('#step-slider').inputValue(), '2');
+        const manualRequest = servoPage.waitForRequest(request => request.url().endsWith('/api/motor_move'));
+        await servoPage.route('**/api/motor_move', route => route.fulfill({ json: { status: 'ok' } }));
+        await servoPage.getByTitle('Pan Right', { exact: true }).click();
+        assert.deepEqual((await manualRequest).postDataJSON(), { direction: 'right', degrees: 2 });
+
+        // A stopped session may still need operator action when daemon failure
+        // prevents confirmation that the last PWM command was disabled.
+        const stoppedMotors = {
+            ...motors, connected: false, pulse_enabled: null,
+            error: 'Unable to disable PWM: pigpiod connection lost',
+        };
+        await servoPage.route('**/api/status', route => route.fulfill({ json: {
+            running: false, recording: false, fps: 0, shift_x: null, shift_y: null,
+            stopping: false, recording_stop_pending: false, warning: null,
+            motors: stoppedMotors,
+        } }));
+        await servoPage.evaluate(() => updateStatus());
+        assert(await servoPage.locator('#motor-error').isVisible());
+        assert.match(await servoPage.locator('#motor-error').textContent(), /Unable to disable PWM/);
+        assert.equal(await servoPage.locator('#motor-connection').textContent(), 'Disconnected');
+        assert(await servoPage.locator('#ev3-toggle').isDisabled());
+        assert(await servoPage.locator('#btn-start').isEnabled());
         assert.deepEqual(errors, []);
-        console.log('Browser UI checks passed: explicit retry, warning deduplication, healthy/running recording, in-flight and cleanup controls, 390/900/1200px layout.');
+        console.log('Browser UI checks passed: recovery, recording, cleanup controls, GPIO status/calibration/errors/manual movement, 390/900/1200px layout.');
     } finally {
         await browser.close();
     }
