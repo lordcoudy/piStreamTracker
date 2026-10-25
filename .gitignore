@@ -24,8 +24,10 @@ models/*.tflite
 
 # Temporary files
 .DS_Store
+.standalone.lock
 
 # Recordings
 recordings/
+camera-recordings/
 
 models/

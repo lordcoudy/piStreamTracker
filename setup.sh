@@ -5,6 +5,7 @@
 # Usage:
 #   ./setup.sh --camera
 #   ./setup.sh --tracker
+#   ./setup.sh --standalone --config config.pi4.yaml
 #   ./setup.sh --camera --skip-network
 #   ./setup.sh --tracker --dry-run
 #   ./setup.sh status
@@ -41,11 +42,12 @@ Usage: ./setup.sh [OPTIONS] [COMMAND] [ARGS...]
 Roles:
   --camera     Pi 3B+ camera server (192.168.100.1 from config.yaml)
   --tracker    Pi 5 tracker + EV3 (192.168.100.2 from config.yaml)
+  --standalone Pi 4 camera + GPIO servos + web UI (preserves existing networking)
 
 Commands (default: install):
   install      Full automatic: network + udev (tracker) + systemd enable --now
   network      Configure ethernet IPv4 via NetworkManager (or systemd-networkd)
-  service      Write / enable pitracker.service
+  service      Write / enable services (two distinct application units for standalone)
   udev         EV3 USB udev rule
   status       Show IPs, venv, udev, service
 
@@ -55,6 +57,7 @@ Flags (forwarded to python -m pistream.install):
 Examples:
   ./setup.sh --camera
   ./setup.sh --tracker
+  ./setup.sh --standalone --config config.pi4.yaml
   ./setup.sh --camera --skip-network
   ./setup.sh --tracker --dry-run
   ./setup.sh status
@@ -101,21 +104,31 @@ install_system_deps() {
         libfontconfig1-dev libcairo2-dev libgdk-pixbuf-2.0-dev \
         libpango1.0-dev libgtk-3-dev \
         python3-dev \
-        ffmpeg \
-        network-manager
-    if [[ "$role" == "camera" ]]; then
+        ffmpeg
+    if [[ "$role" != "standalone" ]]; then
+        sudo apt-get install -y -qq network-manager
+    fi
+    if [[ "$role" == "camera" || "$role" == "standalone" ]]; then
         sudo apt-get install -y -qq \
-            libcamera-apps \
             libcamera-dev \
             python3-libcamera \
-            python3-picamera2 || true
+            python3-picamera2
+    fi
+    if [[ "$role" == "standalone" ]]; then
+        sudo apt-get install -y -qq rpicam-apps pigpiod python3-pigpio
     fi
     print_step "System dependencies installed"
 }
 
 setup_venv() {
     print_step "Setting up Python virtual environment..."
-    if [[ ! -d "venv" ]]; then
+    if [[ ! -x "venv/bin/python" ]]; then
+        python3 -m venv --system-site-packages venv
+    elif ! venv/bin/python -c 'import sys; raise SystemExit(sys.prefix == sys.base_prefix)' ; then
+        print_error "venv/bin/python is not a virtual environment"
+        exit 1
+    else
+        # Existing isolated environments cannot see the apt camera bindings.
         python3 -m venv --system-site-packages venv
     fi
     print_step "Virtual environment ready"
@@ -132,18 +145,27 @@ install_python_deps() {
         pip install -q 'pyyaml>=6.0'
     else
         print_step "Installing Tracker Python deps..."
-        pip install -q -e .
+        if [[ "$role" == "standalone" ]]; then
+            pip install -q -e '.[standalone]'
+            python -c 'import picamera2, libcamera, cv2, numpy, pigpio; from tflite_runtime.interpreter import Interpreter; print("Camera, OpenCV, NumPy, TFLite and pigpio imports OK")'
+        else
+            pip install -q -e .
+        fi
     fi
 }
 
 download_model() {
-    print_step "Downloading MoveNet model..."
-    mkdir -p models
-    if [[ ! -f "models/movenet_lightning.tflite" ]]; then
-        wget -q -O models/movenet_lightning.tflite \
-            "https://storage.googleapis.com/tfhub-lite-models/google/lite-model/movenet/singlepose/lightning/tflite/float16/4.tflite" \
-            || print_warning "Model download failed - will auto-download on first run"
-    fi
+    print_step "Checking MoveNet runtime and model (downloads if absent)..."
+    # Reuse the runtime loader's cache validation, primary URL and fallbacks.
+    # Check the actual interpreter now so first Start does not need a download.
+    venv/bin/python - "$1" <<'PY'
+import sys
+from pistream.detect import PoseDetector
+
+detector = PoseDetector(threads=2 if sys.argv[1] == 'standalone' else None)
+if not detector.ready:
+    raise SystemExit('MoveNet initialization failed; check the runtime/model errors above and rerun setup.')
+PY
     print_step "Model ready"
 }
 
@@ -162,6 +184,7 @@ array_contains() {
 ROLE=""
 COMMAND=""
 DRY_RUN=0
+CONFIG_SET=0
 FORWARD=()
 
 if [[ $# -eq 0 ]]; then
@@ -177,6 +200,32 @@ while [[ $# -gt 0 ]]; do
             ;;
         --tracker)
             ROLE="tracker"
+            shift
+            ;;
+        --standalone)
+            ROLE="standalone"
+            shift
+            ;;
+        --role)
+            if [[ $# -lt 2 ]]; then
+                print_error "--role needs camera, tracker, standalone or auto"
+                exit 2
+            fi
+            ROLE="$2"
+            shift 2
+            ;;
+        --config)
+            if [[ $# -lt 2 ]]; then
+                print_error "--config needs a path"
+                exit 2
+            fi
+            CONFIG_SET=1
+            FORWARD+=("$1" "$2")
+            shift 2
+            ;;
+        --config=*)
+            CONFIG_SET=1
+            FORWARD+=("$1")
             shift
             ;;
         --help|-h)
@@ -231,30 +280,34 @@ pip_role="$ROLE"
 if [[ -z "$pip_role" || "$pip_role" == "auto" ]]; then
     if [[ "$pi_model" == "pi3" ]]; then
         pip_role="camera"
+    elif [[ "$pi_model" == "pi4" ]]; then
+        pip_role="standalone"
     else
         pip_role="tracker"
     fi
 fi
 
-if check_platform; then
-    if [[ "$DRY_RUN" -eq 1 ]]; then
-        print_warning "Dry-run: skipping apt-get"
-    else
+if [[ "$pip_role" == "standalone" && "$CONFIG_SET" -eq 0 ]]; then
+    FORWARD+=(--config "$SCRIPT_DIR/config.pi4.yaml")
+fi
+
+if [[ "$COMMAND" != "install" || "$DRY_RUN" -eq 1 ]]; then
+    # Inspection/planning must not create environments or install dependencies.
+    PY="$SCRIPT_DIR/venv/bin/python"
+    [[ -x "$PY" ]] || PY="$SCRIPT_DIR/.venv/bin/python"
+    [[ -x "$PY" ]] || PY=$(command -v python3)
+else
+    if check_platform; then
         install_system_deps "$pip_role"
     fi
-fi
-
-setup_venv
-if [[ "$DRY_RUN" -eq 1 ]]; then
-    print_warning "Dry-run: skipping pip install (venv must already import pistream)"
-else
+    setup_venv
     install_python_deps "$pip_role"
     if [[ "$pip_role" != "camera" ]]; then
-        download_model
+        download_model "$pip_role"
     fi
 fi
 
-PY="$SCRIPT_DIR/venv/bin/python"
+PY=${PY:-"$SCRIPT_DIR/venv/bin/python"}
 if [[ ! -x "$PY" ]]; then
     print_error "venv python missing"
     exit 1

@@ -12,6 +12,7 @@ from pistream.install import (
     RunAction,
     WriteAction,
     cmd_network,
+    cmd_install,
     cmd_service,
     cmd_status,
     detect_network_backend,
@@ -44,6 +45,10 @@ class DetectPiModelTests(unittest.TestCase):
 
 
 class ResolveRoleTests(unittest.TestCase):
+    def test_auto_pi4_is_standalone(self):
+        self.assertEqual(resolve_role('auto', 'pi4'), 'standalone')
+        self.assertEqual(resolve_role('standalone', 'unknown'), 'standalone')
+
     def test_explicit_camera(self):
         self.assertEqual(resolve_role('camera', 'pi5'), 'camera')
 
@@ -238,6 +243,35 @@ class SshGuardTests(unittest.TestCase):
 
 
 class UnitFileTests(unittest.TestCase):
+    def test_standalone_services_share_config_and_order_camera_before_tracker(self):
+        actions = plan_service_actions(
+            role='standalone', user='pi', work_dir='/repo', python='/repo/venv/bin/python',
+            config_path='/configs/pi4.yaml', enable=True,
+        )
+        writes = {Path(a.path).name: a.content for a in actions if isinstance(a, WriteAction)}
+        self.assertEqual(set(writes), {
+            'pistream-camera.service', 'pistream-tracker.service', 'pigpiod.service',
+        })
+        for name, script in [('pistream-camera.service', 'camera.py'),
+                             ('pistream-tracker.service', 'web.py')]:
+            body = writes[name]
+            self.assertIn('User=pi', body)
+            self.assertIn(f'"/repo/{script}" "--config" "/configs/pi4.yaml"', body)
+            self.assertIn('Conflicts=pitracker.service', body)
+        self.assertIn('After=network-online.target pigpiod.service pistream-camera.service',
+                      writes['pistream-tracker.service'])
+        self.assertIn('Requires=pigpiod.service pistream-camera.service',
+                      writes['pistream-tracker.service'])
+        self.assertIn('ExecStart=/usr/bin/pigpiod -g -l -f', writes['pigpiod.service'])
+        runs = [a.argv for a in actions if isinstance(a, RunAction)]
+        self.assertIn(('systemctl', 'enable', '--now', 'pigpiod', 'pistream-camera',
+                       'pistream-tracker'), runs)
+
+    def test_standalone_apps_cannot_run_as_root(self):
+        with self.assertRaisesRegex(InstallError, 'ordinary user'):
+            plan_service_actions(role='standalone', user='root', work_dir='/repo',
+                                 python='/repo/venv/bin/python', enable=True)
+
     def test_service_preserves_custom_config_for_both_roles_with_spaces(self):
         with TemporaryDirectory() as tmp:
             root = (Path(tmp) / 'repo with spaces').resolve()
@@ -365,6 +399,33 @@ class InstallModuleTests(unittest.TestCase):
 
 
 class CmdNetworkTests(unittest.TestCase):
+    def test_standalone_network_preserves_current_settings(self):
+        out = StringIO()
+        args = parse_args(['network', '--role', 'standalone'])
+        def unexpected(*_args, **_kwargs):
+            self.fail('Standalone must not inspect or mutate network profiles')
+        self.assertEqual(cmd_network(args, platform='linux', stdout=out,
+                                     load_cfg=unexpected, is_active=unexpected, run=unexpected), 0)
+        self.assertIn('preserving', out.getvalue())
+
+    def test_standalone_install_skips_ev3_udev_and_network(self):
+        from unittest.mock import patch
+        args = parse_args(['install', '--role', 'standalone', '--skip-service'])
+        with patch('pistream.install.cmd_network') as network, \
+                patch('pistream.install.cmd_udev') as udev:
+            self.assertEqual(cmd_install(args), 0)
+        network.assert_not_called()
+        udev.assert_not_called()
+
+    def test_standalone_service_disables_existing_legacy_owner(self):
+        calls = []
+        args = parse_args(['service', '--role', 'standalone'])
+        cmd_service(args, platform='linux', user='pi', work_dir=Path('/repo'),
+                    python='/repo/venv/bin/python', legacy_service_exists=True,
+                    run=lambda argv, **_kwargs: calls.append(argv),
+                    write_file=lambda *_args: None, stdout=StringIO())
+        self.assertEqual(calls[0], ('sudo', 'systemctl', 'disable', '--now', 'pitracker'))
+
     def test_non_linux_skips(self):
         out = StringIO()
         args = parse_args(['--dry-run', 'network', '--role', 'camera'])
