@@ -1,15 +1,17 @@
 # piStreamTracker project map
 
-Agent orientation, updated for the recording, recovery, geometry and setup fixes
-on 2026-10-09 (base commit `1da684e`) and simplification on 2026-10-11. This is a
+Agent orientation, updated for standalone Pi 4 / SG90 support on 2026-10-25,
+following the recording/recovery fixes and simplification in October. This is a
 navigation aid, not a specification. Source code and tests determine current
 behavior; recheck the relevant section before changing it.
 
 ## System at a glance
 
-A lecturer-following camera system: a Pi 3B+ captures video, a Pi 5 tracks one
-person and controls an EV3 pan/tilt head. The tracker can run with an OpenCV
-window or a Flask web UI. Persistent artifacts are files; there is no database.
+A lecturer-following camera system with two deployment choices: Pi 3B+ camera
+and Pi 5 tracker with USB EV3, or one Pi 4 with OV5647 and two GPIO SG90 servos.
+In standalone, `camera.py` alone opens CSI and `web.py` consumes its local MJPEG
+at `127.0.0.1:8000`; the Flask UI binds to the LAN. Tracking can also run with an
+OpenCV window or without motors. Persistent artifacts are files; no database.
 
 ```mermaid
 flowchart LR
@@ -17,7 +19,8 @@ flowchart LR
     Capture --> Human["HumanTracker.process_frame"]
     Human -->|periodic inference| Detector["AsyncDetector / MoveNet"]
     Detector -->|bbox and pose| Human
-    Human -->|raw target offset| Motors["MotorController / USB EV3"]
+    Human -->|raw target offset| Motors["motion.py: EV3 / GPIO servos / none"]
+    Motors --> GPIO["servo.py / localhost pigpiod / SG90"]
     Human --> Preview["Annotated preview / web UI"]
     Human -->|clean leveled frame| Local["Local recording / ffmpeg or MJPG"]
     Human -->|recording HTTP controls| Camera
@@ -39,12 +42,14 @@ use the source and this map for current ownership.
 | Capture | [capture.py](pistream/capture.py) | Latest-frame buffer, OpenCV backends, automatic stream reconnect |
 | Detection | [detect.py](pistream/detect.py) | MoveNet model acquisition/interpreter, pose parsing, asynchronous inference |
 | Motors | [motors.py](pistream/motors.py), [motors_math.py](pistream/motors_math.py), [ev3_usb.py](pistream/ev3_usb.py) | USB command serialization, deadzones, speed, home/manual holds; pure axis math; ev3-dc wrapper |
+| Controller selection | [motion.py](pistream/motion.py), [servo.py](pistream/servo.py) | Pan/tilt protocol and factory, no-motor backend, local pigpio position commands and frame watchdog |
+| SG90 commissioning | [calibrate.py](pistream/calibrate.py), [config.pi4.yaml](config.pi4.yaml) | Interactive manual/Home tests, independent pulse calibration and mechanical limits, atomic YAML save and calibration gate |
 | Recording | [record.py](pistream/record.py), [recordings.py](pistream/recordings.py) | Timed local writer, encoder probing/fallback, file listing/path confinement, remote file operations |
 | Preview geometry | [preview.py](pistream/preview.py), [horizon.py](pistream/horizon.py) | New-frame/rate gates, resize/FPS caps, pose roll estimation, smoothing, rotate/crop |
 | HTTP helpers | [camera_auth.py](pistream/camera_auth.py), [jsonutil.py](pistream/jsonutil.py) | Bearer token checks, defensive JSON-object parsing; camera stream slots use `threading.BoundedSemaphore` in `camera.py` |
 | Configuration | [config.yaml](config.yaml), [config.py](pistream/config.py) | User settings, built-in defaults, validation, preset/CLI merge, host selection and logging |
 | Installation | [setup.sh](setup.sh), [install.py](pistream/install.py) | apt/venv/pip bootstrap; planned network, systemd and udev operations |
-| Launch wrappers | [run_cam.sh](run_cam.sh), [run_tracker.sh](run_tracker.sh) | Checkout working directory, venv selection, role/preset flags, active-service checks |
+| Launch wrappers | [run_cam.sh](run_cam.sh), [run_tracker.sh](run_tracker.sh), [run_standalone.sh](run_standalone.sh) | Checkout working directory, venv selection, active-service checks; standalone child ownership/signal cleanup |
 | Browser UI | [index.html](pistream/templates/index.html), [app.js](pistream/static/app.js), [style.css](pistream/static/style.css) | Jinja page, plain JavaScript controls/status polling, CSS; no frontend build step |
 | Development source | [fake_mjpeg.py](scripts/fake_mjpeg.py) | Synthetic local MJPEG stream; text frames exercise plumbing, not human detection |
 
@@ -72,22 +77,48 @@ a new negative result `(True, None)` from no new result `(False, None)`;
 only new negatives count toward `DETECTION_MISS_LIMIT` (currently three).
 
 - Capture continuously publishes one latest frame under a lock. Consumers use
-  `accept_new_frame()` to skip repeated frame objects and failed reads.
+  `read_sample()` / `HumanTracker.read_frame()` to keep its monotonic timestamp
+  and reconnect generation with the consumed frame. `accept_new_frame()` skips
+  repeated frame objects and failed reads.
 - `AsyncDetector` copies submitted frames, uses single pending/result slots,
-  and runs inference on a daemon worker. It does not queue every video frame.
+  and runs inference on a daemon worker. It rejects old results using submission
+  age (`tracker.detection.result_timeout`) and invalidates pending/inflight work
+  on Reset, reconnect, frame gaps and stop. Resize buffers follow actual frames.
 - The web tracker loop is another worker. Flask shares one `TrackerLifecycle`
   and one annotated frame/sequence per process. Lifecycle retains a live
   startup worker after timeout, preventing overlapping sessions, and performs
   cleanup in the worker's `finally`. It retains the tracker after incomplete local
-  writer closure or an unconfirmed camera stop, blocking replacement sessions.
+  writer closure, unfinished capture/detection workers or an unconfirmed camera
+  stop, blocking replacement sessions.
   Concurrent Stop requests serialize; only explicit Stop retries pending work.
 - Motor USB calls share an I/O lock; recording coordination uses an `RLock`.
   Local encoding and ffmpeg stderr draining have their own workers.
 
-Motor commands are relative finite-degree moves. A replacement command stops
+EV3 motor commands are relative finite-degree moves. A replacement command stops
 an existing move first. Home is the encoder position captured at connection.
 Home/manual holds suppress automatic updates and ordinary `stop()`;
 `disconnect()` stops directly.
+
+`motors.backend` selects `ev3`, `gpio_servo` or `none`; null preserves the old
+`ev3.enabled` selection. `--no-motors` wins over all backend flags; `--no-ev3`
+disables only a resolved EV3 backend. GPIO mode never opens EV3 USB. SG90 uses
+BCM18/pan and BCM19/tilt by default, with one worker and host GPIO file locks.
+All commands clamp working angles, map through independent calibration bounds
+and clamp pulse widths. The worker limits degrees/second with monotonic time and
+`max_dt`, holds the last issued command on target loss, and cancels automatic
+movement after `frame_timeout` even without frame processing. Manual/Home hold
+auto while moving and for the configured pause; Stop disconnects regardless of
+holds. `calibrated: false` blocks auto but permits commissioning commands.
+Status distinguishes target and last commanded degrees; SG90 has no feedback.
+Failed PWM-off is an error with unknown pulse state, retained in web status after
+Stop; use the recovery instructions in README before reconnecting.
+
+`request_stop()` disconnects motors before waiting for frame processing or
+detector/capture teardown. GPIO reconnect requests serialize with stop/cleanup
+through a separate control lock, so a stale HTTP request cannot reopen hardware.
+SIGTERM cleanup is installed in camera, web, tracker CLI and calibration entry
+points; the camera closes its listener, encoders and CSI device on partial startup
+failure as well as normal exit.
 
 ## Preview, recording, and HTTP boundaries
 
@@ -136,9 +167,12 @@ an OpenCV writer is never released while its worker is writing.
   The server extends `http.server.ThreadingHTTPServer`; stream slots are acquired
   without blocking and released when each client disconnects.
 - Tracker: `/`, `/video_feed`; `/api/status`, `/api/config`; start/stop/reset,
-  record/screenshot, EV3/manual movement, zoom/settings, and recordings routes.
+  record/screenshot, `/api/motors` connection toggle, manual movement, zoom/settings,
+  and recordings routes. `/api/ev3` remains specific to the EV3 backend.
   Definitions are grouped in `pistream/web_app.py`.
   Status adds `recording_error`, `recording_stop_pending`, `stopping` and `warning`.
+  `motors` includes backend, connection/error and SG90 calibration, command/target
+  angles and working limits. EV3 speed/deadzone settings are backend-specific.
   Unconfirmed shutdown reports `running: false`, conservative `recording: true`.
   Start returns 409 while shutdown is unresolved; Stop returns 202 during cleanup,
   503 for unconfirmed camera stop and 200 after confirmation.
@@ -159,6 +193,14 @@ built-in defaults. Most web settings mutate the current tracker only. Overlay
 also changes in-memory web config; UI controls do not write `config.yaml`.
 Web mode is selected by `web.py` or `run_tracker.sh --web`; the unused
 `web.enabled` default and YAML entry have been removed.
+`config.pi4.yaml` selects localhost camera endpoints, camera-side H.264 recording,
+separate `camera-recordings/` and tracker `recordings/` directories, 640×480 at
+15 camera FPS, 2 inference threads and 10 preview FPS. These are initial settings,
+not measured throughput. The built-in `pi4` performance preset also supplies
+camera/detection/preview settings; only the config file is shared by both processes.
+`camera_stream_url()` and `camera_base_url()` in `preview.py` share camera addressing
+for tracking, raw preview, recorder control and file operations. An explicit
+HTTP(S) tracker stream URL supplies the control/file origin too.
 
 Paths to remember: camera `recording_dir`, tracker `output_dir`, optional log
 file, and the downloaded `models/movenet_lightning.tflite`. Relative output,
@@ -177,16 +219,30 @@ manual `ip address` / `ip link` changes do not persist across reboots. Each devi
 `pitracker.service`: `camera.py` on the camera, `web.py` on the tracker, running
 as a normal user. Tracker udev rules grant EV3 USB access.
 
+Standalone skips network and EV3 udev changes. `setup.sh --standalone --config ...`
+installs the union of camera/tracker dependencies and pigpio, preloads MoveNet,
+and writes `pistream-camera.service`, `pistream-tracker.service`, plus a localhost-only
+`pigpiod.service`. Tracker Requires/After camera and pigpiod; both applications get
+the same absolute config and an ordinary user with video/render groups. An existing
+legacy `pitracker.service` is disabled/stopped to avoid a second camera owner.
+Pi 4 auto-selects standalone. `run_standalone.sh` owns two subprocesses with a
+checkout lock, service guards and bounded signal/child-failure cleanup. Reboots
+restore the three services; tracking starts explicitly from the web UI.
+
 Laptop setup uses `pip install -e ".[dev,desktop]"`. The optional extra selects
 `ai-edge-litert>=2.3,<2.4`, or `tensorflow>=2.16,<2.17` on Intel macOS. The base Pi
-TFLite Runtime dependency remains unchanged. Browser sidebar width uses a CSS
+TFLite Runtime is pinned to 2.14.0 (Bookworm Python 3.11 ARM wheels), NumPy stays
+below 2 and OpenCV below 4.10. Picamera2/libcamera come from apt and are visible via
+`--system-site-packages`; standalone setup checks imports before enabling services.
+Browser sidebar width uses a CSS
 variable; the mobile breakpoint controls its one-column layout.
 
 For inspection, read source or use unit tests. Importing `camera.py` requires
 Picamera2 but does not configure the server or create recording directories.
 `main()` parses `--config` before `configure_camera()` builds config-dependent
 directories, stream limits and page content. Constructing
-`HumanTracker` may create files, download the model and connect to EV3.
+`HumanTracker` may create files, download the model and connect the selected controller.
+`setup.sh status` and planning via `--dry-run` do not bootstrap apt/pip or create a venv.
 
 ## Verification and test navigation
 
@@ -207,6 +263,8 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 | Reconnect and frame identity | [test_capture_policy.py](tests/test_capture_policy.py), [test_frame_gate.py](tests/test_frame_gate.py) |
 | Async result semantics and tracker refresh/loss | [test_async_detector.py](tests/test_async_detector.py), [test_track_box.py](tests/test_track_box.py) |
 | Motor commands and holds | [test_motors.py](tests/test_motors.py) |
+| SG90 mapping, speed, holds/watchdog, ownership/errors and calibration | [test_servo.py](tests/test_servo.py), [test_calibrate.py](tests/test_calibrate.py) |
+| Controller selection, local URLs, stop and stale-work boundaries | [test_motion_integration.py](tests/test_motion_integration.py), [test_motion_safety_review.py](tests/test_motion_safety_review.py) |
 | Web session startup/stop/timeout/recovery | [test_lifecycle.py](tests/test_lifecycle.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Leveling, preview geometry and rate caps | [test_horizon.py](tests/test_horizon.py), [test_preview.py](tests/test_preview.py) |
 | Writer health, bounded encoder shutdown and ownership | [test_record_writer.py](tests/test_record_writer.py), [test_recording_backend.py](tests/test_recording_backend.py) |
@@ -216,38 +274,42 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 | Camera API/auth/client slots | [test_camera_server.py](tests/test_camera_server.py), [test_camera_auth.py](tests/test_camera_auth.py) |
 | UI/package layout and API errors/validation | [test_package.py](tests/test_package.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Network/service/udev planning | [test_install.py](tests/test_install.py) |
+| Standalone wrapper signals, services, children and setup dispatch | [test_standalone_launch.py](tests/test_standalone_launch.py) |
 | Mocked browser recovery and mobile layout | [browser_ui.cjs](tests/browser_ui.cjs), [web_ui_fixture.py](tests/web_ui_fixture.py) |
 
 Baseline on 2026-10-09: 172 tests passed; Ruff passed on Python 3.12.12.
 After these fixes, a fresh Python 3.12 desktop environment passed 231 tests and
 25 subtests; Ruff and Chromium checks at 390/900/1200px also passed.
+Standalone validation on 2026-10-25 uses Python 3.12.12 on the development Mac:
+314 tests and 35 subtests, Ruff, shell syntax and Chromium at 390/900/1200px.
+A synthetic localhost MJPEG smoke exercised real OpenCV capture, web Start/Stop,
+preview, screenshot and a readable local MJPG recording with detector/motors
+disabled. Bookworm/Python 3.11 ARM wheel availability was checked against primary
+package sources; installation and operation on Pi hardware remain unverified.
 [CI](.github/workflows/ci.yml) runs Ubuntu with Python 3.11/3.12, installing
 the declared `.[dev,desktop]` dependencies.
 Tests use mocked hardware and Flask's test client; they do not establish real
 Pi camera/EV3 behavior or MoveNet inference quality. Standalone browser checks
-cover mocked recovery and responsiveness. A fresh macOS ARM desktop install was
+cover mocked recovery, GPIO controls and responsiveness. A fresh macOS ARM desktop install was
 smoke-tested with LiteRT 2.3 and the cached MoveNet model (finite `(1,1,17,3)` output).
 
 ## Observed caveats to recheck when working nearby
 
 These are code observations at the revision above, not fixes made by this map.
 
-- **Detection/reset:** results have no frame age or reset generation. An older
-  result can initialize a tracker on a newer frame, including after reset.
-  Keypoints retain their inference coordinates while the tracked box moves.
-  See `AsyncDetector`, `process_frame()` and `reset_tracking()`.
+- **Pose overlays:** keypoints retain inference coordinates while the tracked
+  box moves; result age/generation are now checked, but poses are not reprojected
+  by the OpenCV box tracker.
 - **Startup:** model acquisition happens during `HumanTracker` construction.
   Download timeouts can exceed the web lifecycle's default startup deadline.
   See `PoseDetector._get_model()` and `TrackerLifecycle.start()`.
-- **Reconnect:** capture metadata and detector/motor dimensions are initialized
-  at connection and not refreshed after reconnect. Resolution changes need
-  explicit handling. See `VideoCapture.start()` and `_capture_loop()`.
-- **Raw preview URL:** `camera_stream_url()` builds from camera IP/port and
-  does not use the tracker's custom `stream_url`. See `preview.py` and
-  `web_app._proxy_camera_stream()`.
+- **Reconnect/recording:** capture/detector/motor dimensions follow new frames,
+  but an already-open local recorder retains its initial geometry. Keep camera
+  resolution fixed during a recording.
 - **Native OpenCV finalization:** worker writes are guarded, but OpenCV's native
   `VideoWriter.release()` call has no timeout. The ffmpeg subprocess shutdown
   bounds do not guarantee a bound on native MJPG file finalization.
-- **Installer inspection:** `setup.sh status/network/service/udev` performs
-  bootstrap steps before dispatch. Its `--dry-run` can still create a venv.
-  Use the Python installer's status command for read-only status.
+- **Hardware verification:** no Pi 4, OV5647, SG90, real pigpiod or timing benchmark
+  is available in the development environment. Follow README's hardware acceptance
+  checklist; initial position commands cannot limit physical motion from an unknown
+  startup position. Commission with unloaded horns and safe cable clearance.
