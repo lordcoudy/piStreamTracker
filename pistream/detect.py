@@ -3,6 +3,7 @@
 import logging
 import os
 import ssl
+import time
 import urllib.request
 from threading import Event, Lock, Thread
 from typing import Optional
@@ -186,12 +187,9 @@ class AsyncDetector:
     """
 
     def __init__(self, detector: PoseDetector, process_scale: float,
-                 frame_width: int, frame_height: int):
+                 frame_width: int, frame_height: int, max_result_age: float = 1.0):
         self._detector = detector
         self._process_scale = process_scale
-        self._scale_inv = 1.0 / process_scale
-        self._frame_w = frame_width
-        self._frame_h = frame_height
 
         # Inter-thread communication
         self._submit_lock = Lock()
@@ -200,6 +198,11 @@ class AsyncDetector:
         self._result: Optional[dict] = None
         self._new_result = False
         self._busy = False
+        self._generation = 0
+        self._pending_generation = 0
+        self._pending_at = 0.0
+        self._result_at = 0.0
+        self._max_result_age = max_result_age
 
         self._stop = Event()
         self._has_frame = Event()
@@ -222,11 +225,25 @@ class AsyncDetector:
 
     def stop(self):
         self._stop.set()
+        self.invalidate()
         self._has_frame.set()  # unblock the worker if waiting
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        return self.closed
 
-    def submit(self, frame: np.ndarray):
+    @property
+    def closed(self) -> bool:
+        return not self._thread.is_alive()
+
+    def invalidate(self):
+        """Cancel pending/inflight work across Reset, stream recovery and stop."""
+        with self._submit_lock, self._result_lock:
+            self._generation += 1
+            self._pending_frame = None
+            self._result = None
+            self._new_result = False
+
+    def submit(self, frame: np.ndarray, captured_at: float | None = None):
         """Submit a frame for background detection (non-blocking).
 
         The frame is **copied** internally so the caller can reuse its buffer.
@@ -234,7 +251,11 @@ class AsyncDetector:
         pending one (latest-wins).
         """
         with self._submit_lock:
+            if self._stop.is_set():
+                return
             self._pending_frame = frame.copy()
+            self._pending_generation = self._generation
+            self._pending_at = time.monotonic() if captured_at is None else captured_at
         self._has_frame.set()
 
     def poll_result(self) -> tuple[bool, Optional[dict]]:
@@ -242,6 +263,10 @@ class AsyncDetector:
         with self._result_lock:
             if self._new_result:
                 self._new_result = False
+                if time.monotonic() - getattr(self, '_result_at', 0) > getattr(
+                    self, '_max_result_age', float('inf')
+                ):
+                    return False, None
                 return True, self._result
         return False, None
 
@@ -261,20 +286,32 @@ class AsyncDetector:
             with self._submit_lock:
                 frame = self._pending_frame
                 self._pending_frame = None
+                generation = self._pending_generation
+                captured_at = self._pending_at
             if frame is None:
                 continue
 
             self._busy = True
-            result = self._detect(frame)
-            self._busy = False
-
-            with self._result_lock:
-                self._result = result
-                self._new_result = True
+            try:
+                result = self._detect(frame)
+                with self._submit_lock, self._result_lock:
+                    if generation == self._generation and not self._stop.is_set():
+                        self._result = result
+                        self._result_at = captured_at
+                        self._new_result = True
+            except Exception:
+                logger.exception('Async detection failed')
+            finally:
+                self._busy = False
 
     def _detect(self, frame: np.ndarray) -> Optional[dict]:
         """Run detection (called inside worker thread)."""
-        if self._process_scale < 1.0 and self._scaled_buf is not None:
+        h, w = frame.shape[:2]
+        if self._process_scale < 1.0:
+            shape = (max(1, int(h * self._process_scale)),
+                     max(1, int(w * self._process_scale)), 3)
+            if self._scaled_buf is None or self._scaled_buf.shape != shape:
+                self._scaled_buf = np.empty(shape, dtype=np.uint8)
             cv2.resize(frame,
                        (self._scaled_buf.shape[1], self._scaled_buf.shape[0]),
                        dst=self._scaled_buf,
@@ -288,12 +325,12 @@ class AsyncDetector:
             return None
 
         # Scale coordinates back to original frame size
-        w, h = self._frame_w, self._frame_h
         x, y, bw, bh = det['bbox']
-        x = int(x * self._scale_inv)
-        y = int(y * self._scale_inv)
-        bw = int(bw * self._scale_inv)
-        bh = int(bh * self._scale_inv)
+        scale_x, scale_y = w / small.shape[1], h / small.shape[0]
+        x = int(x * scale_x)
+        y = int(y * scale_y)
+        bw = int(bw * scale_x)
+        bh = int(bh * scale_y)
 
         x = max(0, min(x, w - 1))
         y = max(0, min(y, h - 1))
@@ -301,7 +338,7 @@ class AsyncDetector:
         bh = min(bh, h - y)
 
         if det['keypoints'] is not None:
-            det['keypoints'][:, :2] *= self._scale_inv
+            det['keypoints'][:, :2] *= (scale_x, scale_y)
 
         det['bbox'] = (x, y, bw, bh)
         return det

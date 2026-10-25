@@ -1,6 +1,7 @@
 """Threaded video capture with reconnect."""
 
 import logging
+import time
 from threading import Event, Lock, Thread
 
 import cv2
@@ -30,6 +31,8 @@ class VideoCapture:
         self._cap = None
         self._frame = None
         self._ret = False
+        self._generation = 0
+        self._frame_at = 0.0
         self._lock = Lock()
         self._stop = Event()
         self._thread = None
@@ -105,6 +108,8 @@ class VideoCapture:
             return False
         if self.width <= 0 or self.height <= 0:
             self.height, self.width = self._frame.shape[:2]
+        self._generation += 1
+        self._frame_at = time.monotonic()
 
         self._stop.clear()
         self._thread = Thread(target=self._capture_loop, daemon=True)
@@ -123,6 +128,8 @@ class VideoCapture:
                 if ret:
                     with self._lock:
                         self._ret, self._frame = ret, frame
+                        self._frame_at = time.monotonic()
+                        self.height, self.width = frame.shape[:2]
                     failures = 0
                     reconnects = 0
                 else:
@@ -140,6 +147,8 @@ class VideoCapture:
                         if self._stop.is_set():
                             return
                         if self._open_capture():
+                            with self._lock:
+                                self._generation += 1
                             logger.info("Stream reconnected")
                             failures = 0
                             reconnects = 0
@@ -156,6 +165,17 @@ class VideoCapture:
         with self._lock:
             return self._ret, self._frame
 
+    def read_sample(self):
+        """Read frame and its safety metadata atomically."""
+        with self._lock:
+            return self._ret, self._frame, self._generation, self._frame_at
+
+    @property
+    def frame_metadata(self) -> tuple[int, float]:
+        """Capture generation and monotonic acquisition time of the latest frame."""
+        with self._lock:
+            return self._generation, self._frame_at
+
     def stop(self):
         """Stop capture."""
         self._stop.set()
@@ -167,6 +187,11 @@ class VideoCapture:
             self._release_capture()
         with self._lock:
             self._ret = False
+        return self.closed
+
+    @property
+    def closed(self) -> bool:
+        return self._cap is None and (self._thread is None or not self._thread.is_alive())
 
     @property
     def is_open(self) -> bool:
