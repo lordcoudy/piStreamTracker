@@ -74,6 +74,79 @@ class CliOverrideTests(unittest.TestCase):
             apply_cli_overrides(_base(), args)
 
 
+class MotorBackendTests(unittest.TestCase):
+    def test_legacy_enabled_flag_selects_ev3_or_none(self):
+        from pistream.config import motor_backend
+
+        cfg = _base()
+        self.assertEqual(motor_backend(cfg), 'ev3')
+        cfg['ev3']['enabled'] = False
+        self.assertEqual(motor_backend(cfg), 'none')
+
+    def test_explicit_backend_overrides_legacy_enabled_flag(self):
+        from pistream.config import motor_backend
+
+        cfg = _base()
+        cfg['ev3']['enabled'] = False
+        cfg['motors'] = {'backend': 'gpio_servo'}
+        self.assertEqual(motor_backend(cfg), 'gpio_servo')
+        cfg['motors']['backend'] = 'ev3'
+        self.assertEqual(motor_backend(cfg), 'ev3')
+
+    def test_disable_flag_precedence_is_unambiguous(self):
+        from pistream.config import motor_backend
+
+        for backend, no_ev3, no_motors, expected in (
+            ('gpio_servo', True, False, 'gpio_servo'),
+            ('ev3', True, False, 'none'),
+            ('gpio_servo', False, True, 'none'),
+            ('gpio_servo', True, True, 'none'),
+        ):
+            with self.subTest(backend=backend, no_ev3=no_ev3, no_motors=no_motors):
+                args = Namespace(motor_backend=backend, no_ev3=no_ev3, no_motors=no_motors)
+                cfg = apply_cli_overrides(_base(), args)
+                self.assertEqual(motor_backend(cfg), expected)
+
+    def test_unknown_backend_is_rejected_at_config_load(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('motors:\n  backend: software_pwm\n')
+            with self.assertRaisesRegex(ValueError, 'motors.backend'):
+                load_config(str(path))
+
+    def test_pi4_config_uses_local_camera_and_distinct_artifact_directories(self):
+        from pistream.config import motor_backend
+        from pistream.preview import camera_stream_url
+
+        cfg = load_config(str(Path(__file__).resolve().parents[1] / 'config.pi4.yaml'))
+        self.assertEqual(motor_backend(cfg), 'gpio_servo')
+        self.assertEqual(camera_bind_host(cfg), '127.0.0.1')
+        self.assertEqual(web_bind_host(cfg), '0.0.0.0')
+        self.assertEqual(camera_stream_url(cfg), 'http://127.0.0.1:8000/stream')
+        self.assertEqual(cfg['tracker']['stream_url'], camera_stream_url(cfg))
+        self.assertEqual(cfg['camera']['resolution'], {'width': 640, 'height': 480})
+        self.assertEqual(cfg['camera']['framerate'], 15)
+        self.assertEqual(cfg['tracker']['movenet']['threads'], 2)
+        self.assertLessEqual(cfg['web']['preview_max_fps'], 15)
+        self.assertNotEqual(cfg['camera']['recording_dir'], cfg['tracker']['output_dir'])
+        self.assertFalse(cfg['gpio_servo']['calibrated'])
+
+    def test_pi4_preset_sets_camera_and_inference_defaults(self):
+        from pistream.config import default_config
+
+        cfg = apply_preset(default_config(), 'pi4')
+        self.assertEqual(cfg['camera']['resolution'], {'width': 640, 'height': 480})
+        self.assertEqual(cfg['camera']['framerate'], 15)
+        self.assertEqual(cfg['tracker']['movenet']['threads'], 2)
+
+    def test_servo_validation_runs_before_hardware_use(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('motors:\n  backend: gpio_servo\ngpio_servo:\n  pan:\n    max_speed: .nan\n')
+            with self.assertRaisesRegex(ValueError, 'pan.max_speed'):
+                load_config(str(path))
+
+
 class ConfigValidationTests(unittest.TestCase):
     def test_non_mapping_yaml_root_has_clear_error(self):
         with TemporaryDirectory() as tmp:
