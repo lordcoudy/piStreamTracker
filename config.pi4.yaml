@@ -1,0 +1,62 @@
+# Raspberry Pi 4 + OV5647 + positional SG90, Raspberry Pi OS Bookworm 64-bit.
+# camera.py owns CSI; web.py reads local MJPEG. No network changes are required.
+network:
+  camera_ip: "127.0.0.1"
+  tracker_ip: "0.0.0.0"
+
+camera:
+  host: "127.0.0.1"
+  port: 8000
+  resolution: {width: 640, height: 480}
+  framerate: 15
+  jpeg_quality: 75
+  recording_dir: "camera-recordings"
+
+tracker:
+  stream_url: "http://127.0.0.1:8000/stream"
+  output_dir: "recordings"  # screenshots and fallback local recordings only
+  recording_mode: "camera"
+  recording_fps: 15
+  detection: {interval: 8, scale: 0.5}
+  movenet: {threads: 2}
+
+motors:
+  backend: "gpio_servo"
+
+gpio_servo:
+  calibrated: false  # set only after checking directions and mechanical limits
+  frame_timeout: 0.75  # seconds; worker cancels auto movement if frames stop
+  update_interval: 0.02
+  max_dt: 0.1  # maximum credited time after a delayed control cycle
+  home_hold: 3.0
+  manual_hold: 1.0
+  deadzone: 0.08  # fraction of half the image dimension, per axis
+  gain: 30.0
+  min_step: 0.2  # degrees; suppress small command changes
+  pan:
+    gpio: 18  # BCM18, physical pin 12
+    calibration: {min_angle: -90, max_angle: 90, min_pulse_us: 1000, max_pulse_us: 2000}
+    min_angle: -30  # provisional mechanism limits; inspect printed stops/CSI cable
+    max_angle: 30
+    home: 0
+    invert: false
+    max_speed: 30  # degrees/second
+  tilt:
+    gpio: 19  # BCM19, physical pin 35
+    calibration: {min_angle: -90, max_angle: 90, min_pulse_us: 1000, max_pulse_us: 2000}
+    min_angle: -15
+    max_angle: 15
+    home: 0
+    invert: false
+    max_speed: 20
+
+web:
+  host: "0.0.0.0"
+  port: 5000
+  preview_max_edge: 640
+  preview_max_fps: 10
+  preview_quality: 65
+
+logging:
+  level: "INFO"
+  file: "tracker.log"

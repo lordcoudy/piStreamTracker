@@ -342,3 +342,13 @@
             text-align: center;
             padding: 15px 0;
         }
+        .motor-note {
+            margin-top: 10px;
+            color: #cbd5e1;
+            font-size: 0.8rem;
+            line-height: 1.5;
+            overflow-wrap: anywhere;
+        }
+        .motor-note p {
+            margin-top: 8px;
+        }

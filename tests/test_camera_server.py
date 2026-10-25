@@ -119,6 +119,41 @@ class CameraServerTests(unittest.TestCase):
         self.assertEqual(picam.start_recording.call_args.args[0].kwargs, {'q': 62})
         picam.stop_recording.assert_called_once()
 
+    def test_termination_signal_closes_stream_camera_and_listener(self):
+        import signal
+
+        camera = import_camera_module(fresh=True)
+        picam, srv = Mock(), Mock()
+        handlers = {}
+
+        def install(signum, handler):
+            handlers[signum] = handler
+            return signal.SIG_DFL
+
+        srv.serve_forever.side_effect = lambda: handlers[signal.SIGTERM](signal.SIGTERM, None)
+        with TemporaryDirectory() as tmp, \
+                patch.object(camera, 'Picamera2', return_value=picam), \
+                patch.object(camera, 'StreamingServer', return_value=srv), \
+                patch('signal.signal', side_effect=install):
+            config = Path(tmp) / 'config.yaml'
+            config.write_text(f'camera:\n  recording_dir: "{tmp}/recordings"\n')
+            camera.main(['--config', str(config)])
+        picam.stop_recording.assert_called_once()
+        picam.close.assert_called_once()
+        srv.server_close.assert_called_once()
+        self.assertEqual(handlers[signal.SIGTERM], signal.SIG_DFL)
+
+    def test_partial_camera_startup_failure_releases_csi_owner(self):
+        camera = import_camera_module(fresh=True)
+        picam = Mock()
+        picam.configure.side_effect = RuntimeError('configuration failed')
+        with TemporaryDirectory() as tmp, patch.object(camera, 'Picamera2', return_value=picam):
+            config = Path(tmp) / 'config.yaml'
+            config.write_text(f'camera:\n  recording_dir: "{tmp}/recordings"\n')
+            with self.assertRaisesRegex(RuntimeError, 'configuration failed'):
+                camera.main(['--config', str(config)])
+        picam.close.assert_called_once()
+
     def test_stream_output_reports_bytes_written(self):
         output = self.camera.StreamingOutput()
         self.assertEqual(output.write(b'jpeg'), 4)

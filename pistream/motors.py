@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 class MotorController:
     """EV3 motor controller for pan/tilt tracking."""
 
+    backend = 'ev3'
+
     def __init__(self, config: dict):
         self.deadzone_x = config['deadzone']['x']
         self.deadzone_y = config['deadzone']['y']
@@ -36,6 +38,7 @@ class MotorController:
         self._cam_w = 1280
         self._cam_h = 960
         self.connected = False
+        self.error = None
 
         if config['enabled']:
             self.connect()
@@ -50,6 +53,7 @@ class MotorController:
                 self._pan = self._ev3.Motor(self.pan_port)
                 self._tilt = self._ev3.Motor(self.tilt_port)
                 self.connected = True
+                self.error = None
 
                 try:
                     self._pan_home = self._pan.position
@@ -70,7 +74,14 @@ class MotorController:
             except Exception as e:
                 logger.warning(f"EV3 connection failed: {e}")
                 self.connected = False
+                self.error = str(e)
                 return False
+
+    def status(self) -> dict:
+        return {'backend': self.backend, 'connected': self.connected, 'error': self.error}
+
+    def frame_seen(self, timestamp=None):
+        """EV3 finite moves retain their existing frame policy."""
 
     def set_frame_size(self, width: int, height: int):
         """Update frame dimensions for motor calculations."""
@@ -156,6 +167,10 @@ class MotorController:
                 )
             except Exception as e:
                 logger.warning(f"Move to home failed: {e}")
+
+    def target_lost(self):
+        """Preserve manual/Home holds when the visual target is lost."""
+        self.stop()
 
     def manual_move(self, pan_degrees: int = 0, tilt_degrees: int = 0,
                     speed: Optional[int] = None):

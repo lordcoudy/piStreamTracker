@@ -6,11 +6,12 @@ Simple Flask-based control panel for the tracking system
 
 import json
 import logging
+import signal
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from threading import Lock
+from threading import Lock, current_thread, main_thread
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -28,10 +29,14 @@ from flask import (
 )
 from werkzeug.exceptions import HTTPException
 
-from pistream.config import apply_cli_overrides, configure_logging, load_config, web_bind_host
+from pistream.config import (
+    apply_cli_overrides, configure_logging, load_config, motor_backend, web_bind_host,
+)
 from pistream.config import _bounded_number as _bounded
 from pistream.lifecycle import TrackerLifecycle
-from pistream.preview import accept_new_frame, camera_stream_url, preview_gate, preview_target_size
+from pistream.preview import (
+    accept_new_frame, camera_base_url, camera_stream_url, preview_gate, preview_target_size,
+)
 from pistream.recordings import (
     delete_remote_recording,
     fetch_remote_recordings,
@@ -70,6 +75,40 @@ def _tracker() -> Optional[HumanTracker]:
 def _active_tracker() -> Optional[HumanTracker]:
     trk = _tracker()
     return trk if trk is not None and trk.running and trk.capture is not None else None
+
+
+def _motor_backend(trk=None) -> str:
+    selected = getattr(trk, 'motor_backend', None)
+    if isinstance(selected, str):
+        return selected
+    return motor_backend(getattr(trk, 'config', None) or _config)
+
+
+def _motor_status(trk=None) -> dict:
+    """Report command positions as commands; SG90 has no position sensor."""
+    backend = _motor_backend(trk)
+    controller = getattr(trk, 'motors', None)
+    get_status = getattr(controller, 'status', None)
+    if callable(get_status):
+        state = get_status()
+        if isinstance(state, dict):
+            return state
+    state = {
+        'backend': backend, 'connected': bool(controller and controller.connected),
+        'error': getattr(_lifecycle, 'last_motor_error', None),
+    }
+    if backend == 'gpio_servo':
+        servo = _config.get('gpio_servo') or {}
+        state['calibrated'] = bool(servo.get('calibrated', False))
+        state['pulse_enabled'] = None if state['error'] else False
+        for axis in ('pan', 'tilt'):
+            cfg = servo.get(axis) or {}
+            state[axis] = {
+                'commanded_angle': None, 'target_angle': None,
+                'min_angle': cfg.get('min_angle'), 'max_angle': cfg.get('max_angle'),
+                'home': cfg.get('home'),
+            }
+    return state
 
 
 def _remember_recording_error(trk: Optional[HumanTracker], revision: Optional[int] = None):
@@ -305,6 +344,12 @@ def api_status():
     """Get current tracker status."""
     trk = _tracker()
     recording_status = _recording_status(trk)
+    motors = _motor_status(trk)
+    motor_fields = {
+        'motors': motors, 'motor_backend': motors['backend'],
+        'motor_connected': bool(motors['connected']), 'motor_error': motors.get('error'),
+        'ev3_connected': motors['backend'] == 'ev3' and bool(motors['connected']),
+    }
     if trk:
         detection = trk.current_detection if trk.running else None
         bbox = detection.get('bbox') if detection else None
@@ -320,7 +365,7 @@ def api_status():
         return jsonify({
             'running': bool(trk.running),
             'recording': bool(trk.recording),
-            'ev3_connected': bool(trk.motors.connected),
+            **motor_fields,
             'fps': float(trk.fps),
             'detected': detection is not None,
             'shift_x': shift_x,
@@ -335,7 +380,7 @@ def api_status():
     return jsonify({
         'running': False,
         'recording': False,
-        'ev3_connected': False,
+        **motor_fields,
         'fps': 0.0,
         'detected': False,
         'shift_x': None,
@@ -440,17 +485,34 @@ def api_screenshot():
 
 @app.route('/api/ev3', methods=['POST'])
 def api_ev3():
-    """Toggle EV3 connection."""
+    """Preserve the EV3 endpoint without changing another selected backend."""
+    if _motor_backend(_tracker()) != 'ev3':
+        return _error('EV3 is not the selected motor backend', 409)
+    return api_motors()
+
+
+@app.route('/api/motors', methods=['POST'])
+def api_motors():
+    """Toggle the selected motion controller connection."""
     trk = _active_tracker()
     if trk:
+        if _motor_backend(trk) == 'none':
+            return _error('Motors are disabled by configuration', 409)
         data, err = _json_object()
         if err:
             return _error(err)
         if not isinstance(data.get('enabled'), bool):
             return _error('enabled must be a boolean')
-        if data.get('enabled', False):
+        enabled = data.get('enabled', False)
+        set_enabled = getattr(trk, 'set_motors_enabled', None)
+        if set_enabled is not None:
+            if not set_enabled(enabled):
+                state = _motor_status(trk)
+                return _error(state.get('error') or 'Motor connection cancelled or failed', 503)
+        elif enabled:
             if not trk.motors.connect():
-                return _error('Could not connect to EV3', 503)
+                state = _motor_status(trk)
+                return _error(state.get('error') or 'Could not connect to motor controller', 503)
         else:
             trk.motors.disconnect()
         return jsonify({'status': 'ok', 'connected': trk.motors.connected})
@@ -473,6 +535,8 @@ def api_settings():
     tracker_settings = set(data) - {'overlay'}
     if tracker_settings and not trk:
         return _error('Tracker not running', 409)
+    if {'ev3_speed', 'ev3_deadzone'} & set(data) and _motor_backend(trk) != 'ev3':
+        return _error('EV3 settings require the ev3 motor backend', 409)
 
     values = {}
     try:
@@ -525,7 +589,7 @@ def api_motor_move():
     if not trk:
         return _error('Tracker not running', 409)
     if not trk.motors.connected:
-        return _error('EV3 not connected', 409)
+        return _error('Motor controller not connected', 409)
 
     data, err = _json_object()
     if err:
@@ -595,6 +659,7 @@ def api_config():
         'confidence': det.get('confidence', 0.5),
         'interval': det.get('interval', 10),
         'overlay': web.get('overlay', True),
+        'motors': _motor_status(_tracker()),
     })
 
 
@@ -603,10 +668,8 @@ def _recording_dir() -> Path:
 
 
 def _camera_recording_config() -> tuple[str, str]:
-    net = _config.get('network') or {}
     cam = _config.get('camera') or {}
-    base = f"http://{net.get('camera_ip', '127.0.0.1')}:{cam.get('port', 8000)}"
-    return base, cam.get('token') or ''
+    return camera_base_url(_config), cam.get('token') or ''
 
 
 def _camera_recording_mode() -> bool:
@@ -767,7 +830,7 @@ def _run_tracker_loop(trk: HumanTracker):
     prev_frame = None
     try:
         while trk.running:
-            ret, frame = trk.capture.read()
+            ret, frame = trk.read_frame()
             prev_frame, is_new = accept_new_frame(prev_frame, ret, frame)
             if not is_new:
                 time.sleep(0.002)
@@ -801,7 +864,20 @@ def run_web(config: dict, host: str = '0.0.0.0', port: int = 5000):
     _lifecycle = TrackerLifecycle(lambda: HumanTracker(_config), _run_tracker_loop)
 
     logger.info(f"Starting web interface at http://{host}:{port}")
-    app.run(host=host, port=port, threaded=True, debug=False)
+    previous_handlers = {}
+    if current_thread() is main_thread():
+        def terminate(signum, _frame):
+            raise SystemExit(128 + signum)
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, terminate)
+    try:
+        app.run(host=host, port=port, threaded=True, debug=False, use_reloader=False)
+    finally:
+        if _lifecycle is not None:
+            _lifecycle.stop()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def main():
@@ -818,6 +894,9 @@ def main():
     parser.add_argument('--confidence', type=float, help='Confidence threshold')
     parser.add_argument('--movenet-threads', type=int, help='Inference threads')
     parser.add_argument('--no-ev3', action='store_true', help='Disable EV3')
+    parser.add_argument('--motor-backend', choices=['ev3', 'gpio_servo', 'none'],
+                        help='Pan/tilt controller (overrides configuration)')
+    parser.add_argument('--no-motors', action='store_true', help='Disable every motor backend')
     parser.add_argument('--preset', help='Performance preset from config.yaml')
     args = parser.parse_args()
 

@@ -29,15 +29,17 @@ def detect_pi_model(model_text: str | None) -> str:
 
 
 def resolve_role(requested: str, model: str) -> str:
-    if requested in ('camera', 'tracker'):
+    if requested in ('camera', 'tracker', 'standalone'):
         return requested
     if requested == 'auto':
         if model == 'pi3':
             return 'camera'
         if model == 'pi5':
             return 'tracker'
+        if model == 'pi4':
+            return 'standalone'
         raise InstallError(
-            f'Cannot auto-detect role from Pi model {model!r}; pass --role camera or --role tracker'
+            f'Cannot auto-detect role from Pi model {model!r}; pass --role camera, tracker or standalone'
         )
     raise InstallError(f'Unknown role: {requested}')
 
@@ -77,18 +79,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest='command', required=True)
 
     inst = sub.add_parser('install', help='Full automatic install (network + service + udev)')
-    inst.add_argument('--role', choices=('camera', 'tracker', 'auto'), default='auto')
+    inst.add_argument('--role', choices=('camera', 'tracker', 'standalone', 'auto'), default='auto')
     inst.add_argument('--skip-network', action='store_true')
     inst.add_argument('--skip-service', action='store_true')
     inst.add_argument('--skip-udev', action='store_true')
     inst.add_argument('--interface', default=None, help='Override network.interface')
 
     net = sub.add_parser('network', help='Configure ethernet IPv4 from config.yaml')
-    net.add_argument('--role', choices=('camera', 'tracker', 'auto'), default='auto')
+    net.add_argument('--role', choices=('camera', 'tracker', 'standalone', 'auto'), default='auto')
     net.add_argument('--interface', default=None)
 
     svc = sub.add_parser('service', help='Write and enable pitracker.service')
-    svc.add_argument('--role', choices=('camera', 'tracker', 'auto'), default='auto')
+    svc.add_argument('--role', choices=('camera', 'tracker', 'standalone', 'auto'), default='auto')
     svc.add_argument('--no-enable', action='store_true', help='Write unit but do not enable')
 
     sub.add_parser('udev', help='Install EV3 USB udev rule')
@@ -254,6 +256,10 @@ def render_unit_file(
     python: str,
     script: str,
     config_path: str | None = None,
+    after: tuple[str, ...] = (),
+    requires: tuple[str, ...] = (),
+    conflicts: tuple[str, ...] = (),
+    groups: tuple[str, ...] = (),
 ) -> str:
     config_path = config_path if config_path is not None else str(Path(work_dir) / 'config.yaml')
     command = ' '.join(_systemd_argument(arg) for arg in (python, script, '--config', config_path))
@@ -261,15 +267,22 @@ def render_unit_file(
         raise InstallError('Service working directory must not contain line breaks or NUL')
     # WorkingDirectory is a scalar path: quotes would become part of its name.
     directory = work_dir.replace('%', '%%')
+    dependencies = (
+        (f'Requires={" ".join(requires)}\n' if requires else '')
+        + (f'Conflicts={" ".join(conflicts)}\n' if conflicts else '')
+    )
+    group_line = f'SupplementaryGroups={" ".join(groups)}\n' if groups else ''
     return (
         '[Unit]\n'
         f'Description={description}\n'
         'Wants=network-online.target\n'
-        'After=network-online.target\n'
+        f'After={" ".join(("network-online.target",) + after)}\n'
+        f'{dependencies}'
         '\n'
         '[Service]\n'
         'Type=simple\n'
         f'User={user}\n'
+        f'{group_line}'
         f'WorkingDirectory={directory}\n'
         'Environment=OPENBLAS_NUM_THREADS=2\n'
         'Environment=OMP_NUM_THREADS=2\n'
@@ -296,7 +309,42 @@ def plan_service_actions(
     python: str,
     enable: bool,
     config_path: str | None = None,
+    legacy_service_exists: bool = False,
 ) -> list[Action]:
+    if role == 'standalone':
+        if user == 'root':
+            raise InstallError('Standalone applications must run as an ordinary user')
+        actions: list[Action] = []
+        if legacy_service_exists:
+            actions.append(RunAction(('systemctl', 'disable', '--now', 'pitracker')))
+        actions.append(RunAction(('usermod', '-aG', 'video,render', user)))
+        actions.append(WriteAction('/etc/systemd/system/pigpiod.service', (
+            '[Unit]\nDescription=Local pigpio PWM daemon\n\n'
+            '[Service]\nType=simple\nExecStart=/usr/bin/pigpiod -g -l -f\n'
+            'Restart=on-failure\nRestartSec=2\n\n'
+            '[Install]\nWantedBy=multi-user.target\n'
+        )))
+        for name, script, after, requires in (
+            ('pistream-camera', 'camera.py', (), ()),
+            ('pistream-tracker', 'web.py', ('pigpiod.service', 'pistream-camera.service'),
+             ('pigpiod.service', 'pistream-camera.service')),
+        ):
+            actions.append(WriteAction(
+                f'/etc/systemd/system/{name}.service',
+                render_unit_file(
+                    description=f'piStreamTracker {name}', user=user, work_dir=work_dir,
+                    python=python, script=f'{work_dir}/{script}', config_path=config_path,
+                    after=after, requires=requires, conflicts=('pitracker.service',),
+                    groups=('video', 'render'),
+                ),
+            ))
+        actions.append(RunAction(('systemctl', 'daemon-reload')))
+        if enable:
+            # Restart applies the localhost-only flags even to an already running daemon.
+            actions.append(RunAction(('systemctl', 'restart', 'pigpiod')))
+            actions.append(RunAction(('systemctl', 'enable', '--now', 'pigpiod',
+                                      'pistream-camera', 'pistream-tracker')))
+        return actions
     script_name = 'camera.py' if role == 'camera' else 'web.py'
     description = (
         'piStreamTracker Camera Server'
@@ -399,6 +447,8 @@ def _systemctl_is_active(name: str) -> bool:
         result = subprocess.run(
             ('systemctl', 'is-active', '--quiet', name),
             check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         return result.returncode == 0
     except OSError:
@@ -448,8 +498,11 @@ def cmd_network(
     if not plat.startswith('linux'):
         print('Skipping network setup (not Linux).', file=stdout)
         return 0
-    config = load_cfg() if load_cfg is not None else _load_config(args.config)
     role = _resolved_role(args, model_text)
+    if role == 'standalone':
+        print('Standalone: preserving current network settings.', file=stdout)
+        return 0
+    config = load_cfg() if load_cfg is not None else _load_config(args.config)
     iface, ip, prefix = network_target(config, role, getattr(args, 'interface', None))
     backend = detect_network_backend(is_active or _systemctl_is_active)
     if backend == 'networkmanager':
@@ -484,6 +537,7 @@ def cmd_service(
     work_dir: Path | None = None,
     user: str | None = None,
     python: str | None = None,
+    legacy_service_exists: bool | None = None,
     **_kwargs: Any,
 ) -> int:
     if stdout is None:
@@ -495,6 +549,8 @@ def cmd_service(
     from pistream.config import project_root
     root = (work_dir if work_dir is not None else project_root()).resolve()
     role = _resolved_role(args, model_text)
+    if legacy_service_exists is None:
+        legacy_service_exists = Path('/etc/systemd/system/pitracker.service').exists()
     actions = plan_service_actions(
         role=role,
         user=user if user is not None else getpass.getuser(),
@@ -502,6 +558,7 @@ def cmd_service(
         python=python if python is not None else resolve_python(Path(root)),
         enable=not bool(getattr(args, 'no_enable', False)),
         config_path=str(Path(args.config).resolve()),
+        legacy_service_exists=legacy_service_exists,
     )
     execute_actions(
         actions,
@@ -547,7 +604,7 @@ def cmd_install(
     model_text = kwargs.get('model_text')
     role = _resolved_role(args, model_text)
     args.role = role
-    if not getattr(args, 'skip_network', False):
+    if role != 'standalone' and not getattr(args, 'skip_network', False):
         cmd_network(args, **kwargs)
     if role == 'tracker' and not getattr(args, 'skip_udev', False):
         cmd_udev(args, **kwargs)
@@ -578,7 +635,7 @@ def cmd_status(
     try:
         print(f'Auto role: {resolve_role("auto", model_id)}', file=stdout)
     except InstallError:
-        print('Auto role: n/a (pass --role camera or --role tracker)', file=stdout)
+        print('Auto role: n/a (pass --role camera, tracker or standalone)', file=stdout)
     print(f'camera_ip: {net.get("camera_ip")}', file=stdout)
     print(f'tracker_ip: {net.get("tracker_ip")}', file=stdout)
     print(f'interface: {net.get("interface", "eth0")}', file=stdout)
@@ -594,6 +651,9 @@ def cmd_status(
         print(f'pitracker.service: {"active" if active else "inactive"}', file=stdout)
     except OSError:
         print('pitracker.service: n/a', file=stdout)
+    for name in ('pistream-camera', 'pistream-tracker', 'pigpiod'):
+        print(f'{name}.service: {"active" if _systemctl_is_active(name) else "inactive"}',
+              file=stdout)
     return 0
 
 
@@ -611,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == 'status':
             return cmd_status(args)
         raise InstallError(f'Unknown command: {args.command}')
-    except InstallError as exc:
+    except (InstallError, ValueError, subprocess.CalledProcessError) as exc:
         print(exc, file=sys.stderr)
         return 2
 

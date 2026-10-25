@@ -1,10 +1,10 @@
 # piStreamTracker
 
-Follow-cam for a lecturer: a Pi 3B+ streams MJPEG, a Pi 5 runs MoveNet + OpenCV tracking and drives an EV3 pan/tilt head. Control it from a local web UI or a display on the tracker Pi.
+Follow-cam for a lecturer: run a CSI camera, MoveNet + OpenCV tracking, a web UI and two SG90 pan/tilt servos on one Raspberry Pi 4, or keep the original Pi 3B+ camera → Pi 5 tracker → USB EV3 setup.
 
-Do not run the Python processes as root. Assign Ethernet IPs once, then start the apps as a normal user (EV3 via udev).
+Run application Python processes as an ordinary user. The standalone setup keeps existing Ethernet/Wi-Fi settings; the two-Pi setup assigns its Ethernet addresses once (EV3 access uses udev).
 
-## Hardware
+## Original two-Pi hardware
 
 | Device | Role | Address |
 |--------|------|---------|
@@ -25,11 +25,249 @@ camera.py                     tracker.py  or  web.py
 - MoveNet Lightning (async) + MOSSE/KCF/CSRT between detects
 - Aims at the upper half of the box (head/torso)
 - EV3 pan/tilt with deadzone, home-hold after Reset, D-pad
+- GPIO SG90 commands through local `pigpiod`, independent calibration and mechanical limits, speed caps, and a fresh-frame watchdog
 - Web UI: overlay or raw-camera proxy, zoom, horizon preview, recordings
 - Local H.264 (ffmpeg, hardware when available) or camera-side record
 - Stream reconnects after a camera reboot; status shows `stream_lost`
 - Optional Bearer token on every `/record/*` operation; cap on concurrent `/stream` clients
 - Camera-mode recordings remain downloadable/deletable from the tracker UI; local fallback is automatic
+
+## One Raspberry Pi 4: assembly and first run
+
+Use **Raspberry Pi OS Bookworm 64-bit with its system Python 3.11**, one OV5647
+CSI camera (Camera v1.3 format), and two positional SG90 servos. The separately
+prepared `piStreamTracker_Pi4_AD5X.3mf` supplies the mechanism; software limits must
+be calibrated against its printed stops and the actual CSI cable routing.
+
+`camera.py` exclusively owns the CSI camera and serves `127.0.0.1:8000`.
+`web.py` receives `http://127.0.0.1:8000/stream`; raw preview, recording controls,
+file listing and downloads use the same local camera address. Open the UI from
+another LAN device at `http://<Pi-LAN-IP>:5000`. No second Pi or static
+`192.168.100.1/2` addresses are needed.
+
+### Wiring
+
+Shut down the Pi and disconnect both power supplies before connecting or moving
+the CSI cable or GPIO wiring. Use the Pi 4's 15-pin **CAMERA** connector and leave
+enough cable slack for both axes. Follow the
+[Raspberry Pi camera connection guide](https://www.raspberrypi.com/documentation/accessories/camera.html#install-a-raspberry-pi-camera).
+
+| Connection | BCM identifier in YAML | Physical header pin |
+|------------|------------------------|---------------------|
+| Pan SG90 signal | GPIO18 | 12 |
+| Tilt SG90 signal | GPIO19 | 35 |
+| Common ground | GND | 6, for example |
+| Both servo power inputs | Separate regulated 5 V supply | No GPIO signal pin |
+
+Power the Pi through its own USB-C supply. Connect the servo supply ground,
+both servo grounds and Pi ground together. Size the servo supply and wiring for
+both servos moving together; do not power them from a GPIO signal or the 3.3 V
+rail, and do not join the separate supply's positive output to Pi power.
+Check connector polarity on the actual servos. BCM numbering differs from
+physical pin numbering; GPIO uses 3.3 V logic. See the
+[official GPIO pinout](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html#40-pin-gpio-header).
+
+### Install
+
+From the checkout, as the user who will run the applications:
+
+```bash
+./setup.sh --standalone --config config.pi4.yaml
+```
+
+Pi 4 auto-detection also selects `standalone`. Setup creates a
+`--system-site-packages` `venv/`, installs apt camera/libcamera bindings and
+`rpicam-apps`, installs `pigpiod` and the Python client, and installs project
+dependencies. It preserves the selected YAML file on repeat installations and
+does not reconfigure networking or install EV3 udev rules in this role.
+The applications run as the invoking ordinary user; the privileged daemon uses
+`pigpiod -g -l -f` (foreground, localhost connections, FIFO disabled).
+[Upstream daemon options](https://github.com/joan2937/pigpio/blob/master/pigpiod.c).
+
+The target dependency combination is TFLite Runtime **2.14.0**, NumPy **<2** and
+OpenCV contrib **>=4.8,<4.10**. The
+[published TFLite wheel](https://pypi.org/project/tflite-runtime/2.14.0/#files)
+includes CPython 3.11 Linux ARM64; the
+[OpenCV 4.9 release](https://pypi.org/project/opencv-contrib-python/4.9.0.80/#files)
+also supplies Linux ARM64 wheels. The NumPy bound avoids the
+[NumPy 2 binary compatibility break](https://numpy.org/doc/stable/user/troubleshooting-importerror.html#downstream-importerror-attributeerror-or-c-api-abi-incompatibility).
+Picamera2/libcamera come from the OS and remain visible through the venv, as
+described in the [Picamera2 manual, virtual environments](https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf).
+Setup checks imports and loads the MoveNet model/interpreter, downloading the
+model if absent; an unavailable model/runtime fails setup. This still requires
+camera capture and inference checks on the installed Pi image. Log out/in or reboot after group changes
+before using the manual launcher.
+
+Setup enables three services: `pigpiod`, `pistream-camera`, and
+`pistream-tracker`. The tracker starts after and requires the camera and daemon.
+Both applications receive the same absolute config path. A previous
+`pitracker.service` on this device is stopped and disabled to avoid a second
+camera owner. The web service opens the control panel; **tracking starts only
+when Start is pressed**, including after a reboot.
+
+`config.pi4.yaml` starts at 640×480, 15 camera frames/s, two MoveNet threads and
+at most 10 annotated-preview frames/s. Detection interval and processing scale
+remain adjustable. These are commissioning settings, not measured processing
+performance. Camera recordings go to `camera-recordings/`; screenshots and
+fallback local recordings go to `recordings/`, avoiding duplicate list entries.
+
+### Calibrate before automatic motion
+
+The shipped configuration has `gpio_servo.calibrated: false`, which blocks
+automatic tracking. Manual movement and Home remain available. **Start with the
+servo horns detached from the mechanism**: the first pulse uses the configured
+Home reference, and the application cannot know the actual shaft position.
+Speed limits constrain subsequent command changes, not an unknown initial
+physical movement.
+
+Stop the tracker service so it releases GPIO; the camera service may remain on:
+
+```bash
+sudo systemctl stop pistream-tracker
+cp config.pi4.yaml config.pi4.backup.yaml
+venv/bin/python -m pistream.calibrate --config config.pi4.yaml
+```
+
+In the calibration prompt, first use a small working range:
+
+```text
+set pan.min_angle -5
+set pan.max_angle 5
+set tilt.min_angle -5
+set tilt.max_angle 5
+home
+status
+pan 1
+pan -1
+tilt 1
+tilt -1
+save
+```
+
+Wait for each small move and check its direction. `set pan.invert true` or
+`set tilt.invert true` reverses that axis if required. Every `set` disables PWM,
+clears calibration approval and requires another explicit `home` or manual
+command. `stop`, `quit`, Ctrl-C and normal termination disable pulses and
+release the controller; use `connect` after correcting an error that disconnected
+it.
+
+Calibrate each servo's angle-to-pulse map on the unloaded servo:
+`pan.calibration.min_angle`, `max_angle`, `min_pulse_us`, `max_pulse_us`, and the
+corresponding tilt settings. The default -90…90° / 1000…2000 µs map is provisional;
+check the actual angles and pulse range of the installed units. Keep pulses
+within the configured calibration limits. Set each axis's `home` and `max_speed`
+(degrees/s) independently. The utility validates changes before enabling PWM.
+
+Return to Home, quit, remove servo power and fit the mechanism at its neutral
+position without turning the shafts. Re-enter calibration with narrow ranges.
+Increase `pan.min_angle`/`max_angle` and `tilt.min_angle`/`max_angle` gradually,
+one small move at a time, stopping before a printed part touches or the CSI cable
+tightens. These **working limits** must remain inside the calibration angle
+range; changing working limits does not rescale the pulse map. Do not assume
+180° is safe in the assembled platform. Reduce ranges or speed if the servos
+strain or oscillate.
+
+Only when both directions, Home, pulse calibration and assembled limits have
+been checked, enter:
+
+```text
+confirm
+quit
+```
+
+`confirm` saves `calibrated: true` atomically to the chosen YAML. `save` preserves
+the current approval state: after editing a setting this remains `false`; an
+already confirmed, unchanged configuration remains approved. Other sections are
+preserved, though YAML formatting/comments are rewritten. The UI shows
+**commanded** and target angles in degrees, working limits, calibration status
+and controller errors; no SG90 position feedback is available.
+
+### Start, stop and recover
+
+```bash
+sudo systemctl start pistream-tracker
+```
+
+Open `http://<Pi-LAN-IP>:5000`, press **Start**, check the image and use small
+D-pad steps. **Home / Reset** clears detection and returns to saved Home while
+holding automatic tracking for `gpio_servo.home_hold`; manual motion uses
+`manual_hold`. Stop cancels either motion immediately and disables pulses.
+Losing the person cancels automatic motion and holds the last issued position.
+The independent worker cancels automatic motion after `frame_timeout` seconds
+without a fresh frame, even when frame processing stops. There is no search
+rotation. A daemon connection failure remains an explicit controller error.
+
+For a foreground run, stop both application services first; keep `pigpiod`
+running:
+
+```bash
+sudo systemctl stop pistream-tracker pistream-camera
+./run_standalone.sh --config config.pi4.yaml
+# Ctrl-C stops both child applications.
+sudo systemctl start pistream-camera pistream-tracker
+```
+
+The launcher rejects an active application service or another launcher.
+Host-wide GPIO ownership locks also exclude a second tracker/calibration
+session using the same pins. To run
+without motion, append `--no-motors` to the launcher. Configuration changes take
+effect in a new process; restart the relevant services after editing the file.
+
+```bash
+venv/bin/python -m pistream.install --config config.pi4.yaml status
+sudo systemctl status pigpiod pistream-camera pistream-tracker
+sudo journalctl -u pistream-camera -u pistream-tracker -u pigpiod -b --no-pager -n 100
+curl http://127.0.0.1:8000/record/status
+```
+
+If `camera.token` is set, add the matching `Authorization: Bearer ...` header
+to diagnostic recording requests.
+
+For a camera-only diagnostic, release CSI ownership first:
+
+```bash
+sudo systemctl stop pistream-tracker pistream-camera
+rpicam-hello --list-cameras
+rpicam-still --nopreview --timeout 1000 --output /tmp/pistream-camera-test.jpg
+sudo systemctl start pistream-camera pistream-tracker
+```
+
+Bookworm uses the `rpicam-*` commands; see
+[Raspberry Pi camera software](https://www.raspberrypi.com/documentation/computers/camera_software.html).
+If the camera is absent, power down before reseating its cable and check the
+OV5647 entry with `--list-cameras`. If the UI reports `pigpiod` unavailable, check
+its service log, run `sudo systemctl restart pigpiod` and
+`sudo systemctl start pistream-tracker`, then reload the UI and press Start.
+For a transient client error while the service stays up, reconnect using
+**Motors Enabled** or Stop/Start the tracking session. There is no software-PWM
+fallback. Errors about unconfirmed PWM shutdown stay visible after Stop; an
+unknown PWM state is not confirmation that pulses are off. Remove servo power
+before touching the mechanism; a lost daemon connection cannot confirm PWM
+shutdown. Repeated import/ABI failures warrant checking the venv's Python and
+NumPy versions and rerunning setup with the supported OS/runtime combination.
+
+### Hardware acceptance checklist (still to run on the actual build)
+
+Automated tests use fake GPIO, camera and EV3 components. They do not establish
+physical motion, CSI capture, electrical stability or Pi 4 processing speed.
+
+1. Verify supply polarity/common ground and unloaded Home; commission both
+   calibrated axes and inspect the cable/printed stops through their full
+   **working** ranges.
+2. Reboot, verify all three services are active, open the UI from another LAN
+   device and press Start. Confirm annotated and raw preview.
+3. Check D-pad, Home/Reset and Stop during manual/Home motion; repeat Start/Stop
+   and verify no second camera/GPIO owner appears.
+4. Follow a person in both axes, verify limits, remove the person, and interrupt
+   the camera stream. Confirm hold/cancellation and controlled recovery without
+   a stale movement.
+5. Capture a screenshot and a recording, stop recording, and download/play both
+   files. Check camera and local fallback directories and available storage.
+6. Measure actual processing FPS, preview latency, CPU temperature, power and
+   tracking quality with recording enabled before tuning detection/preview
+   settings; no achieved FPS is claimed here.
+7. Reboot again and repeat image/manual/tracking/recording checks. Confirm the
+   selected config, calibration and existing network settings persisted.
 
 ## Setup
 
@@ -131,7 +369,7 @@ first use; the synthetic stream exercises controls and transport, not pose quali
 | Control | What it does |
 |---------|----------------|
 | Start / Stop | Connects to the camera stream, then tracks. Start fails if the stream is down. |
-| Reset | Clears the tracker and homes the EV3; auto-track is held for `ev3.home_hold` seconds |
+| Home / Reset | Clears detection and homes the selected controller; auto-track holds for its configured `home_hold` |
 | Record / Screenshot | Local files under `tracker.output_dir`, or camera Pi if `recording_mode: camera`; an unreachable camera recorder falls back locally |
 | Tracking overlay | Off = proxy the camera MJPEG (lowest delay). On = annotated preview at `preview_max_fps` / `preview_max_edge` |
 | Auto-Level | Rotate the **preview** to level shoulders/hips; motors still use the raw box |
@@ -157,7 +395,11 @@ protections, but it is still a trusted-LAN control surface rather than an Intern
 
 ## Configuration
 
-All defaults are in `config.yaml`. CLI flags override a named `--preset`, which overrides the file.
+Use `config.yaml` for the original two-Pi setup and `config.pi4.yaml` for the
+standalone build. Missing settings use built-in defaults. CLI flags override a
+named `--preset`, which overrides the file. The built-in `pi4` performance preset
+also supplies camera and preview parameters; the standalone file already includes
+those values for both processes.
 
 ```yaml
 network:
@@ -204,6 +446,20 @@ Configuration is validated at startup; unsafe values such as a zero detection in
 ports, unknown recording backends, or malformed section types fail immediately with a clear error.
 Set `PISTREAM_CAMERA_TOKEN` to override `camera.token` without storing the secret in `config.yaml`.
 
+`motors.backend` accepts `ev3`, `gpio_servo`, or `none`. Its default `null` keeps
+old files working: `ev3.enabled: true` selects EV3 and `false` selects no motors.
+An explicit backend overrides that legacy flag. `--motor-backend` overrides the
+file; `--no-ev3` disables only EV3, including an explicitly selected EV3 backend,
+and still permits GPIO servos. `--no-motors` wins over both and disables all
+actuators. GPIO mode never connects to EV3; hardware libraries are loaded only
+by their selected controller.
+
+SG90 settings live under `gpio_servo`. `deadzone` is a fraction of half the frame
+dimension; `gain` sets the angular correction at full normalized offset;
+`min_step` suppresses tiny changes. `max_dt` limits credited elapsed time after
+a delayed worker cycle; each axis also has its own `max_speed` in degrees/s.
+`tracker.detection.result_timeout` rejects inference results that are too old.
+
 ## CLI
 
 ```bash
@@ -212,7 +468,7 @@ python web.py --help
 python -m pistream.install --help
 ```
 
-Shared flags: `--config`, `--url`, `--output-dir`, `--detection-interval`, `--process-scale`, `--confidence`, `--movenet-threads`, `--no-ev3`, `--preset`.
+Shared flags: `--config`, `--url`, `--output-dir`, `--detection-interval`, `--process-scale`, `--confidence`, `--movenet-threads`, `--motor-backend ev3|gpio_servo|none`, `--no-motors`, `--no-ev3`, `--preset`.
 
 Tracker-only: `--no-display`, `--auto-record`.
 
@@ -227,8 +483,8 @@ Camera: `--config` (loaded before recording directories and server settings are 
 | `q` | Quit |
 | `r` | Toggle recording |
 | `s` | Screenshot |
-| `d` | Reset tracker + home EV3 |
-| `e` | Connect / disconnect EV3 |
+| `d` | Reset tracker + home selected controller |
+| `e` | Connect / disconnect selected controller |
 
 Keyboard controls remain available during a stream outage. Screenshots use the
 last displayed frame; before the first frame, the CLI reports that none is available.
@@ -247,14 +503,15 @@ An underlying tracking error also exits nonzero after recovery.
 .venv/bin/ruff check pistream tests tracker.py web.py camera.py ev3_usb.py
 ```
 
-No Pi or EV3 required. GitHub Actions runs the same on Python 3.11 and 3.12.
+No Pi, GPIO or EV3 required. GitHub Actions runs the same on Python 3.11 and 3.12.
 Raspberry Pi OS Bookworm's system `python3` is 3.11.
 
 Optional browser checks use an existing Node/Playwright installation: run
 `.venv/bin/python tests/web_ui_fixture.py` and, in another terminal,
 `node tests/browser_ui.cjs`. `PLAYWRIGHT_MODULE` and `PLAYWRIGHT_EXECUTABLE` can
 select an existing installation and Chromium executable. The fixture uses mocked
-hardware and checks manual retry, warnings, controls and responsive layout.
+hardware and checks manual retry, warnings, GPIO calibration/angle/error display,
+manual command requests and responsive layout.
 
 ## Troubleshooting
 
@@ -277,7 +534,8 @@ hardware and checks manual retry, warnings, controls and responsive layout.
 
 ```
 piStreamTracker/
-├── config.yaml          # Single source of settings
+├── config.yaml          # Two-Pi settings
+├── config.pi4.yaml      # Standalone camera/tracker/GPIO settings
 ├── tracker.py           # Display / CLI entry
 ├── web.py               # Flask entry
 ├── camera.py            # Camera Pi server
@@ -285,12 +543,16 @@ piStreamTracker/
 ├── setup.sh             # Bootstrap apt/venv; exec python -m pistream.install
 ├── run_cam.sh
 ├── run_tracker.sh
+├── run_standalone.sh    # Two local application processes, shared config
 ├── pistream/            # Application package
 │   ├── install.py       # Installer CLI (network, udev, systemd)
 │   ├── capture.py       # Threaded MJPEG capture + reconnect
 │   ├── detect.py        # MoveNet + async worker
 │   ├── track.py         # HumanTracker, MOSSE, CLI
 │   ├── motors.py        # EV3 pan/tilt + home hold
+│   ├── motion.py        # Controller interface/factory and no-motor backend
+│   ├── servo.py         # Local pigpio SG90 commands and watchdog
+│   ├── calibrate.py     # Interactive GPIO calibration and YAML saving
 │   ├── record.py        # ffmpeg / MJPG writer
 │   ├── web_app.py       # Routes
 │   ├── recordings.py    # Listing + path safety

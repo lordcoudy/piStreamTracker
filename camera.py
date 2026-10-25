@@ -5,6 +5,7 @@ Streams MJPEG video from Raspberry Pi Camera to network
 """
 
 import argparse
+import signal
 import io
 import json
 import logging
@@ -374,13 +375,15 @@ def camera_busy_hint(ip: str, port: int) -> str:
         f'Camera device is busy (another process holds libcamera). '
         f'After ./setup.sh --camera, pitracker.service already streams at '
         f'http://{ip}:{port}/stream. Check: sudo systemctl status pitracker. '
-        f'To run camera.py yourself: sudo systemctl stop pitracker'
+        f'For standalone also check pistream-camera.service. '
+        f'To run camera.py yourself: sudo systemctl stop pitracker pistream-camera'
     )
 
 
 class StreamingServer(server.ThreadingHTTPServer):
     """Threaded HTTP server with tuning for low-latency streaming."""
     request_queue_size = 8
+    daemon_threads = True
 
     def server_bind(self):
         """Override to set socket options for streaming performance."""
@@ -399,28 +402,31 @@ def main(argv: list[str] | None = None):
         raise SystemExit(f'Configuration error: {exc}') from exc
     logger.info("Initializing Raspberry Pi Camera...")
 
+    def terminate(_signum, _frame):
+        raise KeyboardInterrupt
+
+    previous_handler = signal.signal(signal.SIGTERM, terminate)
+    picam2 = recorder = srv = None
+    streaming = False
     try:
-        picam2 = Picamera2()
-    except RuntimeError:
-        logger.error(camera_busy_hint(CAMERA_IP, PORT))
-        raise
-    video_config = picam2.create_video_configuration(
-        main={"size": (WIDTH, HEIGHT)},
-        controls={"FrameRate": FRAMERATE},
-    )
-    picam2.configure(video_config)
+        try:
+            picam2 = Picamera2()
+        except RuntimeError:
+            logger.error(camera_busy_hint(CAMERA_IP, PORT))
+            raise
+        video_config = picam2.create_video_configuration(
+            main={"size": (WIDTH, HEIGHT)},
+            controls={"FrameRate": FRAMERATE},
+        )
+        picam2.configure(video_config)
 
-    # Setup streaming with quality-tuned JPEG encoder
-    output = StreamingOutput()
-    StreamingHandler.output = output
-    jpeg_encoder = JpegEncoder(q=JPEG_QUALITY)
-    picam2.start_recording(jpeg_encoder, FileOutput(output))
-
-    # Setup server-side recorder (hardware H.264)
-    recorder = CameraRecorder(picam2, OUTPUT_DIR)
-    StreamingHandler.recorder = recorder
-
-    try:
+        output = StreamingOutput()
+        StreamingHandler.output = output
+        jpeg_encoder = JpegEncoder(q=JPEG_QUALITY)
+        picam2.start_recording(jpeg_encoder, FileOutput(output))
+        streaming = True
+        recorder = CameraRecorder(picam2, OUTPUT_DIR)
+        StreamingHandler.recorder = recorder
         srv = StreamingServer((HOST, PORT), StreamingHandler)
 
         logger.info("=" * 50)
@@ -441,11 +447,22 @@ def main(argv: list[str] | None = None):
 
     finally:
         try:
-            recorder.stop()
+            if srv is not None:
+                srv.server_close()
+            if recorder is not None:
+                recorder.stop()
         except Exception:
             logger.exception("Camera recorder did not stop cleanly")
         finally:
-            picam2.stop_recording()
+            try:
+                if picam2 is not None:
+                    try:
+                        if streaming:
+                            picam2.stop_recording()
+                    finally:
+                        picam2.close()
+            finally:
+                signal.signal(signal.SIGTERM, previous_handler)
         logger.info("Camera server stopped")
 
 

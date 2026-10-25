@@ -20,6 +20,8 @@ def project_root() -> Path:
 
 
 def default_config() -> dict:
+    from pistream.servo import default_servo_config
+
     return {
         'network': {
             'camera_ip': '192.168.100.1',
@@ -50,7 +52,8 @@ def default_config() -> dict:
                 'min_apply': 0.5,
                 'fill_crop': True,
             },
-            'detection': {'interval': 10, 'scale': 0.4, 'confidence': 0.5, 'keypoint_threshold': 0.3},
+            'detection': {'interval': 10, 'scale': 0.4, 'confidence': 0.5,
+                          'keypoint_threshold': 0.3, 'result_timeout': 1.0},
             'movenet': {'model_path': None, 'threads': None}
         },
         'ev3': {
@@ -59,13 +62,22 @@ def default_config() -> dict:
             'home_hold': 3.0,
             'invert': {'x': False, 'y': False}, 'ports': {'pan': 'a', 'tilt': 'b'}
         },
+        # null preserves the legacy ev3.enabled selection.
+        'motors': {'backend': None},
+        'gpio_servo': default_servo_config(),
         'web': {
             'host': None, 'port': 5000,
             'preview_quality': 70, 'preview_max_edge': 640,
             'preview_max_fps': 15, 'overlay': True,
         },
         'logging': {'level': 'INFO', 'file': None, 'verbose_shifts': False},
-        'presets': {}
+        'presets': {
+            'pi4': {
+                'detection_interval': 8, 'process_scale': 0.5, 'movenet_threads': 2,
+                'camera_width': 640, 'camera_height': 480, 'camera_framerate': 15,
+                'preview_max_fps': 10,
+            },
+        }
     }
 
 
@@ -157,6 +169,17 @@ def validate_config(config: dict) -> dict:
     web = _mapping(config.get('web'), 'web')
     network = _mapping(config.get('network'), 'network')
     log_config = _mapping(config.get('logging'), 'logging')
+    motors = _mapping(config.setdefault('motors', {'backend': None}), 'motors')
+    backend = motors.get('backend')
+    if backend is not None and (not isinstance(backend, str) or backend not in {
+        'ev3', 'gpio_servo', 'none'
+    }):
+        raise ValueError('motors.backend must be ev3, gpio_servo, none, or null')
+    from pistream.servo import default_servo_config, validate_servo_config
+
+    config['gpio_servo'] = validate_servo_config(
+        config.setdefault('gpio_servo', default_servo_config())
+    )
 
     camera['port'] = _positive_int(camera.get('port'), 'camera.port', 65535)
     camera['framerate'] = _bounded_number(camera.get('framerate'), 'camera.framerate', 1, 240)
@@ -206,6 +229,9 @@ def validate_config(config: dict) -> dict:
     )
     detection['keypoint_threshold'] = _bounded_number(
         detection.get('keypoint_threshold'), 'tracker.detection.keypoint_threshold', 0, 1
+    )
+    detection['result_timeout'] = _bounded_number(
+        detection.get('result_timeout', 1.0), 'tracker.detection.result_timeout', 0.01, 60
     )
     if movenet.get('threads') is not None:
         movenet['threads'] = _positive_int(movenet['threads'], 'tracker.movenet.threads', 256)
@@ -302,6 +328,20 @@ def apply_preset(config: dict, name: str) -> dict:
         config['tracker']['movenet']['threads'] = _positive_int(
             preset['movenet_threads'], f'presets.{name}.movenet_threads', 256
         )
+    for dimension in ('width', 'height'):
+        key = f'camera_{dimension}'
+        if key in preset:
+            config['camera']['resolution'][dimension] = _positive_int(
+                preset[key], f'presets.{name}.{key}', 16384
+            )
+    if 'camera_framerate' in preset:
+        config['camera']['framerate'] = _bounded_number(
+            preset['camera_framerate'], f'presets.{name}.camera_framerate', 1, 240
+        )
+    if 'preview_max_fps' in preset:
+        config['web']['preview_max_fps'] = _bounded_number(
+            preset['preview_max_fps'], f'presets.{name}.preview_max_fps', 1, 240
+        )
     return config
 
 
@@ -332,9 +372,26 @@ def apply_cli_overrides(config: dict, args: Any) -> dict:
         config['tracker']['movenet']['threads'] = _positive_int(
             args.movenet_threads, '--movenet-threads', 256
         )
+    if getattr(args, 'motor_backend', None) is not None:
+        backend = args.motor_backend
+        if backend not in {'ev3', 'gpio_servo', 'none'}:
+            raise ValueError('--motor-backend must be ev3, gpio_servo, or none')
+        config.setdefault('motors', {})['backend'] = backend
     if getattr(args, 'no_ev3', False):
+        if motor_backend(config) == 'ev3':
+            config.setdefault('motors', {})['backend'] = 'none'
         config['ev3']['enabled'] = False
+    if getattr(args, 'no_motors', False):
+        config.setdefault('motors', {})['backend'] = 'none'
     return config
+
+
+def motor_backend(config: dict) -> str:
+    """Resolve explicit selection first, then the legacy EV3 enabled flag."""
+    selected = (config.get('motors') or {}).get('backend')
+    if selected is not None:
+        return selected
+    return 'ev3' if (config.get('ev3') or {}).get('enabled', True) else 'none'
 
 
 def configure_logging(config: dict) -> None:

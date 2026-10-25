@@ -24,6 +24,7 @@ def tracker_shell(reads=()):
     tracker._recording = False
     tracker._recording_backend = None
     tracker._rec_thread = None
+    tracker._async_detector = None
     tracker.remote_stop_pending = False
     tracker.motors = Mock(connected=False)
     tracker.tracker = SimpleNamespace(tracker_type=None)

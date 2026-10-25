@@ -23,6 +23,7 @@ class TrackerLifecycle:
         self._cleaning = False
         self._cancel: Optional[Event] = None
         self.tracker = None
+        self.last_motor_error = None
         self.thread: Optional[Thread] = None
 
     def start(self, connect_timeout: float = 15.0) -> dict:
@@ -112,6 +113,9 @@ class TrackerLifecycle:
                 self._cancel.set()
             if self.tracker is not None:
                 self.tracker.running = False
+                stop_motion = getattr(self.tracker, 'request_stop', None)
+                if stop_motion is not None:
+                    stop_motion()
             stopped = self._join_unlocked()
             if stopped:
                 if retry_pending:
@@ -165,4 +169,7 @@ class TrackerLifecycle:
             self.tracker.cleanup_pending or self.tracker.remote_stop_pending
         ):
             return
+        if self.tracker is not None:
+            error = getattr(getattr(self.tracker, 'motors', None), 'error', None)
+            self.last_motor_error = error if isinstance(error, str) else None
         self.tracker = None

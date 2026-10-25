@@ -2,10 +2,12 @@
 
 import argparse
 import logging
+import signal
 import sys
 import time
 import urllib.request
 from collections import deque
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from threading import Lock, RLock
@@ -20,8 +22,8 @@ from pistream.capture import VideoCapture
 from pistream.config import apply_cli_overrides, configure_logging, load_config
 from pistream.detect import AsyncDetector, PoseDetector
 from pistream import horizon
-from pistream.motors import MotorController
-from pistream.preview import accept_new_frame, capped_recording_fps
+from pistream.motion import create_motor_controller
+from pistream.preview import accept_new_frame, capped_recording_fps, camera_base_url, camera_stream_url
 from pistream.record import _RecordingThread
 
 logger = logging.getLogger(__name__)
@@ -130,13 +132,9 @@ class HumanTracker:
         self.config = config
 
         # Build stream URL
-        net = config['network']
         cam = config['camera']
         tracker_cfg = config['tracker']
-        url = tracker_cfg.get('stream_url')
-        if not url:
-            url = f"http://{net['camera_ip']}:{cam['port']}/stream"
-        self.stream_url = url
+        self.stream_url = camera_stream_url(config)
 
         # Settings (all from config — CLI overrides are merged before construction)
         det = tracker_cfg['detection']
@@ -155,10 +153,15 @@ class HumanTracker:
             keypoint_threshold=det['keypoint_threshold']
         )
         self.tracker = ObjectTracker()
-        self.motors = MotorController(config['ev3'])
 
         # State
         self.running = False
+        self._tracking_lock = RLock()
+        self._motor_control_lock = RLock()
+        self._motion_stopped = False
+        self._capture_generation = None
+        self._last_capture_at = None
+        self._frame_timeout = (config.get('gpio_servo') or {}).get('frame_timeout', 0.75)
         self.recording = False
         self.current_detection = None
         self._last_keypoints = None
@@ -192,7 +195,7 @@ class HumanTracker:
 
         # Recording mode: 'local' (Pi 5) or 'camera' (Pi 3B+)
         self.recording_mode = tracker_cfg.get('recording_mode', 'local')
-        self._camera_base_url = f"http://{net['camera_ip']}:{cam['port']}"
+        self._camera_base_url = camera_base_url(config)
         self._camera_token = (cam or {}).get('token') or ''
 
         # Async detector (created in connect() once we know frame size)
@@ -205,9 +208,13 @@ class HumanTracker:
         if config['logging'].get('verbose_shifts'):
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             self._shift_logger = ShiftLogger(self.output_dir / f"shifts_{ts}.txt")
+        # Acquire hardware only after all other initialization has succeeded.
+        self.motors = create_motor_controller(config)
 
     def connect(self) -> bool:
         """Connect to video stream."""
+        if self.capture is not None or self._cleaned:
+            return False
         self.capture = VideoCapture(self.stream_url)
         if not self.capture.start():
             return False
@@ -219,11 +226,21 @@ class HumanTracker:
             self._async_detector = AsyncDetector(
                 self.detector, self.process_scale,
                 self.capture.width, self.capture.height,
+                max_result_age=self.config['tracker']['detection'].get('result_timeout', 1.0),
             )
             self._async_detector.start()
             logger.info("Async detection thread started")
 
         return True
+
+    def read_frame(self):
+        """Keep acquisition time with the consumed frame even if capture advances."""
+        read_sample = getattr(self.capture, 'read_sample', None)
+        if read_sample is None:
+            return self.capture.read()
+        ret, frame, generation, captured_at = read_sample()
+        self._capture_sample = (frame, generation, captured_at)
+        return ret, frame
 
     def process_frame(self, frame: np.ndarray) -> tuple:
         """Process frame, return (annotated_frame, detection).
@@ -232,12 +249,40 @@ class HumanTracker:
         method never blocks on MoveNet inference.  Between detections the
         lightweight MOSSE tracker keeps the bounding box up-to-date.
         """
+        with getattr(self, '_tracking_lock', nullcontext()):
+            return self._process_frame(frame)
+
+    def _process_frame(self, frame: np.ndarray) -> tuple:
         self.frame_count += 1
+        self._frame_size = (frame.shape[1], frame.shape[0])
+        now = time.monotonic()
+        sample = getattr(self, '_capture_sample', None)
+        if sample is not None and sample[0] is frame:
+            _, generation, captured_at = sample
+        else:
+            generation, captured_at = getattr(self.capture, 'frame_metadata', (0, now))
+        timeout = getattr(self, '_frame_timeout', 0.75)
+        previous_at = getattr(self, '_last_capture_at', None)
+        previous_generation = getattr(self, '_capture_generation', None)
+        if (previous_generation is not None and generation != previous_generation) or (
+            previous_at is not None and captured_at - previous_at > timeout
+        ):
+            self.reset_tracking(home=False)
+        self._capture_generation = generation
+        self._last_capture_at = captured_at
+        fresh = now - captured_at <= timeout and not getattr(self, '_motion_stopped', False)
+        if fresh:
+            if hasattr(self.motors, 'frame_seen'):
+                self.motors.frame_seen(captured_at)
+            if hasattr(self.motors, 'set_frame_size'):
+                self.motors.set_frame_size(frame.shape[1], frame.shape[0])
+        else:
+            self.reset_tracking(home=False)
 
         # --- 1. Pick up async detection result (non-blocking) ---------------
         result_ready = False
         det_result = None
-        if self._async_detector is not None:
+        if fresh and self._async_detector is not None:
             result_ready, det_result = self._async_detector.poll_result()
         if det_result:
             self._detection_misses = 0
@@ -260,17 +305,17 @@ class HumanTracker:
         # --- 2. Submit frame for detection when needed ----------------------
         #   • Periodically (every N frames) to refresh the pose estimate
         #   • Urgently every frame when there is nothing to track yet
-        if self._async_detector is not None:
+        if fresh and self._async_detector is not None:
             need_detect = (
                 self.frame_count % self.detection_interval == 0
                 or not self.tracker.active
             )
             if need_detect and not self._async_detector.busy:
-                self._async_detector.submit(frame)
+                self._async_detector.submit(frame, captured_at=captured_at)
 
         # --- 3. Fast tracker update (MOSSE ≈ 0.5 ms) -----------------------
         detection = None
-        tracked_bbox = self.tracker.update(frame) if self.tracker.active else None
+        tracked_bbox = self.tracker.update(frame) if fresh and self.tracker.active else None
 
         if tracked_bbox is not None:
             detection = {
@@ -287,7 +332,7 @@ class HumanTracker:
             self._update_aim(detection)
         else:
             self.current_detection = None
-            self.motors.stop()
+            self._target_lost()
 
         angle = self._update_horizon(detection)
         leveled = self._level_frame(frame, angle)
@@ -299,8 +344,8 @@ class HumanTracker:
     def _update_aim(self, detection: dict) -> None:
         """Drive motors from the raw (unrotated) bounding box."""
         x, y, w, h = detection['bbox']
-        cx = self.capture.width // 2
-        cy = self.capture.height // 2
+        width, height = getattr(self, '_frame_size', (self.capture.width, self.capture.height))
+        cx, cy = width // 2, height // 2
         shift_x = x + w // 2 - cx
         shift_y = y + h // 4 - cy
         if self._shift_logger:
@@ -358,7 +403,8 @@ class HumanTracker:
     def _draw(self, frame: np.ndarray, detection: Optional[dict],
               angle: float = 0.0) -> np.ndarray:
         """Draw tracking overlay on an already-leveled frame."""
-        cx, cy = self.capture.width // 2, self.capture.height // 2
+        width, height = getattr(self, '_frame_size', (self.capture.width, self.capture.height))
+        cx, cy = width // 2, height // 2
 
         if self.horizon_correction:
             cv2.putText(frame, f"H:{angle:+.1f}", (cx - 30, 20),
@@ -413,14 +459,41 @@ class HumanTracker:
 
     def reset_tracking(self, home: bool = True) -> None:
         """Clear all target state and optionally return the camera to home."""
-        self.tracker.reset()
-        self.current_detection = None
-        self._last_keypoints = None
-        self._detection_misses = 0
-        self.motors.stop()
-        self.reset_horizon()
-        if home:
-            self.motors.move_to_home()
+        with getattr(self, '_tracking_lock', nullcontext()):
+            detector = self._async_detector
+            if detector is not None:
+                detector.invalidate()
+            self.tracker.reset()
+            self.current_detection = None
+            self._last_keypoints = None
+            self._detection_misses = 0
+            self._target_lost()
+            self.reset_horizon()
+            if home and not getattr(self, '_motion_stopped', False):
+                self.motors.move_to_home()
+
+    def _target_lost(self):
+        getattr(self.motors, 'target_lost', self.motors.stop)()
+
+    def request_stop(self):
+        """Disable motion immediately, before waiting for capture/model/recorders."""
+        self.running = False
+        self._motion_stopped = True
+        with getattr(self, '_motor_control_lock', nullcontext()):
+            self.motors.disconnect()
+        detector = self._async_detector
+        if detector is not None:
+            detector.invalidate()
+
+    def set_motors_enabled(self, enabled: bool) -> bool:
+        """Serialize GPIO reconnect with Stop so an old HTTP request cannot reopen it."""
+        with self._motor_control_lock:
+            if self._motion_stopped or self._cleaned or not self.running:
+                return False
+            if enabled:
+                return self.motors.connect()
+            self.motors.disconnect()
+            return True
 
     def start_recording(self):
         """Start video recording.
@@ -601,7 +674,10 @@ class HumanTracker:
     @property
     def cleanup_pending(self) -> bool:
         with self._record_lock:
-            return self.remote_stop_pending or (
+            return any(
+                resource is not None and not getattr(resource, 'closed', True)
+                for resource in (self._async_detector, self.capture)
+            ) or self.remote_stop_pending or (
                 self._rec_thread is not None and not self._rec_thread.closed.is_set()
             )
 
@@ -646,7 +722,8 @@ class HumanTracker:
     def _show_tracking_frame(self, annotated: np.ndarray) -> None:
         cv2.putText(annotated, f"FPS: {self.fps:.1f}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        ev3_text = "EV3: ON" if self.motors.connected else "EV3: OFF"
+        backend = getattr(self.motors, 'backend', 'ev3')
+        ev3_text = f"{backend}: {'ON' if self.motors.connected else 'OFF'}"
         ev3_color = (0, 255, 0) if self.motors.connected else (0, 0, 255)
         cv2.putText(annotated, ev3_text, (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, ev3_color, 2)
@@ -669,10 +746,10 @@ class HumanTracker:
                 self.running = True
                 if auto_record:
                     self.start_recording()
-                logger.info("Tracking started. Keys: q=quit, r=record, s=screenshot, d=reset, e=EV3")
+                logger.info("Tracking started. Keys: q=quit, r=record, s=screenshot, d=reset, e=motors")
                 prev_frame = None
                 while self.running:
-                    ret, frame = self.capture.read()
+                    ret, frame = self.read_frame()
                     prev_frame, is_new = accept_new_frame(prev_frame, ret, frame)
                     if is_new:
                         annotated, _ = self.process_frame(frame)
@@ -771,9 +848,10 @@ class HumanTracker:
         self._cleanup_ok = True
         logger.info("Cleaning up...")
         self.running = False
+        self._motion_stopped = True
         actions = [
+            ('motors', self, 'request_stop'),
             ('detector', self._async_detector, 'stop'),
-            ('motors', self.motors, 'disconnect'),
             ('capture', self.capture, 'stop'),
             ('shift log', self._shift_logger, 'flush'),
         ]
@@ -785,8 +863,10 @@ class HumanTracker:
             except (Exception, KeyboardInterrupt):
                 self._cleanup_ok = False
                 logger.exception("Could not clean up %s", name)
-        self._async_detector = None
-        self.capture = None
+        if self._async_detector is not None and getattr(self._async_detector, 'closed', True):
+            self._async_detector = None
+        if self.capture is not None and getattr(self.capture, 'closed', True):
+            self.capture = None
         self.stop_recording()
         return self._cleanup_ok
 
@@ -850,7 +930,9 @@ def parse_args():
 
     # EV3
     parser.add_argument('--no-ev3', action='store_true', help='Disable EV3')
-    parser.add_argument('--preset', help='Performance preset from config.yaml (pi3, pi5, fast, quality)')
+    parser.add_argument('--motor-backend', choices=['ev3', 'gpio_servo', 'none'], help='Pan/tilt controller')
+    parser.add_argument('--no-motors', action='store_true', help='Disable all motion controllers')
+    parser.add_argument('--preset', help='Performance preset from config.yaml (pi3, pi4, pi5, fast, quality)')
 
     return parser.parse_args()
 
@@ -865,7 +947,17 @@ def main():
     configure_logging(config)
 
     tracker = HumanTracker(config)
-    raise SystemExit(tracker.run(display=not args.no_display, auto_record=args.auto_record))
+
+    def terminate(_signum, _frame):
+        raise KeyboardInterrupt
+
+    previous_handler = signal.signal(signal.SIGTERM, terminate)
+    try:
+        result = tracker.run(display=not args.no_display, auto_record=args.auto_record)
+    finally:
+        tracker.cleanup()
+        signal.signal(signal.SIGTERM, previous_handler)
+    raise SystemExit(result)
 
 
 if __name__ == "__main__":

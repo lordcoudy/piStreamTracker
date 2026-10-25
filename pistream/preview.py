@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 
 def accept_new_frame(prev, ret: bool, frame):
     """Return (frame_or_prev, is_new). Same capture buffer is not a new frame."""
@@ -46,9 +48,22 @@ def capped_recording_fps(requested: float, source_fps: float) -> float:
 
 
 def camera_stream_url(config: dict) -> str:
-    """MJPEG URL on the camera Pi."""
+    """One configured source for tracking and the overlay-free preview."""
+    custom = (config.get('tracker') or {}).get('stream_url')
+    if custom:
+        return custom
+    return f'{camera_base_url(config)}/stream'
+
+
+def camera_base_url(config: dict) -> str:
+    """Camera controls/files use the stream origin, including localhost overrides."""
+    custom = (config.get('tracker') or {}).get('stream_url')
+    if custom:
+        parsed = urlsplit(custom)
+        if parsed.scheme in {'http', 'https'} and parsed.netloc:
+            return f'{parsed.scheme}://{parsed.netloc}'
     net = config.get('network') or {}
     cam = config.get('camera') or {}
     ip = net.get('camera_ip') or '192.168.100.1'
     port = cam.get('port') or 8000
-    return f"http://{ip}:{port}/stream"
+    return f"http://{ip}:{port}"
