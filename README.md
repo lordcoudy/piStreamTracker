@@ -26,7 +26,8 @@ camera.py                     tracker.py  or  web.py
 
 The current `config.yaml` was checked on a camera Pi 4 (`pi3.local`) and tracker
 Pi 5 on 2026-10-29: 1280×960, 4:3, 30 capture/recording FPS, JPEG quality 80,
-camera-side H.264 and two MoveNet threads. Its room-light WB is red 1.1368712 /
+camera-side H.264 and two MoveNet threads. The current saved exposure mode is Auto, with a retained manual draft of
+33.3 ms / gain 10.66. Its room-light WB is red 1.1368712 /
 blue 1.86235795; use automatic WB after lighting changes. Confidence 0.4 retained
 the dim-room person detection that was borderline at 0.5, and the exit check
 showed no detections in the final ten seconds. The `pi5` launcher preset keeps
@@ -78,7 +79,7 @@ bounds fixed imports. Picamera2/libcamera remain installed through apt.
 - Aims at the upper half of the box (head/torso)
 - EV3 pan/tilt with deadzone, home-hold after Reset, D-pad
 - GPIO SG90 commands through local `pigpiod`, independent calibration and mechanical limits, speed caps, and a fresh-frame watchdog
-- Web UI: overlay or raw-camera proxy, zoom, horizon preview, recordings
+- Web UI: camera-only or annotated preview, saved image/preview settings, zoom, horizon preview, recordings
 - Local H.264 (ffmpeg, hardware when available) or camera-side H.264/MP4 via Picamera2/PyavOutput
 - Stream reconnects after a camera reboot; status shows `stream_lost`
 - Optional Bearer token on every `/record/*` operation; cap on concurrent `/stream` clients
@@ -180,11 +181,30 @@ or recording. **Start** opens the preview, and **Stop** keeps camera-only viewin
 available. The tracking-overlay preference is kept for the next tracking session.
 
 The **Camera settings** panel below the preview changes and saves capture format,
-FPS, white balance and exposure on the camera Pi. **Save & apply** writes the
+FPS, white balance, exposure, brightness, contrast, saturation, sharpness,
+noise reduction and exposure compensation on the camera Pi. **Save & apply** writes the
 camera service's active YAML atomically; changes survive service restarts and
 reboots. It offers 1280×720/1920×1080 at 16:9 and 1280×960 at 4:3, with 25 or
 30 camera frames/s. Format/FPS changes briefly stop and resume an active tracker;
-recording must be stopped first. Other tracker settings remain session-only.
+recording must be stopped first. Unsupported image controls are disabled.
+Exposure compensation is measured in EV stops and applies only with automatic
+exposure; its saved value is retained while manual exposure is selected.
+Neutral values are brightness/EV 0 and contrast/saturation/sharpness 1.
+Noise reduction offers Off, Fast, High quality and Minimal; Fast preserves the
+existing video default. Higher sharpening can emphasize noise, and stronger
+denoising can smooth fine detail.
+
+The separate **Web preview** panel saves resolution (maximum edge, retaining
+aspect ratio) and JPEG quality on the tracker Pi. Native uses the camera's
+dimensions; smaller limits never upscale the source. These settings affect both
+annotated and camera-only viewing, without changing capture, detection or video
+recordings. Both preview paths now resize/re-encode at the configured preview
+FPS budget; camera-only viewing also incurs that processing cost. The defaults
+are a 640-pixel maximum edge and JPEG quality 70. Save updates an existing viewer
+and keeps a hidden viewer hidden, without starting/stopping the tracker or
+consuming pending autostart. Both settings panels persist across service restarts.
+On a standalone Pi, shared file locking prevents concurrent camera/preview saves
+from overwriting each other's YAML fields. Other tracker settings remain session-only.
 
 The supplied Pi 4 was measured at 25.000 capture frames/s (39,999 µs frame
 duration). IMX219 uses the binned 1640×1232/10-bit sensor mode for 720p and
@@ -508,7 +528,8 @@ first use; the synthetic stream exercises controls and transport, not pose quali
 | Start / Stop | Starts/stops tracking and cancels a pending automatic start. Start connects to the camera stream and fails if it is down. |
 | Home / Reset | Clears detection and homes the selected controller; auto-track holds for its configured `home_hold` |
 | Record / Screenshot | Local files under `tracker.output_dir`, or camera Pi if `recording_mode: camera`; an unreachable camera recorder falls back locally |
-| Tracking overlay | Off = proxy the camera MJPEG (lowest delay). On = annotated preview at `preview_max_fps` / `preview_max_edge` |
+| Tracking overlay | Off = camera image without annotations. On = tracked annotations. Both use saved Web preview resolution/quality and `preview_max_fps`. |
+| Camera settings / Web preview | Independent saved camera image controls and browser resolution/JPEG quality; preview saves keep hidden viewing off. |
 | Auto-Level | Rotate the **preview** to level shoulders/hips; motors still use the raw box |
 | D-pad / Zoom | Manual pan/tilt; digital zoom on the preview only |
 | Recordings | Lists, downloads, and deletes `.mp4` / `.avi` / stills from both Pis. Active recordings cannot be deleted. |
@@ -555,6 +576,12 @@ camera:
   exposure_mode: auto      # auto | manual
   exposure_time_us: 20000  # used in manual exposure, must fit one frame
   analogue_gain: 1.0       # used in manual exposure
+  brightness: 0.0         # -1..1
+  contrast: 1.0           # 0..32
+  saturation: 1.0         # 0..32
+  sharpness: 1.0          # 0..16
+  noise_reduction: fast   # off | fast | high_quality | minimal
+  exposure_value: 0.0     # -8..8 EV stops, automatic exposure only
   token: null              # Bearer for /record/* and /camera/settings; empty = open LAN
   max_stream_clients: 4
 

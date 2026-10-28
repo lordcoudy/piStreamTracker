@@ -41,6 +41,7 @@ use the source and this map for current ownership.
 |---|---|---|
 | Camera service | [camera.py](camera.py) | Picamera2 and optional sensor tuning, threaded MJPEG HTTP server, camera H.264 recorder, `/record/*` and `/camera/settings` APIs |
 | Persisted camera controls | [camera_settings.py](pistream/camera_settings.py), [camera_api.py](pistream/camera_api.py) | Validated WB/exposure/format controls, atomic camera-host YAML save and runtime rollback; bounded authenticated tracker proxy |
+| Persisted web preview | [preview_settings.py](pistream/preview_settings.py), [config_store.py](pistream/config_store.py) | Tracker-host preview resolution/JPEG quality, atomic YAML save and shared process file locking |
 | Shared IMX219 camera profile | [imx219-160-colour.json](tuning/imx219-160-colour.json), [tuning notes](tuning/README.md) | Original sensor tuning plus measured static colour shading; previous no-ALSC file retained for rollback |
 | Desktop/headless tracker | [tracker.py](tracker.py), [track.py](pistream/track.py) | CLI parsing, `HumanTracker`, `ObjectTracker`, rendering, screenshots, recording coordination |
 | Web controls | [web.py](web.py), [web_app.py](pistream/web_app.py) | Flask routes, preview, runtime settings, recordings proxy, background tracker loop |
@@ -187,9 +188,16 @@ when the overlay preference is on; Start shows tracking output and Stop leaves
 camera-only viewing available. Status transitions reconnect the image source.
 **Hide camera** releases only that viewer and remains hidden across polling,
 overlay changes and camera-setting saves. The overlay preference is preserved.
-Raw preview reads complete multipart JPEG parts without decoding/re-encoding,
-preserving APP/EXIF bytes and normalizing the downstream boundary. Frames are
-bounded to 8 MiB and MIME headers to 16 KiB. Initial offline state and upstream
+GET/POST `/api/preview/settings` independently stores maximum edge/JPEG quality
+in the tracker host's active `--config` file. Saves update current viewers live,
+keep a hidden viewer hidden and do not touch tracking or pending autostart.
+Camera-only preview reads complete multipart JPEG parts and normalizes the
+downstream boundary. Both preview paths apply the saved maximum edge/JPEG quality
+and configured FPS budget; camera-only JPEGs are decoded/resized/re-encoded.
+The raw multipart parser preserves APP/EXIF bytes, while re-encoding discards
+that metadata. JPEG SOF dimensions are checked before decode (16 MP maximum,
+16384 pixels per axis), frames are bounded to 8 MiB and MIME headers to 16 KiB.
+Initial offline state and upstream
 EOF/reset produce a cached No Signal frame and retry with 0.5–3 second backoff
 and a five-second connection/read timeout. A browser disconnect closes its
 single upstream connection. An active tracker's initial raw-source failure
@@ -257,9 +265,16 @@ also changes in-memory web config. The camera panel is persistent: settings are
 sent to the configured camera origin, which alone rewrites its active YAML.
 `CameraSettings` preserves unrelated latest YAML fields and file permissions,
 uses a flushed/fsynced temporary file plus atomic replace, and rolls back camera
-controls/output if application or persistence fails. New setting fields are
+controls/output if application or persistence fails. Camera and preview writers
+share a stable sibling file lock around read/modify/replace, preserving both
+sections when standalone processes save concurrently. New setting fields are
 `awb_mode`, `colour_gains` (red/blue), `exposure_mode`, `exposure_time_us` and
-`analogue_gain`; old YAML defaults to automatic WB/AE. Runtime format changes
+`analogue_gain`, plus `brightness`, `contrast`, `saturation`, `sharpness`,
+`noise_reduction` and `exposure_value`. Old YAML keeps neutral image controls
+and Picamera2's Fast video noise-reduction default. Native advertised control
+limits restrict requests; unsupported controls are disabled/omitted in the UI
+and explicitly requested unsupported values fail. EV is saved while manual AE
+is selected and applied when automatic exposure is restored. Runtime format changes
 accept 1280×720, 1280×960 or 1920×1080 and 25–40 FPS; the UI offers 25/30.
 Legacy startup geometries/presets remain accepted. Exposure is bounded by both
 camera-advertised limits and frame duration. FrameDurationLimits fixes the capture
@@ -277,7 +292,8 @@ Web mode is selected by `web.py` or `run_tracker.sh --web`; the unused
 `web.enabled` default and YAML entry have been removed.
 The current two-Pi `config.yaml` targets a Pi 4 camera and Pi 5 tracker:
 1280×960/30, full-width IMX219 mode, manual room-light WB 1.1368712/1.86235795,
-autoexposure, camera-side H.264, two inference threads and confidence 0.4.
+the user's current Auto exposure (manual draft 33.3 ms/gain 10.66), camera-side H.264,
+two inference threads and confidence 0.4.
 Its `pi5` file preset also uses two threads so the launcher preserves that budget;
 built-in defaults and explicit fast/quality presets retain their own values.
 EV3 pan=A/tilt=B use inversions false/true, max speed 25, cooldown 0.25 seconds
@@ -400,6 +416,7 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 | Camera tuning/startup/API/auth/client slots | [test_camera_server.py](tests/test_camera_server.py), [test_camera_auth.py](tests/test_camera_auth.py), [test_config.py](tests/test_config.py) |
 | Camera controls, atomic persistence/rollback and proxy lifecycle | [test_camera_settings.py](tests/test_camera_settings.py), [test_camera_settings_routes.py](tests/test_camera_settings_routes.py) |
 | Raw preview EOF/offline/MIME recovery and viewer cleanup | [test_web_preview_recovery.py](tests/test_web_preview_recovery.py), [browser_preview_recovery.cjs](tests/browser_preview_recovery.cjs), [preview_recovery_fixture.py](tests/preview_recovery_fixture.py) |
+| Saved preview geometry/quality, JPEG pixel limits and concurrent YAML saves | [test_preview_settings.py](tests/test_preview_settings.py), [test_config_store.py](tests/test_config_store.py) |
 | Independent preview and shared static colour shading | [test_web_preview.py](tests/test_web_preview.py), [test_camera_profiles.py](tests/test_camera_profiles.py) |
 | UI/package layout and API errors/validation | [test_package.py](tests/test_package.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Network/service/udev planning | [test_install.py](tests/test_install.py) |
@@ -429,6 +446,19 @@ web download matched the 5,092,484-byte file and ffmpeg decoded a frame. Trackin
 continued at 29.97 FPS during recording. A later camera/tracker sample measured
 43.3°C/61.5°C with `throttled=0x0` and no service restarts on either host. These
 are measured live checks, not a sustained thermal or full mechanical-range test.
+
+The saved image/preview-controls update passed 587 tests and 85 subtests,
+Ruff and browser flows at 320/768/1200px. All six native image controls were
+advertised by the live IMX219 camera and saved through the web UI. Non-default
+image controls and a 320/Q55 preview survived restarting both services without
+changing existing WB/exposure/capture settings. Saving with the viewer hidden
+kept tracking/motors off. Manual exposure retained its EV draft. An open
+camera-only viewer changed from 320×240 to 1280×960 without reconnecting;
+Q55/Q85 produced different actual JPEG quantization tables. The tracking
+preview also delivered 1280×960/Q85, with median processing 29.99 FPS over a
+short 12-sample check and no stream/motor errors. Final settings restored neutral
+image adjustments and the previous 640/Q70 preview; the user's latest Auto
+exposure, manual shutter draft and white balance were preserved.
 
 The paired-camera/EV3 update passed 510 tests and 85 subtests, plus Ruff.
 USB regression tests cover missing replies, lock recovery, explicit disposal,
