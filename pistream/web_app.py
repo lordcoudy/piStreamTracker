@@ -10,6 +10,7 @@ import signal
 import time
 import urllib.error
 import urllib.request
+from email.message import Message
 from functools import wraps
 from pathlib import Path
 from threading import Event, Lock, RLock, current_thread, main_thread
@@ -309,36 +310,158 @@ def _generate_overlay_preview():
         last_emit = now
 
 
-def _proxy_camera_stream():
-    """Pass through camera MJPEG so the tracker does not re-encode."""
-    url = camera_stream_url(_config)
+def _camera_boundary(response):
+    message = Message()
+    message['Content-Type'] = response.headers.get('Content-Type', '')
+    boundary = message.get_param('boundary')
+    if not message.get_content_type().startswith('multipart/') or not isinstance(boundary, str):
+        raise ValueError('Camera preview requires a multipart JPEG stream')
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'piStreamTracker/preview'})
-        resp = urllib.request.urlopen(req, timeout=5)
-    except Exception as exc:
-        logger.warning(f"Camera proxy failed ({url}): {exc}")
-        return None
+        boundary = boundary.encode('ascii')
+    except UnicodeEncodeError as exc:
+        raise ValueError('Invalid camera multipart boundary') from exc
+    if not 1 <= len(boundary) <= 70 or any(value < 32 or value > 126 for value in boundary):
+        raise ValueError('Invalid camera multipart boundary')
+    return b'--' + boundary
 
-    content_type = resp.headers.get(
-        'Content-Type', 'multipart/x-mixed-replace; boundary=FRAME'
-    )
+
+def _camera_jpegs(response, max_frame_bytes=8 * 1024 * 1024):
+    """Read complete MIME parts; JPEG metadata may contain marker-like bytes."""
+    boundary = _camera_boundary(response)
+    max_headers = 16 * 1024
+    pending = None
+
+    def read_line(limit):
+        line = response.readline(limit + 1)
+        if len(line) > limit:
+            raise ValueError('Camera JPEG exceeds preview size limit')
+        return line
+
+    while True:
+        line = pending
+        pending = None
+        skipped = 0
+        while line is None or line.rstrip(b'\r\n') not in (boundary, boundary + b'--'):
+            line = read_line(max_headers)
+            if not line:
+                return
+            skipped += len(line)
+            if skipped > max_headers:
+                raise ValueError('Camera multipart preamble is too large')
+        if line.rstrip(b'\r\n') == boundary + b'--':
+            return
+        headers = {}
+        header_size = 0
+        while True:
+            line = read_line(max_headers)
+            if not line:
+                return
+            header_size += len(line)
+            if header_size > max_headers:
+                raise ValueError('Camera multipart headers are too large')
+            if line in (b'\r\n', b'\n'):
+                break
+            name, separator, value = line.partition(b':')
+            if not separator:
+                raise ValueError('Invalid camera multipart header')
+            headers[name.strip().lower()] = value.strip()
+        length = headers.get(b'content-length')
+        if length is not None:
+            try:
+                length = int(length)
+            except ValueError as exc:
+                raise ValueError('Invalid camera JPEG Content-Length') from exc
+            if not 1 <= length <= max_frame_bytes:
+                raise ValueError('Camera JPEG exceeds preview size limit')
+            image = bytearray()
+            while len(image) < length:
+                chunk = response.read(length - len(image))
+                if not chunk:
+                    return  # A reboot may cut a part short; never forward it.
+                image.extend(chunk)
+        else:
+            image = bytearray()
+            while True:
+                line = read_line(max_frame_bytes + len(boundary) + 6 - len(image))
+                if not line:
+                    return
+                if line.rstrip(b'\r\n') in (boundary, boundary + b'--'):
+                    pending = line
+                    if image.endswith(b'\r\n'):
+                        del image[-2:]
+                    elif image.endswith(b'\n'):
+                        del image[-1:]
+                    break
+                image.extend(line)
+                if len(image) > max_frame_bytes + 2:
+                    raise ValueError('Camera JPEG exceeds preview size limit')
+            if len(image) > max_frame_bytes:
+                raise ValueError('Camera JPEG exceeds preview size limit')
+        if not image.startswith(b'\xff\xd8') or not image.endswith(b'\xff\xd9'):
+            raise ValueError('Invalid camera JPEG part')
+        yield bytes(image)
+
+
+def _proxy_camera_stream():
+    """Reframe raw JPEGs and reconnect one upstream stream per visible viewer."""
+    url = camera_stream_url(_config)
+    initial = None
+    if _active_tracker() is not None:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'piStreamTracker/preview'})
+            initial = urllib.request.urlopen(req, timeout=5)
+            _camera_boundary(initial)
+        except Exception as exc:
+            if initial is not None:
+                initial.close()
+            logger.warning('Raw camera preview unavailable (%s): %s', url, exc)
+            return None  # Preserve processed-frame fallback for non-MJPEG sources.
+
+    def close_initial():
+        nonlocal initial
+        if initial is not None:
+            initial.close()
+            initial = None
 
     def generate():
+        nonlocal initial
+        resp, initial = initial, None
+        placeholder = _mjpeg_part(_placeholder_jpeg())
+        delay = 0.5
+        failed = False
         try:
             while True:
-                chunk = resp.read(8192)
-                if not chunk:
-                    break
-                yield chunk
-        except Exception:
-            return
+                # Detect a hidden viewer before another connection attempt.
+                yield placeholder
+                try:
+                    if resp is None:
+                        req = urllib.request.Request(url, headers={'User-Agent': 'piStreamTracker/preview'})
+                        resp = urllib.request.urlopen(req, timeout=5)
+                    for jpeg in _camera_jpegs(resp):
+                        delay = 0.5
+                        failed = False
+                        yield _mjpeg_part(jpeg)
+                except Exception as exc:
+                    if not failed:
+                        logger.warning('Camera preview disconnected (%s): %s', url, exc)
+                    failed = True
+                finally:
+                    if resp is not None:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                        resp = None
+                yield placeholder
+                time.sleep(delay)
+                delay = min(delay * 2, 3.0)
         finally:
-            try:
+            if resp is not None:
                 resp.close()
-            except Exception:
-                pass
 
-    return Response(generate(), content_type=content_type)
+    response = Response(generate(), content_type='multipart/x-mixed-replace; boundary=frame')
+    response.call_on_close(close_initial)
+    return response
 
 
 @app.route('/video_feed')
