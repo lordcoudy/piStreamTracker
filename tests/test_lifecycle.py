@@ -38,6 +38,53 @@ def _loop_until_stopped(tracker):
 
 
 class TrackerLifecycleTests(unittest.TestCase):
+    def test_cancelled_guard_prevents_tracker_acquisition(self):
+        cancelled = Event()
+        cancelled.set()
+        factory = Mock(side_effect=FakeTracker)
+        life = TrackerLifecycle(factory, _loop_until_stopped)
+
+        self.assertEqual(life.start(unless_cancelled=cancelled)['status'], 'cancelled')
+        factory.assert_not_called()
+        self.assertIsNone(life.tracker)
+        self.assertIsNone(life.thread)
+
+    def test_stop_during_guarded_connect_cancels_admitted_worker(self):
+        connecting = Event()
+        release_connect = Event()
+        cancelled = Event()
+
+        class GatedTracker(FakeTracker):
+            def connect(self):
+                connecting.set()
+                release_connect.wait(2)
+                return super().connect()
+
+        fake = GatedTracker()
+        factory = Mock(return_value=fake)
+        life = TrackerLifecycle(factory, _loop_until_stopped, join_timeout=0.01)
+        results = []
+        starter = Thread(target=lambda: results.append(life.start(
+            connect_timeout=1, unless_cancelled=cancelled)), daemon=True)
+        starter.start()
+        try:
+            self.assertTrue(connecting.wait(1))
+            cancelled.set()
+            self.assertEqual(life.stop()['status'], 'stopping')
+            release_connect.set()
+            starter.join(1)
+            self.assertFalse(starter.is_alive())
+            self.assertEqual(results[0]['status'], 'error')
+            self.assertFalse(fake.running)
+            self.assertFalse(fake._loop_entered.is_set())
+            self.assertEqual(fake.cleaned, 1)
+            self.assertEqual(life.start(unless_cancelled=cancelled)['status'], 'cancelled')
+            factory.assert_called_once_with()
+        finally:
+            release_connect.set()
+            life.stop()
+            starter.join(1)
+
     def test_start_fails_when_stream_does_not_connect(self):
         life = TrackerLifecycle(lambda: FakeTracker(connect_ok=False), _loop_until_stopped)
         result = life.start(connect_timeout=2.0)
@@ -317,6 +364,78 @@ class DelayedTrackerLifecycleTests(unittest.TestCase):
         timer.function()
         self.factory.assert_not_called()
         self.assertIsNone(self.life.tracker)
+
+    def test_preview_cancellation_consumes_pending_autostart_without_a_tracker(self):
+        self.life.schedule_start(120)
+        timer = self.timers[0]
+        self.life.cancel_scheduled_start()
+        self.assertTrue(timer.finished.is_set())
+        timer.function()
+        self.factory.assert_not_called()
+        self.assertIsNone(self.life.tracker)
+
+    def test_preview_cancellation_preserves_a_running_tracker(self):
+        self.assertEqual(self.life.start()['status'], 'ok')
+        tracker = self.life.tracker
+        self.life.schedule_start(120)
+        timer = self.timers[0]
+        self.life.cancel_scheduled_start()
+        timer.function()
+        self.assertIs(self.life.tracker, tracker)
+        self.assertTrue(tracker.running)
+        self.assertEqual(tracker.cleaned, 0)
+        self.factory.assert_called_once_with()
+
+    def test_preview_cancellation_blocks_callback_already_waiting_for_admission(self):
+        self.life.schedule_start(120)
+        entered = Event()
+        release = Event()
+        original_start = self.life._start
+
+        def gated_start(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return original_start(*args, **kwargs)
+
+        with patch.object(self.life, '_start', side_effect=gated_start):
+            callback = Thread(target=self.timers[0].function)
+            callback.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.life.cancel_scheduled_start()
+            finally:
+                release.set()
+                callback.join(2)
+        self.assertFalse(callback.is_alive())
+        self.factory.assert_not_called()
+        self.assertIsNone(self.life.tracker)
+
+    def test_preview_cancellation_does_not_cancel_an_admitted_manual_start(self):
+        connecting = Event()
+        release = Event()
+
+        class ConnectingTracker(FakeTracker):
+            def connect(self):
+                connecting.set()
+                release.wait(2)
+                return super().connect()
+
+        tracker = ConnectingTracker()
+        self.factory.side_effect = lambda: tracker
+        results = []
+        starter = Thread(target=lambda: results.append(self.life.start(connect_timeout=2)))
+        starter.start()
+        try:
+            self.assertTrue(connecting.wait(1))
+            self.life.cancel_scheduled_start()
+        finally:
+            release.set()
+            starter.join(2)
+        self.assertFalse(starter.is_alive())
+        self.assertEqual(results, [{'status': 'ok'}])
+        self.assertIs(self.life.tracker, tracker)
+        self.assertTrue(tracker.running)
+        self.assertEqual(tracker.cleaned, 0)
 
     def test_old_callback_cannot_consume_a_replacement_schedule(self):
         self.life.schedule_start(120)

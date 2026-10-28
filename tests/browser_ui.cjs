@@ -10,9 +10,33 @@ async function main() {
         ...(process.env.PLAYWRIGHT_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE } : {}),
     });
     try {
-        const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+        async function newPage(options) {
+            const page = await browser.newPage(options);
+            let settings = {
+                resolution: { width: 1280, height: 960 }, framerate: 25,
+                awb_mode: 'auto', colour_gains: [1.5, 1.6],
+                exposure_mode: 'auto', exposure_time_us: 20000, analogue_gain: 1,
+            };
+            await page.route('**/api/camera/settings', route => {
+                if (route.request().method() === 'POST') settings = route.request().postDataJSON();
+                return route.fulfill({ json: {
+                    status: 'ok', settings, saved: true,
+                    limits: { AnalogueGain: { min: 1, max: 10.67, default: 1 } },
+                    metadata: { ExposureTime: 12000, AnalogueGain: 1.2, ColourGains: [1.5, 1.6], ColourTemperature: 4500, FrameDuration: 40000 },
+                } });
+            });
+            await page.route('**/api/preview', route => route.fulfill({ json: {
+                status: 'ok', enabled: route.request().postDataJSON().enabled,
+            } }));
+            return page;
+        }
+        const page = await newPage({ viewport: { width: 390, height: 844 } });
         const errors = [];
+        let cameraPosts = 0;
         page.on('pageerror', error => errors.push(error.message));
+        page.on('request', request => {
+            if (request.method() === 'POST' && request.url().endsWith('/api/camera/settings')) cameraPosts++;
+        });
         await page.goto(baseUrl);
         await page.waitForFunction(() => document.getElementById('btn-stop').textContent === 'Retry camera stop');
         assert(await page.locator('#btn-start').isDisabled());
@@ -40,6 +64,18 @@ async function main() {
         assert(await page.locator('#btn-record').isDisabled());
         assert(await page.locator('#recording-warning').isHidden());
         assert.equal((await (await page.request.get(baseUrl + '/__fixture/state')).json()).stop_calls, 2);
+
+        assert.equal(await page.locator('#video-feed').getAttribute('src'), null);
+        await page.locator('#btn-preview').click();
+        await page.waitForFunction(() => document.getElementById('btn-preview').getAttribute('aria-pressed') === 'true');
+        assert.match(await page.locator('#video-feed').getAttribute('src'), /\/video_feed\?t=/);
+        assert(await page.locator('#overlay-toggle').isChecked());
+        assert(await page.locator('#btn-start').isEnabled());
+        await page.locator('#btn-preview').click();
+        assert.equal(await page.locator('#video-feed').getAttribute('src'), null);
+        assert(await page.locator('#preview-placeholder').isVisible());
+        await page.locator('#btn-preview').click();
+        await page.waitForFunction(() => document.getElementById('btn-preview').getAttribute('aria-pressed') === 'true');
 
         // Idle Stop must remain available to cancel a pending automatic start.
         let releaseIdleStop;
@@ -82,15 +118,17 @@ async function main() {
         releaseStart();
         await page.waitForFunction(() => !document.getElementById('btn-start').disabled);
 
-        for (const width of [390, 900, 1200]) {
+        for (const width of [320, 390, 768, 900, 1024, 1200]) {
             await page.setViewportSize({ width, height: 844 });
             const layout = await page.evaluate(() => {
                 const video = document.querySelector('.video-container').getBoundingClientRect();
                 const controls = document.querySelector('.controls').getBoundingClientRect();
-                return { video: video.toJSON(), controls: controls.toJSON(), scrollWidth: document.documentElement.scrollWidth, innerWidth };
+                const settings = document.querySelector('.camera-settings').getBoundingClientRect();
+                return { video: video.toJSON(), controls: controls.toJSON(), settings: settings.toJSON(), scrollWidth: document.documentElement.scrollWidth, innerWidth };
             });
+            assert(layout.settings.top >= layout.video.bottom, `Camera settings must be below preview at ${width}px`);
             if (width <= 900) {
-                assert(layout.controls.top >= layout.video.bottom, `Controls must stack at ${width}px`);
+                assert(layout.controls.top >= layout.settings.bottom, `Controls must stack at ${width}px`);
                 assert(layout.video.width >= width - 40, `Preview must fill mobile content at ${width}px`);
             } else {
                 assert.equal(layout.controls.width, 300);
@@ -99,7 +137,81 @@ async function main() {
             assert(layout.scrollWidth <= layout.innerWidth, `Page must fit ${width}px viewport`);
         }
 
-        const stoppingPage = await browser.newPage();
+        // Camera edits stay local until Save, survive status polling, and are
+        // restored from the saved server settings by Reload or a page reload.
+        await page.locator('#camera-settings-form').waitFor();
+        await page.waitForFunction(() => !document.getElementById('camera-save').disabled);
+        assert.equal(await page.locator('#camera-aspect').inputValue(), '4:3');
+        assert.equal(await page.locator('#camera-resolution').inputValue(), '1280x960');
+        assert.match(await page.locator('#camera-current-readings').textContent(), /12\.0 ms.*4500 K.*25\.0 camera FPS/);
+        assert.equal(await page.locator('#camera-analogue-gain').getAttribute('max'), '10.67');
+        await page.locator('#camera-aspect').selectOption('16:9');
+        await page.locator('#camera-resolution').selectOption('1920x1080');
+        await page.locator('#camera-framerate').selectOption('30');
+        await page.locator('#camera-awb-mode').selectOption('manual');
+        await page.locator('#camera-red-gain').fill('2.2');
+        await page.locator('#camera-blue-gain').fill('1.6');
+        await page.locator('#camera-exposure-mode').selectOption('manual');
+        await page.locator('#camera-exposure-ms').fill('10');
+        await page.locator('#camera-analogue-gain').fill('2');
+        await page.waitForResponse(response => response.url().endsWith('/api/status'));
+        assert.equal(await page.locator('#camera-resolution').inputValue(), '1920x1080');
+        assert.equal(await page.locator('#camera-exposure-ms').inputValue(), '10');
+        assert.equal(cameraPosts, 0, 'Editing or polling must not save the camera draft');
+
+        let releaseCameraSave;
+        let enteredCameraSave;
+        let submittedSettings;
+        const cameraSaveGate = new Promise(resolve => { releaseCameraSave = resolve; });
+        const cameraSaveEntered = new Promise(resolve => { enteredCameraSave = resolve; });
+        await page.route('**/api/camera/settings', async route => {
+            if (route.request().method() !== 'POST') return route.fallback();
+            submittedSettings = route.request().postDataJSON();
+            enteredCameraSave();
+            await cameraSaveGate;
+            return route.fallback();
+        });
+        await page.locator('#camera-save').click();
+        await cameraSaveEntered;
+        assert(await page.locator('#camera-save').isDisabled());
+        assert(await page.locator('#camera-reload').isDisabled());
+        await page.waitForResponse(response => response.url().endsWith('/api/status'));
+        assert(await page.locator('#camera-save').isDisabled());
+        releaseCameraSave();
+        await page.waitForFunction(() => document.getElementById('camera-settings-status').textContent.includes('saved'));
+        assert.deepEqual(submittedSettings, {
+            resolution: { width: 1920, height: 1080 }, framerate: 30,
+            awb_mode: 'manual', colour_gains: [2.2, 1.6],
+            exposure_mode: 'manual', exposure_time_us: 10000, analogue_gain: 2,
+        });
+        assert.match(await page.locator('#video-feed').getAttribute('src'), /\/video_feed\?t=/);
+        assert.equal(await page.evaluate(() => document.documentElement.style.getPropertyValue('--stream-aspect')), '1920/1080');
+        await page.locator('#camera-red-gain').fill('3');
+        await page.locator('#camera-reload').click();
+        await page.waitForFunction(() => document.getElementById('camera-red-gain').value === '2.2');
+        await page.reload();
+        await page.waitForFunction(() => document.getElementById('camera-resolution').value === '1920x1080');
+        assert.equal(await page.locator('#camera-exposure-ms').inputValue(), '10');
+        await page.locator('#camera-exposure-ms').fill('40');
+        await page.locator('#camera-save').click();
+        assert.match(await page.locator('#camera-settings-status').textContent(), /exposure.*33\.33|33\.33.*exposure/i);
+        assert.equal(await page.locator('#camera-exposure-ms').inputValue(), '40');
+        await page.locator('#camera-exposure-ms').fill('12');
+        await page.route('**/api/camera/settings', route => route.fulfill({ status: 503, json: { status: 'error', message: 'Camera unavailable' } }));
+        await page.locator('#camera-save').click();
+        await page.waitForFunction(() => document.getElementById('camera-settings-status').textContent.includes('Camera unavailable'));
+        assert.equal(await page.locator('#camera-exposure-ms').inputValue(), '12');
+        assert(await page.locator('#camera-save').isEnabled());
+        await page.route('**/api/camera/settings', route => route.fulfill({ json: {
+            status: 'ok', saved: true, settings: route.request().postDataJSON(),
+            warning: 'Tracking restart failed. Press Start to retry.',
+        } }));
+        await page.locator('#camera-save').click();
+        await page.waitForFunction(() => document.getElementById('camera-settings-status').textContent.includes('Tracking restart failed'));
+        assert.match(await page.locator('#camera-settings-status').getAttribute('class'), /warning/);
+        assert.match(await page.locator('#log-output').textContent(), /Tracking restart failed/);
+
+        const stoppingPage = await newPage();
         stoppingPage.on('pageerror', error => errors.push(error.message));
         await stoppingPage.route('**/api/status', route => route.fulfill({ json: {
             running: false, recording: false, fps: 0, shift_x: null, shift_y: null,
@@ -112,7 +224,7 @@ async function main() {
         assert(await stoppingPage.locator('#btn-stop').isEnabled());
         assert(await stoppingPage.locator('#btn-record').isDisabled());
 
-        const recordingPage = await browser.newPage();
+        const recordingPage = await newPage();
         recordingPage.on('pageerror', error => errors.push(error.message));
         await recordingPage.route('**/api/status', route => route.fulfill({ json: {
             running: true, recording: true, fps: 10, shift_x: null, shift_y: null,
@@ -124,8 +236,10 @@ async function main() {
         assert(await recordingPage.locator('#btn-record').isEnabled());
         assert.equal(await recordingPage.locator('#btn-record').textContent(), 'Stop Rec');
         assert.equal(await recordingPage.locator('#btn-stop').textContent(), 'Stop');
+        assert(await recordingPage.locator('#camera-save').isDisabled());
+        assert(await recordingPage.locator('#camera-recording-note').isVisible());
 
-        const healthyPage = await browser.newPage();
+        const healthyPage = await newPage();
         healthyPage.on('pageerror', error => errors.push(error.message));
         await healthyPage.route('**/api/status', route => route.fulfill({ json: {
             running: true, recording: true, fps: 10, shift_x: null, shift_y: null,
@@ -135,7 +249,105 @@ async function main() {
         await healthyPage.waitForFunction(() => !document.getElementById('btn-record').disabled);
         assert(await healthyPage.locator('#recording-warning').isHidden());
 
-        const servoPage = await browser.newPage({ viewport: { width: 390, height: 844 } });
+        const previewPage = await newPage();
+        previewPage.on('pageerror', error => errors.push(error.message));
+        let previewRunning = false;
+        let previewOverlay = true;
+        let previewStarts = 0;
+        let previewStops = 0;
+        let previewRequests = 0;
+        previewPage.on('request', request => {
+            if (request.url().includes('/video_feed')) previewRequests++;
+        });
+        await previewPage.route('**/api/status', route => route.fulfill({ json: {
+            running: previewRunning, recording: false, fps: previewRunning ? 10 : 0,
+            shift_x: null, shift_y: null, overlay: previewOverlay,
+            stopping: false, recording_stop_pending: false, warning: null,
+        } }));
+        await previewPage.route('**/api/start', route => {
+            previewRunning = true;
+            previewStarts++;
+            return route.fulfill({ json: { status: 'ok' } });
+        });
+        await previewPage.route('**/api/stop', route => {
+            previewRunning = false;
+            previewStops++;
+            return route.fulfill({ json: { status: 'ok' } });
+        });
+        await previewPage.route('**/api/settings', route => {
+            const body = route.request().postDataJSON();
+            if (typeof body.overlay === 'boolean') previewOverlay = body.overlay;
+            return route.fulfill({ json: { status: 'ok' } });
+        });
+        await previewPage.goto(baseUrl);
+        await previewPage.waitForFunction(() => !document.getElementById('camera-save').disabled);
+        assert.equal(previewRequests, 0, 'An idle page must not consume a stream client');
+        await previewPage.locator('#btn-preview').click();
+        await previewPage.waitForFunction(() => document.getElementById('btn-preview').getAttribute('aria-pressed') === 'true');
+        assert.equal(previewStarts, 0);
+        assert.equal(previewStops, 0);
+        assert.match(await previewPage.locator('#preview-status').textContent(), /automatic start.*cancelled/i);
+        const rawSource = await previewPage.locator('#video-feed').getAttribute('src');
+        await previewPage.locator('#btn-start').click();
+        await previewPage.waitForFunction(() => document.getElementById('fps-display').textContent.includes('Tracking preview'));
+        assert.notEqual(await previewPage.locator('#video-feed').getAttribute('src'), rawSource);
+        await previewPage.locator('#btn-preview').click();
+        await previewPage.waitForResponse(response => response.url().endsWith('/api/status'));
+        assert.equal(await previewPage.locator('#video-feed').getAttribute('src'), null);
+        const hiddenRequests = previewRequests;
+        await previewPage.getByText('Tracking overlay', { exact: true }).click();
+        await previewPage.locator('#camera-save').click();
+        await previewPage.waitForFunction(() => document.getElementById('camera-settings-status').textContent.includes('saved and applied'));
+        assert.equal(previewRequests, hiddenRequests, 'Saving settings and overlay changes must keep a hidden preview disconnected');
+        await previewPage.locator('#btn-preview').click();
+        await previewPage.waitForFunction(() => document.getElementById('btn-preview').getAttribute('aria-pressed') === 'true');
+        assert.equal(previewStarts, 1);
+        assert.equal(previewStops, 0);
+        await previewPage.locator('#btn-stop').click();
+        await previewPage.waitForFunction(() => document.getElementById('fps-display').textContent.includes('Camera only'));
+        assert(await previewPage.locator('#video-feed').isVisible());
+        assert.equal(previewStops, 1);
+        assert(!(await previewPage.locator('#overlay-toggle').isChecked()));
+        await previewPage.locator('#btn-preview').click();
+        await previewPage.route('**/api/preview', route => route.fulfill({ status: 503, json: { status: 'error', message: 'Preview unavailable' } }));
+        await previewPage.locator('#btn-preview').click();
+        await previewPage.waitForFunction(() => document.getElementById('preview-status').textContent.includes('Preview unavailable'));
+        assert.equal(await previewPage.locator('#video-feed').getAttribute('src'), null);
+
+        const unavailablePage = await newPage();
+        unavailablePage.on('pageerror', error => errors.push(error.message));
+        let unavailableGets = 0;
+        await unavailablePage.route('**/api/camera/settings', route => {
+            unavailableGets++;
+            return route.fulfill({ status: 503, json: { status: 'error', message: 'Camera offline' } });
+        });
+        await unavailablePage.goto(baseUrl);
+        await unavailablePage.waitForFunction(() => document.getElementById('camera-settings-status').textContent.includes('Camera offline'));
+        assert(await unavailablePage.locator('#camera-save').isDisabled());
+        assert(await unavailablePage.locator('#camera-reload').isEnabled());
+        for (let i = 0; i < 2; i++) await unavailablePage.waitForResponse(response => response.url().endsWith('/api/status'));
+        assert.equal(unavailableGets, 1, 'Unavailable camera settings must not retry on every status poll');
+        await unavailablePage.locator('#camera-reload').click();
+        await unavailablePage.waitForFunction(() => !document.getElementById('camera-reload').disabled);
+        assert.equal(unavailableGets, 2);
+
+        const legacyPage = await newPage();
+        legacyPage.on('pageerror', error => errors.push(error.message));
+        await legacyPage.route('**/api/camera/settings', route => route.fulfill({ json: {
+            status: 'ok', settings: {
+                resolution: { width: 640, height: 480 }, framerate: 15,
+                awb_mode: 'auto', colour_gains: [1.5, 1.5],
+                exposure_mode: 'auto', exposure_time_us: 20000, analogue_gain: 1,
+            },
+        } }));
+        await legacyPage.goto(baseUrl);
+        await legacyPage.waitForFunction(() => !document.getElementById('camera-save').disabled);
+        assert.equal(await legacyPage.locator('#camera-resolution').inputValue(), '640x480');
+        assert.equal(await legacyPage.locator('#camera-framerate').inputValue(), '15');
+        await legacyPage.locator('#camera-save').click();
+        assert.match(await legacyPage.locator('#camera-settings-status').textContent(), /at least HD/);
+
+        const servoPage = await newPage({ viewport: { width: 390, height: 844 } });
         servoPage.on('pageerror', error => errors.push(error.message));
         const motors = {
             backend: 'gpio_servo', connected: true, calibrated: false, mode: 'idle',
@@ -181,7 +393,7 @@ async function main() {
         assert(await servoPage.locator('#ev3-toggle').isDisabled());
         assert(await servoPage.locator('#btn-start').isEnabled());
         assert.deepEqual(errors, []);
-        console.log('Browser UI checks passed: idle Stop/autostart cancellation, recovery, recording, cleanup controls, GPIO status/calibration/errors/manual movement, 390/900/1200px layout.');
+        console.log('Browser UI checks passed: camera settings save/reload/persistence/validation/limits/offline/recording lock, idle Stop/autostart cancellation, recovery, recording, cleanup controls, GPIO controls, 320–1200px layout.');
     } finally {
         await browser.close();
     }

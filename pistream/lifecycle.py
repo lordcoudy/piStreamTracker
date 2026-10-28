@@ -49,11 +49,22 @@ class TrackerLifecycle:
             timer.start()
         logger.info('Tracking and configured motors will start in %s seconds', delay)
 
-    def start(self, connect_timeout: float = 15.0) -> dict:
-        return self._start(connect_timeout)
-
-    def _start(self, connect_timeout: float = 15.0, scheduled: Optional[Timer] = None) -> dict:
+    def cancel_scheduled_start(self) -> None:
+        """Consume delayed startup while preserving any admitted tracker session."""
         with self._lock:
+            self._cancel_start_timer_unlocked()
+
+    def start(self, connect_timeout: float = 15.0, *,
+              unless_cancelled: Optional[Event] = None) -> dict:
+        return self._start(connect_timeout, unless_cancelled=unless_cancelled)
+
+    def _start(self, connect_timeout: float = 15.0, scheduled: Optional[Timer] = None,
+               unless_cancelled: Optional[Event] = None) -> dict:
+        with self._lock:
+            # Check the caller's cancellation under the admission lock: a Stop
+            # arriving after this check must see and cancel the registered worker.
+            if unless_cancelled is not None and unless_cancelled.is_set():
+                return {'status': 'cancelled'}
             # Cancel and admit starts under the same lock as Stop: an already
             # entered timer callback must never reopen hardware after Stop.
             if scheduled is not None and scheduled is not self._start_timer:

@@ -125,26 +125,28 @@ class MotorBackendTests(unittest.TestCase):
         self.assertEqual(camera_stream_url(cfg), 'http://127.0.0.1:8000/stream')
         self.assertEqual(cfg['tracker']['stream_url'], camera_stream_url(cfg))
         self.assertEqual(cfg['camera']['resolution'], {'width': 1280, 'height': 720})
-        self.assertEqual(cfg['camera']['framerate'], 45)
+        self.assertEqual(cfg['camera']['framerate'], 25)
         self.assertEqual(cfg['camera']['jpeg_quality'], 80)
-        self.assertEqual(cfg['camera']['tuning_file'], 'tuning/imx219-160-no-alsc.json')
-        self.assertEqual(cfg['tracker']['recording_fps'], 45)
-        self.assertEqual(cfg['tracker']['movenet']['threads'], 2)
+        self.assertEqual(cfg['camera']['tuning_file'], 'tuning/imx219-160-colour.json')
+        self.assertEqual(cfg['tracker']['recording_fps'], 25)
+        self.assertEqual(cfg['tracker']['movenet']['threads'], 1)
         self.assertLessEqual(cfg['web']['preview_max_fps'], 15)
         self.assertNotEqual(cfg['camera']['recording_dir'], cfg['tracker']['output_dir'])
         self.assertTrue(cfg['gpio_servo']['calibrated'])
         self.assertEqual(cfg['web']['autostart_delay'], 120)
 
-    def test_pi4_config_preserves_confirmed_servo_limits_and_speeds(self):
+    def test_pi4_config_preserves_limits_and_uses_live_tested_motion_settings(self):
         cfg = load_config(str(Path(__file__).resolve().parents[1] / 'config.pi4.yaml'))
+        self.assertEqual(cfg['gpio_servo']['gain'], 6)
         for axis, minimum, maximum, speed in (
-            ('pan', -90, 90, 500), ('tilt', -45, 45, 300),
+            ('pan', -90, 90, 25), ('tilt', -45, 45, 15),
         ):
             with self.subTest(axis=axis):
                 settings = cfg['gpio_servo'][axis]
                 self.assertEqual(settings['min_angle'], minimum)
                 self.assertEqual(settings['max_angle'], maximum)
                 self.assertEqual(settings['max_speed'], speed)
+                self.assertTrue(settings['invert'])
 
     def test_builtin_servo_defaults_still_require_calibration(self):
         from pistream.config import default_config

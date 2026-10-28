@@ -13,14 +13,15 @@ import mimetypes
 from datetime import datetime
 from http import server
 from pathlib import Path
-from threading import BoundedSemaphore, Condition, Lock
+from threading import BoundedSemaphore, Condition, RLock
 from urllib.parse import quote, unquote, urlsplit
 
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder, JpegEncoder
-from picamera2.outputs import FfmpegOutput, FileOutput
+from picamera2.outputs import FileOutput, PyavOutput
 
 from pistream.camera_auth import extract_bearer, token_ok
+from pistream.camera_settings import CameraSettings, controls_for_settings
 from pistream.config import camera_bind_host, load_config
 from pistream.recordings import is_recording_file, list_recording_files, safe_recording_path
 
@@ -39,13 +40,16 @@ TUNING_FILE = None
 CAMERA_TOKEN = ''
 STREAM_LIMIT = None
 HTML_PAGE = ''
+CONFIG = CONFIG_PATH = None
 
 
 def configure_camera(config_path: str) -> None:
     """Load startup settings before creating their dependent resources."""
     global HOST, PORT, WIDTH, HEIGHT, FRAMERATE, JPEG_QUALITY, CAMERA_IP
     global OUTPUT_DIR, TUNING_FILE, CAMERA_TOKEN, STREAM_LIMIT, HTML_PAGE
+    global CONFIG, CONFIG_PATH
     config = load_config(config_path)
+    CONFIG, CONFIG_PATH = config, Path(config_path).resolve()
     camera_cfg = config['camera']
     HOST = camera_bind_host(config)
     PORT = camera_cfg['port']
@@ -134,8 +138,8 @@ class CameraRecorder:
         self._picam2 = picam2
         self._output_dir = output_dir
         self._encoder: H264Encoder | None = None
-        self._output: FfmpegOutput | None = None
-        self._lock = Lock()
+        self._output: PyavOutput | None = None
+        self._lock = RLock()
         self.recording = False
         self.current_file: str | None = None
 
@@ -148,7 +152,9 @@ class CameraRecorder:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             path = self._output_dir / f"cam_rec_{ts}.mp4"
             self._encoder = H264Encoder(bitrate=bitrate)
-            self._output = FfmpegOutput(str(path))
+            # Keep muxing in-process: FfmpegOutput's parent-death signal kills
+            # its child when this short-lived HTTP request thread exits.
+            self._output = PyavOutput(str(path))
             self._picam2.start_encoder(self._encoder, self._output)
             self.recording = True
             self.current_file = str(path)
@@ -175,13 +181,14 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 
     output = None  # Set by main
     recorder = None  # Set by main
+    camera_settings = None  # Set by main; shares the recorder lock
 
     def log_message(self, format, *args):
         logger.debug(format % args)
 
     def do_GET(self):
         path = unquote(urlsplit(self.path).path)
-        if path.startswith('/record/') and not self._authorized():
+        if path.startswith(('/record/', '/camera/')) and not self._authorized():
             return
         if path == '/':
             self.send_response(301)
@@ -232,6 +239,18 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             finally:
                 STREAM_LIMIT.release()
 
+        elif path == '/camera/settings':
+            if self.camera_settings is None:
+                self._json_response({'error': 'camera settings not available'}, 500)
+                return
+            try:
+                result = self.camera_settings.snapshot()
+            except Exception as exc:
+                logger.exception('Could not read camera settings')
+                self._json_response({'error': str(exc)}, 500)
+            else:
+                self._json_response({'status': 'ok', **result})
+
         elif path == '/record/list':
             active_name = None
             if self.recorder and self.recorder.recording and self.recorder.current_file:
@@ -266,9 +285,12 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlsplit(self.path).path)
-        if path.startswith('/record/') and not self._authorized():
+        if path.startswith(('/record/', '/camera/')) and not self._authorized():
             return
-        if path == '/record/start':
+        if path == '/camera/settings':
+            self._update_camera_settings()
+
+        elif path == '/record/start':
             if not self.recorder:
                 self._json_response({'error': 'recorder not available'}, 500)
                 return
@@ -295,6 +317,55 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 
         else:
             self.send_error(404)
+
+    def _settings_request(self) -> dict:
+        """Read one small, length-delimited JSON object without accepting NaN."""
+        if self.headers.get('Transfer-Encoding'):
+            raise ValueError('Transfer-Encoding is not supported')
+        try:
+            length = int(self.headers.get('Content-Length', ''))
+        except (TypeError, ValueError) as exc:
+            raise ValueError('A valid Content-Length is required') from exc
+        if not 1 <= length <= 4096:
+            raise ValueError('Camera settings JSON must be between 1 and 4096 bytes')
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError('Incomplete camera settings JSON')
+
+        def invalid_constant(value):
+            raise ValueError(f'Invalid JSON number: {value}')
+
+        try:
+            settings = json.loads(raw, parse_constant=invalid_constant)
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError('Camera settings must be valid JSON') from exc
+        if not isinstance(settings, dict):
+            raise ValueError('Camera settings must be a JSON object')
+        return settings
+
+    def _update_camera_settings(self):
+        if self.camera_settings is None or self.recorder is None:
+            self._json_response({'error': 'camera settings not available'}, 500)
+            return
+        try:
+            settings = self._settings_request()
+        except ValueError as exc:
+            self.close_connection = True
+            self._json_response({'error': str(exc)}, 400)
+            return
+        try:
+            with self.recorder._lock:
+                if self.recorder.recording:
+                    self._json_response({'error': 'Stop recording before changing camera settings'}, 409)
+                    return
+                result = self.camera_settings.update(settings)
+        except ValueError as exc:
+            self._json_response({'error': str(exc)}, 400)
+        except Exception as exc:
+            logger.exception('Could not apply camera settings')
+            self._json_response({'error': str(exc)}, 500)
+        else:
+            self._json_response({'status': 'ok', 'saved': True, **result})
 
     def do_DELETE(self):
         path = unquote(urlsplit(self.path).path)
@@ -397,6 +468,27 @@ class StreamingServer(server.ThreadingHTTPServer):
         super().server_bind()
 
 
+def _full_width_sensor_mode(picam2):
+    """Inspect modes before streaming; enumerating them reconfigures the device."""
+    properties = getattr(picam2, 'camera_properties', {})
+    if not isinstance(properties, dict) or properties.get('Model', '').lower() != 'imx219':
+        return None
+    for mode in picam2.sensor_modes:
+        if mode['size'] == (1640, 1232) and mode['bit_depth'] == 10:
+            return {'output_size': (1640, 1232), 'bit_depth': 10}
+    return None
+
+
+def camera_video_configuration(picam2, settings, sensor_mode=None):
+    """Keep IMX219 HD previews on its full-width binned mode when available."""
+    resolution = settings['resolution']
+    size = (resolution['width'], resolution['height'])
+    options = {'main': {'size': size}, 'controls': {'FrameRate': settings['framerate']}}
+    if sensor_mode is not None and size in {(1280, 720), (1280, 960)}:
+        options['sensor'] = sensor_mode
+    return picam2.create_video_configuration(**options)
+
+
 def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description='Raspberry Pi camera streaming server')
     parser.add_argument('--config', default='config.yaml', help='Config file path')
@@ -423,11 +515,13 @@ def main(argv: list[str] | None = None):
         except RuntimeError:
             logger.error(camera_busy_hint(CAMERA_IP, PORT))
             raise
-        video_config = picam2.create_video_configuration(
-            main={"size": (WIDTH, HEIGHT)},
-            controls={"FrameRate": FRAMERATE},
-        )
+        sensor_mode = _full_width_sensor_mode(picam2)
+        video_config = camera_video_configuration(picam2, CONFIG['camera'], sensor_mode)
         picam2.configure(video_config)
+        available_controls = picam2.camera_controls
+        picam2.set_controls(controls_for_settings(
+            CONFIG['camera'], available_controls if isinstance(available_controls, dict) else {}
+        ))
 
         output = StreamingOutput()
         StreamingHandler.output = output
@@ -436,6 +530,29 @@ def main(argv: list[str] | None = None):
         streaming = True
         recorder = CameraRecorder(picam2, OUTPUT_DIR)
         StreamingHandler.recorder = recorder
+
+        def reconfigure(settings):
+            nonlocal streaming
+            global WIDTH, HEIGHT, FRAMERATE, HTML_PAGE
+            if streaming:
+                picam2.stop_recording()
+                streaming = False
+            with output.condition:
+                output.frame = None
+            resolution = settings['resolution']
+            new_config = camera_video_configuration(picam2, settings, sensor_mode)
+            picam2.configure(new_config)
+            # A failed start may already own an encoder/device; rollback must
+            # stop that partial attempt before configuring the previous mode.
+            streaming = True
+            picam2.start_recording(JpegEncoder(q=JPEG_QUALITY), FileOutput(output))
+            WIDTH, HEIGHT = resolution['width'], resolution['height']
+            FRAMERATE = settings['framerate']
+            HTML_PAGE = render_html_page()
+
+        StreamingHandler.camera_settings = CameraSettings(
+            CONFIG_PATH, CONFIG, picam2, reconfigure, lock=recorder._lock
+        )
         srv = StreamingServer((HOST, PORT), StreamingHandler)
 
         logger.info("=" * 50)
@@ -445,6 +562,7 @@ def main(argv: list[str] | None = None):
         logger.info(f"Stream URL:    http://{CAMERA_IP}:{PORT}/stream")
         logger.info(f"Web Interface: http://{CAMERA_IP}:{PORT}/")
         logger.info("Record API:    POST /record/start  POST /record/stop")
+        logger.info("Camera API:    GET/POST /camera/settings")
         logger.info(f"Recordings:    {OUTPUT_DIR}/")
         logger.info("Press Ctrl+C to stop")
         logger.info("=" * 50)

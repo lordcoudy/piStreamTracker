@@ -1,6 +1,6 @@
 # piStreamTracker project map
 
-Agent orientation, updated for the supplied Pi 4 camera configuration and delayed
+Agent orientation, updated for live Pi 4 camera/motion tuning and delayed
 tracking startup on 2026-10-28, following the recording/recovery fixes in October. This is a
 navigation aid, not a specification. Source code and tests determine current
 behavior; recheck the relevant section before changing it.
@@ -10,7 +10,7 @@ behavior; recheck the relevant section before changing it.
 A lecturer-following camera system with two deployment choices: Pi 3B+ with an
 IMX219 camera and Pi 5 tracker with USB EV3, or one Pi 4 with an IMX219 camera
 and two GPIO SG90 servos. Both deployments use the same IMX219 camera module
-and select the shared 160-degree profile without ALSC through `camera.tuning_file`
+and select the shared 160-degree profile with static colour shading through `camera.tuning_file`
 in `config.yaml` and `config.pi4.yaml`. Automatic
 sensor tuning also remains available for OV5647 and other cameras.
 In standalone, `camera.py` alone opens CSI and `web.py` consumes its local MJPEG
@@ -39,8 +39,9 @@ use the source and this map for current ownership.
 
 | Area | Start here | Responsibility |
 |---|---|---|
-| Camera service | [camera.py](camera.py) | Picamera2 and optional sensor tuning, threaded MJPEG HTTP server, camera H.264 recorder and `/record/*` API |
-| Shared IMX219 camera profile | [imx219-160-no-alsc.json](tuning/imx219-160-no-alsc.json) | Supplied IMX219 tuning without `rpi.alsc`; selected by `camera.tuning_file` on Pi 3B+ and Pi 4 |
+| Camera service | [camera.py](camera.py) | Picamera2 and optional sensor tuning, threaded MJPEG HTTP server, camera H.264 recorder, `/record/*` and `/camera/settings` APIs |
+| Persisted camera controls | [camera_settings.py](pistream/camera_settings.py), [camera_api.py](pistream/camera_api.py) | Validated WB/exposure/format controls, atomic camera-host YAML save and runtime rollback; bounded authenticated tracker proxy |
+| Shared IMX219 camera profile | [imx219-160-colour.json](tuning/imx219-160-colour.json), [tuning notes](tuning/README.md) | Original sensor tuning plus measured static colour shading; previous no-ALSC file retained for rollback |
 | Desktop/headless tracker | [tracker.py](tracker.py), [track.py](pistream/track.py) | CLI parsing, `HumanTracker`, `ObjectTracker`, rendering, screenshots, recording coordination |
 | Web controls | [web.py](web.py), [web_app.py](pistream/web_app.py) | Flask routes, preview, runtime settings, recordings proxy, background tracker loop |
 | Session lifetime | [lifecycle.py](pistream/lifecycle.py) | Serialized web start/stop, delayed automatic start, startup confirmation, cancellation, cleanup ownership |
@@ -119,8 +120,12 @@ and clamp pulse widths. The worker limits degrees/second with monotonic time and
 movement after `frame_timeout` even without frame processing. Manual/Home hold
 auto while moving and for the configured pause; Stop disconnects regardless of
 holds. `calibrated: false` blocks auto but permits commissioning commands.
-The current `config.pi4.yaml` preserves the supplied Pi's confirmed calibration,
-pan ±90° / 500°/s and tilt ±45° / 300°/s. Built-in servo defaults remain
+The current `config.pi4.yaml` preserves the supplied Pi's confirmed calibration
+and mechanical ranges: pan ±90° and tilt ±45°. Live direction checks found both
+axes reversed, so both use `invert: true`; speed caps are now 25°/s and 15°/s,
+with gain 6 rather than 30. A stationary live test held pan commands constant;
+tilt remained at its −45° limit and did not establish vertical centering.
+Built-in servo defaults remain
 uncalibrated with conservative working ranges/speeds for commissioning.
 Status distinguishes target and last commanded degrees; SG90 has no feedback.
 Failed PWM-off is an error with unknown pulse state, retained in web status after
@@ -151,6 +156,20 @@ angle when the target is lost. The affine transform levels that signed screen an
 CLI keyboard events run even for missing/repeated frames; processing, recording,
 FPS and preview updates accept only new frames. Screenshots use the last displayed frame.
 
+The browser preview is independent of tracker ownership and initially off per
+tab, with no image URL/stream connection. **Show camera** calls `/api/preview`
+to consume pending autostart without constructing or stopping a tracker, then
+opens `/video_feed`. With tracking stopped that route proxies raw MJPEG even
+when the overlay preference is on; Start shows tracking output and Stop leaves
+camera-only viewing available. Status transitions reconnect the image source.
+**Hide camera** releases only that viewer and remains hidden across polling,
+overlay changes and camera-setting saves. The overlay preference is preserved.
+
+Camera-side H.264 uses Picamera2's encoder with `PyavOutput` to mux MP4 in-process.
+`FfmpegOutput` starts FFmpeg with a parent-death signal; when called by a short-lived
+HTTP request thread, that child is killed after the request returns. The local
+tracker recorder's ffmpeg path is separate.
+
 Camera-mode recording first calls `/record/start`. If its response fails,
 the tracker checks `/record/status` before falling back locally. A failed
 camera stop requires an explicit JSON `recording: false` confirmation. Cleanup
@@ -176,12 +195,12 @@ seconds before kill. Incomplete closure retains ownership for explicit Stop retr
 an OpenCV writer is never released while its worker is writing.
 
 - Camera: `/stream`; `/record/start`, `/record/stop`, `/record/status`,
-  `/record/list`, and `/record/files/<filename>`.
+  `/record/list`, `/record/files/<filename>` and GET/POST `/camera/settings`.
   The server extends `http.server.ThreadingHTTPServer`; stream slots are acquired
   without blocking and released when each client disconnects.
 - Tracker: `/`, `/video_feed`; `/api/status`, `/api/config`; start/stop/reset,
   record/screenshot, `/api/motors` connection toggle, manual movement, zoom/settings,
-  and recordings routes. `/api/ev3` remains specific to the EV3 backend.
+  recordings, POST `/api/preview` and GET/POST `/api/camera/settings`. `/api/ev3` remains specific to the EV3 backend.
   Definitions are grouped in `pistream/web_app.py`.
   Status adds `recording_error`, `recording_stop_pending`, `stopping` and `warning`.
   `motors` includes backend, connection/error and SG90 calibration, command/target
@@ -189,7 +208,7 @@ an OpenCV writer is never released while its worker is writing.
   Unconfirmed shutdown reports `running: false`, conservative `recording: true`.
   Start returns 409 while shutdown is unresolved; Stop returns 202 during cleanup,
   503 for unconfirmed camera stop and 200 after confirmation.
-- Optional camera Bearer authentication covers `/record/*`, not `/stream`;
+- Optional camera Bearer authentication covers `/record/*` and `/camera/settings`, not `/stream`;
   an empty token leaves recording endpoints open. The tracker has same-origin
   browser mutation checks and security headers, but no login.
   Binding defaults to configured device IPs; this is a trusted-LAN control app.
@@ -203,18 +222,56 @@ Configuration precedence is built-in defaults → recursively merged YAML →
 named preset → explicit CLI flags. `PISTREAM_CAMERA_TOKEN` overrides the YAML
 token. `load_config()` validates startup settings; a missing YAML file uses
 built-in defaults. Most web settings mutate the current tracker only. Overlay
-also changes in-memory web config; UI controls do not write `config.yaml`.
+also changes in-memory web config. The camera panel is persistent: settings are
+sent to the configured camera origin, which alone rewrites its active YAML.
+`CameraSettings` preserves unrelated latest YAML fields and file permissions,
+uses a flushed/fsynced temporary file plus atomic replace, and rolls back camera
+controls/output if application or persistence fails. New setting fields are
+`awb_mode`, `colour_gains` (red/blue), `exposure_mode`, `exposure_time_us` and
+`analogue_gain`; old YAML defaults to automatic WB/AE. Runtime format changes
+accept 1280×720, 1280×960 or 1920×1080 and 25–40 FPS; the UI offers 25/30.
+Legacy startup geometries/presets remain accepted. Exposure is bounded by both
+camera-advertised limits and frame duration. FrameDurationLimits fixes the capture
+rate; 50 Hz flicker controls are applied only when advertised. Snapshot metadata
+reports actual settings without querying sensor modes on a running camera.
+Camera recording and settings share a reentrant lock, rejecting changes while
+the H.264 encoder is active. Web Start/record/settings mutations serialize;
+format changes cancel pending autostart, stop the tracker, apply settings and
+resume only a previously running tracker. Stop bypasses network locks and cancels
+that resume through an Event checked under the lifecycle admission lock. Settings
+reads also bypass the mutation lock and never replace in-memory capture config.
+A mutation timeout is never retried;
+the tracker stays stopped until the user reloads settings and explicitly starts.
 Web mode is selected by `web.py` or `run_tracker.sh --web`; the unused
 `web.enabled` default and YAML entry have been removed.
 `web.autostart_delay` defaults to 120 seconds even for existing YAML files that
 omit it. Null disables the one-time automatic start; finite numeric values from
 0 to 86400 select another delay. The web UI remains available during the wait.
-`config.pi4.yaml` preserves the supplied Pi's localhost camera endpoints,
+`config.pi4.yaml` uses the supplied Pi's localhost camera endpoints,
 camera-side H.264 recording, separate `camera-recordings/` and tracker `recordings/`
-directories, 1280×720 at 45 camera/recording FPS, JPEG quality 80, 2 inference
-threads and 10 preview FPS. These are configured values, not measured throughput.
-Its `camera.tuning_file` selects the bundled IMX219 160-degree profile without
-`rpi.alsc`. The two-Pi `config.yaml` selects the same profile for the matching
+directories, 1280×720 at 25 camera/recording FPS, JPEG quality 80, one inference
+thread and 10 preview FPS. The live session reduced the supplied 45 FPS to 25
+after 82–84°C readings with a passive radiator. Camera-process CPU fell from
+about 107% to 65% of one core, but cooling still needs validation under sustained
+load. The one-thread model comparison took about 108 ms versus 78 ms with two
+threads; these inference times are not tracking FPS guarantees.
+White-card tuning for the tested room uses manual WB gains 1.0606/1.87502;
+switch to auto after lighting changes. Autoexposure is retained because 10/20 ms
+manual exposures were too dark at the sensor's maximum analogue gain. Direct
+capture measured 39,999 µs frame duration (25.000 FPS), about 30 ms exposure with
+50 Hz flicker control, and central white-card RGB ratios within 0.3%. The static
+colour-shading profile reduced left-edge blue excess from about 84% to 39% and
+red ratios relative to centre to within about 5% in six sampled regions. Residual
+cold shading remains; the measurement is warm-room empirical tuning, not full
+RAW calibration. On IMX219, startup caches
+the 1640×1232/10-bit sensor mode for 720p/1280×960 to retain full sensor width;
+the former automatic 720p mode selected a cropped 1920×1080 readout. Sensor modes
+are queried once before streaming; Full HD and other sensors use auto selection.
+Its `camera.tuning_file` selects the bundled IMX219 160-degree profile with
+`rpi.alsc` colour tables derived from Arducam's module profile and empirically
+adjusted strengths (see `tuning/README.md`). `n_iter: 0` prevents scene-dependent
+adaptation and `luminance_strength: 0` preserves brightness shading/noise.
+The original no-ALSC profile is retained for rollback. The two-Pi `config.yaml` selects the same profile for the matching
 IMX219 module on the Pi 3B+. Built-in configuration defaults retain null for
 automatic sensor tuning with other camera modules.
 Relative tuning paths resolve from the directory containing `camera.py`,
@@ -300,10 +357,35 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 | Interpreter fallback | [test_detector_runtime.py](tests/test_detector_runtime.py) |
 | Artifact paths and remote files | [test_recordings.py](tests/test_recordings.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Camera tuning/startup/API/auth/client slots | [test_camera_server.py](tests/test_camera_server.py), [test_camera_auth.py](tests/test_camera_auth.py), [test_config.py](tests/test_config.py) |
+| Camera controls, atomic persistence/rollback and proxy lifecycle | [test_camera_settings.py](tests/test_camera_settings.py), [test_camera_settings_routes.py](tests/test_camera_settings_routes.py) |
+| Independent preview and shared static colour shading | [test_web_preview.py](tests/test_web_preview.py), [test_camera_profiles.py](tests/test_camera_profiles.py) |
 | UI/package layout and API errors/validation | [test_package.py](tests/test_package.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Network/service/udev planning | [test_install.py](tests/test_install.py) |
 | Standalone wrapper signals, services, children and setup dispatch | [test_standalone_launch.py](tests/test_standalone_launch.py) |
 | Mocked browser recovery and mobile layout | [browser_ui.cjs](tests/browser_ui.cjs), [web_ui_fixture.py](tests/web_ui_fixture.py) |
+
+The independent-preview/static-colour update passed 453 tests and 71 subtests,
+Ruff and the Chromium Show/Hide/Start/Stop, hidden-save and responsive flows.
+On Pi 4, camera-only viewing delivered 100 raw 1280×720 frames over 3.959 seconds
+(25.008 arrival FPS), with tracker, recording and motors off before/after.
+Show consumed autostart: at web service age 151.83 seconds the tracker remained
+stopped and servo PWM remained disabled, without an intervening Start/Stop.
+Saving camera settings in that state did not construct a tracker. A subsequent
+real UI Start/Stop switched to tracking output and back to camera-only viewing.
+Static colour shading and the new WB retained 25 FPS; all 12 sampled colour
+deviations improved over the no-ALSC baseline, with residual blue shading as
+documented in `tuning/README.md`. The former sensor-tuning file is unchanged.
+
+The persisted camera-controls update on 2026-10-28 passed 427 tests and 71
+subtests, Ruff, and Chromium camera-control/recovery flows at 320–1200px. The
+real Pi 4 UI applied 1280×960/25 while resuming tracking. Camera-host API checks
+confirmed 1920×1080/30 (33,326 µs frame duration), manual 20 ms exposure
+(19,999 µs measured), and restoration of the selected 1280×720/25 profile.
+The saved format, WB gains and exposure mode survived a restart of both services;
+the 120-second autostart setting and servo calibration remained intact. A new
+camera-side recording after the settings changes decoded successfully as H.264
+1280×720, 100 frames at 25 FPS, 4.002 seconds. These short measurements do not
+establish sustained passive-cooling performance.
 
 Baseline on 2026-10-09: 172 tests passed; Ruff passed on Python 3.12.12.
 After these fixes, a fresh Python 3.12 desktop environment passed 231 tests and
@@ -316,13 +398,34 @@ smoke with mocked hardware. All prior Pi YAML values and tuning bytes were prese
 A synthetic localhost MJPEG smoke exercised real OpenCV capture, web Start/Stop,
 preview, screenshot and a readable local MJPG recording with detector/motors
 disabled. Bookworm/Python 3.11 ARM wheel availability was checked against primary
-package sources; installation and operation on Pi hardware remain unverified.
+package sources; that synthetic smoke did not establish Pi hardware operation.
 [CI](.github/workflows/ci.yml) runs Ubuntu with Python 3.11/3.12, installing
 the declared `.[dev,desktop]` dependencies.
 Tests use mocked hardware and Flask's test client; they do not establish real
 Pi camera/EV3 behavior or MoveNet inference quality. Standalone browser checks
 cover mocked recovery, GPIO controls and responsiveness. A fresh macOS ARM desktop install was
 smoke-tested with LiteRT 2.3 and the cached MoveNet model (finite `(1,1,17,3)` output).
+The remote Pi 4 / IMX219 / SG90 live check on 2026-10-28 confirmed camera preview,
+manual axes, Home and Stop. The operator confirmed horizontal following, seated
+vertical following and stopping after leaving the frame. At 25 camera FPS and
+two inference threads, a stationary sample had 68/68 detections over 19.84 seconds,
+median processing FPS 15.91, no stream/motor errors and no pan command changes.
+Tilt was saturated at −45° throughout that sample. These are limited live checks,
+not a completed electrical, full-range mechanical or sustained thermal acceptance.
+The final one-thread live test had 24 positive samples over 7.76 seconds, median
+processing FPS 16.32, no motor/stream errors and held the last angles after exit.
+`PyavOutput` HTTP start/stop produced a 1,663,877-byte H.264 MP4 at 1280×720:
+100 frames over 4.002 seconds, verified by ffprobe, a decoded frame and an
+inactive entry in the web recordings list. The 120-second automatic start was
+also followed by a valid 10.482-second, 262-frame H.264 recording through the
+web controls, with stop confirmed and no pending warning. Automatic startup was
+observed running with connected motors at service age 121.46 seconds, after
+being idle at 33 seconds. A short post-start sample measured 73.5°C, current
+thermal flags clear and camera/tracker CPU 53%/126% of one core; the earlier
+two-thread 25-FPS sample was about 65%/198%. After the web recording, another
+sample was 79.3°C with active thermal flags still clear. These short samples do not establish
+sustained cooling. The updated development suite passed 339 tests and 57 subtests;
+Ruff passed.
 
 ## Observed caveats to recheck when working nearby
 
@@ -340,7 +443,10 @@ These are code observations at the revision above, not fixes made by this map.
 - **Native OpenCV finalization:** worker writes are guarded, but OpenCV's native
   `VideoWriter.release()` call has no timeout. The ffmpeg subprocess shutdown
   bounds do not guarantee a bound on native MJPG file finalization.
-- **Hardware verification:** no Pi 4, CSI camera, SG90, real pigpiod or timing benchmark
-  is available in the development environment. Follow README's hardware acceptance
-  checklist; initial position commands cannot limit physical motion from an unknown
-  startup position. Commission with unloaded horns and safe cable clearance.
+- **Hardware verification:** the remote Pi 4 check above covers preview and selected
+  motion cases; it does not certify full mechanical ranges, electrical stability
+  or sustained cooling. Follow README's acceptance checklist; initial position
+  commands cannot limit physical motion from an unknown startup position.
+  Commission with unloaded horns and safe cable clearance. A standing person can
+  remain above the framing target with tilt at −45°; change placement before
+  considering any mechanical-limit adjustment.
