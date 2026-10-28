@@ -18,7 +18,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder, JpegEncoder
-from picamera2.outputs import FfmpegOutput, FileOutput
+from picamera2.outputs import FileOutput, PyavOutput
 
 from pistream.camera_auth import extract_bearer, token_ok
 from pistream.config import camera_bind_host, load_config
@@ -134,7 +134,7 @@ class CameraRecorder:
         self._picam2 = picam2
         self._output_dir = output_dir
         self._encoder: H264Encoder | None = None
-        self._output: FfmpegOutput | None = None
+        self._output: PyavOutput | None = None
         self._lock = Lock()
         self.recording = False
         self.current_file: str | None = None
@@ -148,7 +148,9 @@ class CameraRecorder:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             path = self._output_dir / f"cam_rec_{ts}.mp4"
             self._encoder = H264Encoder(bitrate=bitrate)
-            self._output = FfmpegOutput(str(path))
+            # Keep muxing in-process: FfmpegOutput's parent-death signal kills
+            # its child when this short-lived HTTP request thread exits.
+            self._output = PyavOutput(str(path))
             self._picam2.start_encoder(self._encoder, self._output)
             self.recording = True
             self.current_file = str(path)

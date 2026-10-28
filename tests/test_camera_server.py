@@ -10,7 +10,7 @@ import unittest
 from contextlib import chdir
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import BoundedSemaphore, Condition
+from threading import BoundedSemaphore, Condition, Thread, current_thread
 from unittest.mock import Mock, patch
 
 
@@ -30,7 +30,7 @@ def import_camera_module(fresh=False):
     picamera2.Picamera2 = Placeholder
     encoders.H264Encoder = Placeholder
     encoders.JpegEncoder = Placeholder
-    outputs.FfmpegOutput = Placeholder
+    outputs.PyavOutput = Placeholder
     outputs.FileOutput = Placeholder
 
     with patch.dict(sys.modules, {
@@ -309,6 +309,67 @@ class CameraServerTests(unittest.TestCase):
 
         self.assertTrue(recorder.recording)
         self.assertIsNotNone(recorder.current_file)
+
+    def test_recording_keeps_frames_after_start_request_thread_exits(self):
+        class InProcessOutput:
+            def __init__(self, filename):
+                self.path = Path(filename)
+                self.frames = bytearray()
+
+            def start(self):
+                pass
+
+            def outputframe(self, frame):
+                self.frames.extend(frame)
+
+            def stop(self):
+                if self.frames:
+                    self.path.write_bytes(self.frames)
+
+        class ThreadBoundFfmpegOutput(InProcessOutput):
+            # FfmpegOutput sets PR_SET_PDEATHSIG: Linux kills its subprocess
+            # when the thread that spawned it exits, including an HTTP worker.
+            def start(self):
+                self.owner = current_thread()
+
+            def outputframe(self, frame):
+                if self.owner.is_alive():
+                    super().outputframe(frame)
+
+        class Camera:
+            def start_encoder(self, _encoder, output):
+                self.output = output
+                output.start()
+
+            def stop_encoder(self, _encoder):
+                self.output.stop()
+
+        camera = self.camera
+        with TemporaryDirectory() as tmp, \
+                patch.object(camera, 'FfmpegOutput', ThreadBoundFfmpegOutput, create=True), \
+                patch.object(camera, 'PyavOutput', InProcessOutput, create=True):
+            picam = Camera()
+            recorder = camera.CameraRecorder(picam, Path(tmp))
+            handler = self.handler()
+            handler.path = '/record/start'
+            handler._authorized = lambda: True
+            handler.recorder = recorder
+            request_thread = Thread(target=handler.do_POST)
+            request_thread.start()
+            request_thread.join(timeout=1)
+            self.assertFalse(request_thread.is_alive())
+            result = json.loads(handler.wfile.getvalue())
+            self.assertTrue(result['recording'])
+
+            picam.output.outputframe(b'encoded-frame-1')
+            picam.output.outputframe(b'encoded-frame-2')
+            recorder.stop()
+
+            path = Path(result['file'])
+            self.assertTrue(path.is_file(), 'No recording survived the completed HTTP request')
+            self.assertEqual(path.read_bytes(), b'encoded-frame-1encoded-frame-2')
+            self.assertFalse(recorder.recording)
+            self.assertIsNone(recorder.current_file)
 
     def test_unknown_record_path_returns_json(self):
         handler = self.handler()
