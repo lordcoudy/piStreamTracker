@@ -10,8 +10,9 @@ import signal
 import time
 import urllib.error
 import urllib.request
+from functools import wraps
 from pathlib import Path
-from threading import Lock, current_thread, main_thread
+from threading import Event, Lock, RLock, current_thread, main_thread
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -29,6 +30,8 @@ from flask import (
 )
 from werkzeug.exceptions import HTTPException
 
+from pistream.camera_api import request_camera_settings
+from pistream.camera_settings import SETTING_KEYS
 from pistream.config import (
     apply_cli_overrides, configure_logging, load_config, motor_backend, web_bind_host,
 )
@@ -66,6 +69,18 @@ _config: dict = {}
 _recording_error_lock = Lock()
 _last_recording_error: Optional[str] = None
 _recording_error_revision = 0
+_camera_control_lock = RLock()
+_camera_change_cancel: Optional[Event] = None
+
+
+def _serialize_camera_control(function):
+    @wraps(function)
+    def serialized(*args, **kwargs):
+        if has_request_context() and request.method == 'GET':
+            return function(*args, **kwargs)
+        with _camera_control_lock:
+            return function(*args, **kwargs)
+    return serialized
 
 
 def _tracker() -> Optional[HumanTracker]:
@@ -394,6 +409,7 @@ def api_status():
 
 
 @app.route('/api/start', methods=['POST'])
+@_serialize_camera_control
 def api_start():
     """Start tracking. Returns only after the stream connects (or fails)."""
     if _lifecycle is None:
@@ -419,6 +435,8 @@ def api_start():
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
     """Stop tracking."""
+    if _camera_change_cancel is not None:
+        _camera_change_cancel.set()
     if _lifecycle is None:
         return jsonify({'status': 'ok'})
     trk = _tracker()
@@ -445,6 +463,7 @@ def api_reset():
 
 
 @app.route('/api/record', methods=['POST'])
+@_serialize_camera_control
 def api_record():
     """Toggle recording."""
     trk = _active_tracker()
@@ -463,6 +482,91 @@ def api_record():
             return jsonify({'status': 'ok', 'recording': True})
         return _error('Could not start recording', 503)
     return _error('Tracker not running', 409)
+
+
+def _remember_camera_settings(payload):
+    settings = payload['settings']
+    _config.setdefault('camera', {}).update(settings)
+    _config.setdefault('tracker', {})['recording_fps'] = settings['framerate']
+
+
+@app.route('/api/camera/settings', methods=['GET', 'POST'])
+@_serialize_camera_control
+def api_camera_settings():
+    """Apply and persist settings on the Pi that owns the camera."""
+    global _camera_change_cancel
+    base = camera_base_url(_config)
+    token = (_config.get('camera') or {}).get('token') or ''
+    changing = request.method == 'POST'
+    format_changed = False
+    was_running = False
+    try:
+        if not changing:
+            payload = request_camera_settings(base, token)
+            return jsonify({'status': 'ok', **payload})
+        if request.content_length is not None and request.content_length > 4096:
+            return _error('Camera settings request is too large', 413)
+        patch, error = _json_object()
+        if error:
+            return _error(error)
+        if patch.keys() - SETTING_KEYS:
+            return _error('Unknown camera settings')
+        try:
+            json.dumps(patch, allow_nan=False)
+        except (ValueError, TypeError):
+            return _error('Camera settings must contain finite JSON values')
+        _camera_change_cancel = Event()
+        cancelled = _camera_change_cancel
+        trk = _tracker()
+        if trk and (getattr(trk, 'recording', False) or
+                    getattr(trk, 'remote_stop_pending', False) or
+                    (not trk.running and getattr(trk, 'cleanup_pending', False))):
+            return _error('Stop recording and finish tracker cleanup before changing camera settings', 409)
+        if _lifecycle and _lifecycle.stopping:
+            return _error('Tracker is still stopping. Try again after cleanup finishes', 409)
+        current = request_camera_settings(base, token)['settings']
+        requested_resolution = patch.get('resolution', current['resolution'])
+        if isinstance(requested_resolution, dict):
+            requested_resolution = {**current['resolution'], **requested_resolution}
+        format_changed = (requested_resolution != current['resolution'] or
+                          patch.get('framerate', current['framerate']) != current['framerate'])
+        was_running = bool(trk and trk.running)
+        if format_changed and _lifecycle:
+            result = _lifecycle.stop()
+            if result['status'] != 'ok':
+                return _error('Tracker is still stopping. Try again after cleanup finishes', 409)
+            _clear_latest_frame()
+        payload = request_camera_settings(base, token, patch)
+        _remember_camera_settings(payload)
+        warning = None
+        if format_changed and was_running and _lifecycle:
+            try:
+                result = _lifecycle.start(unless_cancelled=cancelled)
+                if result['status'] not in {'ok', 'already_running', 'cancelled'}:
+                    warning = 'Camera settings saved; tracking did not restart: ' + result.get('message', result['status'])
+            except Exception as exc:
+                warning = f'Camera settings saved; tracking did not restart: {exc}'
+        return jsonify({'status': 'ok', **payload, 'saved': True,
+                        **({'warning': warning} if warning else {})})
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read(4096))
+            message = body.get('error') or body.get('message') or 'Camera settings request failed'
+        except (ValueError, AttributeError):
+            message = 'Camera settings request failed'
+        # A rejected request leaves the previous camera format usable.
+        if format_changed and was_running and _lifecycle and exc.code in {400, 401, 409, 413}:
+            _lifecycle.start(unless_cancelled=_camera_change_cancel)
+        return _error(str(message), exc.code if exc.code in {400, 401, 409, 413} else 502)
+    except (OSError, ValueError) as exc:
+        logger.warning('Camera settings request failed: %s', exc)
+        message = 'Camera settings are temporarily unavailable'
+        if changing:
+            message = 'Camera did not confirm the change. Reload camera settings before trying again'
+        return _error(message, 503)
+    finally:
+        if changing:
+            _camera_change_cancel = None
 
 
 @app.route('/api/screenshot', methods=['POST'])

@@ -125,6 +125,25 @@ Check cooling under the intended workload before prolonged operation.
 Camera recordings go to `camera-recordings/`; screenshots and
 fallback local recordings go to `recordings/`, avoiding duplicate list entries.
 
+The **Camera settings** panel below the preview changes and saves capture format,
+FPS, white balance and exposure on the camera Pi. **Save & apply** writes the
+camera service's active YAML atomically; changes survive service restarts and
+reboots. It offers 1280×720/1920×1080 at 16:9 and 1280×960 at 4:3, with 25 or
+30 camera frames/s. Format/FPS changes briefly stop and resume an active tracker;
+recording must be stopped first. Other tracker settings remain session-only.
+
+The supplied Pi 4 was measured at 25.000 capture frames/s (39,999 µs frame
+duration). IMX219 uses the binned 1640×1232/10-bit sensor mode for 720p and
+1280×960, preserving full sensor width; automatic 720p selection had cropped the
+view to a 1920×1080 readout. Its room-light white-card calibration is red gain 1.15644, blue gain
+2.24688; this manual balance is saved in `config.pi4.yaml`. Select **Auto** when
+the lighting changes. Autoexposure with 50 Hz flicker correction (when supported)
+is retained: in the measured dim scene it chose about 30 ms, maximum analogue
+gain and some digital gain. Fixed 10/20 ms exposures were substantially darker.
+Manual exposure is available in milliseconds with separate analogue gain; its
+upper limit follows both the sensor and frame period. The panel reports actual
+exposure/gain/frame rate separately from the tracker's processing FPS.
+
 Both Pi camera configurations load `tuning/imx219-160-no-alsc.json`, preserving the camera
 correction from the supplied project. The JSON omits `rpi.alsc`; it is specific
 to this IMX219 setup. `camera.tuning_file` accepts an absolute path or a path
@@ -472,7 +491,12 @@ camera:
   framerate: 30
   resolution: {width: 1280, height: 960}
   tuning_file: tuning/imx219-160-no-alsc.json  # shared Pi3B+/Pi4 IMX219 profile
-  token: null              # Bearer for /record/* ; empty = open LAN
+  awb_mode: auto           # auto | indoor | daylight | cloudy | manual
+  colour_gains: [1.5, 1.5] # red, blue; used in manual WB
+  exposure_mode: auto      # auto | manual
+  exposure_time_us: 20000  # used in manual exposure, must fit one frame
+  analogue_gain: 1.0       # used in manual exposure
+  token: null              # Bearer for /record/* and /camera/settings; empty = open LAN
   max_stream_clients: 4
 
 tracker:

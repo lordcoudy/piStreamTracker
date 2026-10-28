@@ -8,6 +8,7 @@ import sys
 import types
 import unittest
 from contextlib import chdir
+from http.client import HTTPConnection
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import BoundedSemaphore, Condition, Thread, current_thread
@@ -263,6 +264,341 @@ class CameraServerTests(unittest.TestCase):
                 with patch.object(self.camera, 'CAMERA_TOKEN', 'secret'):
                     handler.do_GET()
                 self.assertEqual(handler.wfile.getvalue(), b'{"error": "unauthorized"}')
+
+    def settings_handler(self, body=b'{}'):
+        handler = self.handler()
+        handler.path = '/camera/settings'
+        handler.rfile = io.BytesIO(body)
+        handler.headers = {'Content-Length': str(len(body)), 'Content-Type': 'application/json'}
+        handler.send_response = Mock()
+        handler.camera_settings = Mock()
+        handler.camera_settings.snapshot.return_value = {'settings': {}, 'metadata': {}, 'limits': {}}
+        handler.camera_settings.update.return_value = {'settings': {'awb_mode': 'indoor'}}
+        handler.recorder = self.camera.CameraRecorder(Mock(), Path('.'))
+        handler._authorized = lambda: True
+        return handler
+
+    def test_camera_settings_get_and_post_require_camera_token(self):
+        for method in ('do_GET', 'do_POST'):
+            with self.subTest(method=method):
+                handler = self.settings_handler()
+                del handler._authorized
+                with patch.object(self.camera, 'CAMERA_TOKEN', 'secret'):
+                    getattr(handler, method)()
+                handler.send_response.assert_called_once_with(401)
+                handler.camera_settings.snapshot.assert_not_called()
+                handler.camera_settings.update.assert_not_called()
+
+    def test_camera_settings_get_returns_runtime_values(self):
+        handler = self.settings_handler()
+        handler.do_GET()
+        handler.send_response.assert_called_once_with(200)
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {
+            'status': 'ok', 'settings': {}, 'metadata': {}, 'limits': {},
+        })
+
+    def test_camera_settings_post_saves_valid_json_object(self):
+        handler = self.settings_handler(b'{"awb_mode": "indoor"}')
+        handler.do_POST()
+        handler.camera_settings.update.assert_called_once_with({'awb_mode': 'indoor'})
+        handler.send_response.assert_called_once_with(200)
+        self.assertEqual(json.loads(handler.wfile.getvalue()), {
+            'status': 'ok', 'saved': True, 'settings': {'awb_mode': 'indoor'},
+        })
+
+    def test_camera_settings_post_rejects_invalid_or_unbounded_json(self):
+        for body, headers in (
+            (b'[]', {}), (b'{', {}), (b'', {}), (b'{"framerate": NaN}', {}),
+            (b'{}', {'Content-Length': '-1'}),
+            (b'{}', {'Content-Length': 'four'}),
+            (b'{}', {'Content-Length': '5000'}),
+            (b'{}', {'Content-Length': '10'}),
+            (b'{}', {'Transfer-Encoding': 'chunked'}),
+        ):
+            with self.subTest(body=body, headers=headers):
+                handler = self.settings_handler(body)
+                handler.headers.update(headers)
+                handler.do_POST()
+                handler.send_response.assert_called_once_with(400)
+                handler.camera_settings.update.assert_not_called()
+
+    def test_camera_settings_post_refuses_active_recording(self):
+        handler = self.settings_handler()
+        handler.recorder.recording = True
+        handler.do_POST()
+        handler.send_response.assert_called_once_with(409)
+        handler.camera_settings.update.assert_not_called()
+
+    def test_camera_settings_post_rejects_excessively_nested_json(self):
+        handler = self.settings_handler(b'[' * 1500 + b']' * 1500)
+        handler.do_POST()
+        handler.send_response.assert_called_once_with(400)
+        handler.camera_settings.update.assert_not_called()
+
+    def test_camera_settings_errors_have_correct_http_status(self):
+        for error, status in ((ValueError('invalid gain'), 400),
+                              (RuntimeError('camera restart failed'), 500),
+                              (OSError('disk full'), 500)):
+            with self.subTest(error=error):
+                handler = self.settings_handler()
+                handler.camera_settings.update.side_effect = error
+                handler.do_POST()
+                handler.send_response.assert_called_once_with(status)
+                self.assertIn(str(error), json.loads(handler.wfile.getvalue())['error'])
+
+    def test_camera_settings_get_reports_unavailable_manager(self):
+        handler = self.settings_handler()
+        handler.camera_settings = None
+        handler.do_GET()
+        handler.send_response.assert_called_once_with(500)
+
+    def test_camera_settings_roundtrip_through_threaded_http_server(self):
+        manager = Mock()
+        manager.update.return_value = {'settings': {'awb_mode': 'indoor'}, 'metadata': {}, 'limits': {}}
+        recorder = self.camera.CameraRecorder(Mock(), Path('.'))
+        handler = type('SettingsHandler', (self.camera.StreamingHandler,), {
+            'camera_settings': manager, 'recorder': recorder,
+        })
+        with self.camera.StreamingServer(('127.0.0.1', 0), handler) as srv, \
+                patch.object(self.camera, 'CAMERA_TOKEN', 'secret'):
+            worker = Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.01})
+            worker.start()
+            try:
+                connection = HTTPConnection(*srv.server_address, timeout=2)
+                connection.request('GET', '/camera/settings')
+                response = connection.getresponse()
+                self.assertEqual(response.status, 401)
+                response.read()
+                connection.close()
+                connection = HTTPConnection(*srv.server_address, timeout=2)
+                connection.request('POST', '/camera/settings', b'{"awb_mode":"indoor"}', {
+                    'Authorization': 'Bearer secret', 'Content-Type': 'application/json',
+                })
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertTrue(json.loads(response.read())['saved'])
+                connection.close()
+            finally:
+                srv.shutdown()
+                worker.join(2)
+        manager.update.assert_called_once_with({'awb_mode': 'indoor'})
+
+    def test_recorder_lock_can_be_reentered_for_settings_transaction(self):
+        recorder = self.camera.CameraRecorder(Mock(), Path('.'))
+        with recorder._lock:
+            acquired = recorder._lock.acquire(blocking=False)
+            self.assertTrue(acquired, 'Settings and recording need one shared reentrant lock')
+            if acquired:
+                recorder._lock.release()
+
+    def test_startup_applies_persisted_white_balance_exposure_and_flicker(self):
+        camera = import_camera_module(fresh=True)
+        picam, srv = Mock(), Mock()
+        picam.camera_controls = {'AeFlickerMode': (0, 1, 0), 'AeFlickerPeriod': (0, 100000, 0)}
+        srv.serve_forever.side_effect = KeyboardInterrupt
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'settings.yaml'
+            config.write_text(
+                'camera:\n  framerate: 25\n  awb_mode: manual\n'
+                '  colour_gains: [1.7, 1.3]\n  exposure_mode: manual\n'
+                '  exposure_time_us: 10000\n  analogue_gain: 2\n'
+                f'  recording_dir: "{tmp}/recordings"\n'
+            )
+            with patch.object(camera, 'Picamera2', return_value=picam), \
+                    patch.object(camera, 'StreamingServer', return_value=srv):
+                camera.main(['--config', str(config)])
+            self.assertEqual(camera.CONFIG_PATH, config.resolve())
+        picam.set_controls.assert_called_once_with({
+            'AwbEnable': False, 'AeEnable': False, 'ColourGains': (1.7, 1.3),
+            'ExposureTime': 10000, 'AnalogueGain': 2.0,
+            'FrameDurationLimits': (40000, 40000), 'AeFlickerMode': 1, 'AeFlickerPeriod': 10000,
+        })
+
+    def test_live_geometry_change_rebuilds_stream_and_keeps_output_buffer(self):
+        camera = import_camera_module(fresh=True)
+        picam, srv = Mock(), Mock()
+        picam.camera_controls = {}
+        picam.capture_metadata.return_value = {}
+        output_seen = []
+        def serve():
+            output = camera.StreamingHandler.output
+            output.write(b'stale frame')
+            output_seen.append(output)
+            result = camera.StreamingHandler.camera_settings.update({
+                'resolution': {'width': 1280, 'height': 960}, 'framerate': 30,
+            })
+            self.assertEqual(result['settings']['resolution']['height'], 960)
+            self.assertIs(camera.StreamingHandler.output, output)
+            self.assertIsNone(output.frame)
+            self.assertEqual((camera.WIDTH, camera.HEIGHT, camera.FRAMERATE), (1280, 960, 30))
+            self.assertIn('1280 x 960', camera.HTML_PAGE)
+            raise KeyboardInterrupt
+        srv.serve_forever.side_effect = serve
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'settings.yaml'
+            config.write_text('camera:\n  framerate: 25\n'
+                              '  resolution: {width: 1280, height: 720}\n'
+                              f'  recording_dir: "{tmp}/recordings"\n')
+            with patch.object(camera, 'Picamera2', return_value=picam), \
+                    patch.object(camera, 'StreamingServer', return_value=srv):
+                camera.main(['--config', str(config)])
+        self.assertEqual(picam.configure.call_count, 2)
+        self.assertEqual(picam.start_recording.call_count, 2)
+        self.assertEqual(picam.stop_recording.call_count, 2)
+        for call in picam.start_recording.call_args_list:
+            self.assertIs(call.args[1].args[0], output_seen[0])
+        srv.server_close.assert_called_once()
+
+    def test_failed_live_configuration_restarts_previous_stream_without_closing_server(self):
+        camera = import_camera_module(fresh=True)
+        picam, srv = Mock(), Mock()
+        picam.camera_controls = {}
+        picam.capture_metadata.return_value = {}
+        picam.configure.side_effect = [None, RuntimeError('bad mode'), None]
+        def serve():
+            with self.assertRaisesRegex(RuntimeError, 'bad mode'):
+                camera.StreamingHandler.camera_settings.update({'framerate': 30})
+            self.assertEqual((camera.WIDTH, camera.HEIGHT, camera.FRAMERATE), (1280, 720, 25))
+            srv.server_close.assert_not_called()
+            raise KeyboardInterrupt
+        srv.serve_forever.side_effect = serve
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'settings.yaml'
+            config.write_text('camera:\n  framerate: 25\n'
+                              '  resolution: {width: 1280, height: 720}\n'
+                              f'  recording_dir: "{tmp}/recordings"\n')
+            original = config.read_bytes()
+            with patch.object(camera, 'Picamera2', return_value=picam), \
+                    patch.object(camera, 'StreamingServer', return_value=srv):
+                camera.main(['--config', str(config)])
+            self.assertEqual(config.read_bytes(), original)
+        self.assertEqual(picam.configure.call_count, 3)
+        self.assertEqual(picam.start_recording.call_count, 2)
+        self.assertEqual(picam.stop_recording.call_count, 2)
+
+    def test_partial_live_encoder_start_is_stopped_before_old_stream_is_restored(self):
+        camera = import_camera_module(fresh=True)
+        picam, srv = Mock(), Mock()
+        picam.camera_controls = {}
+        picam.capture_metadata.return_value = {}
+        picam.start_recording.side_effect = [None, RuntimeError('encoder start failed'), None]
+        def serve():
+            with self.assertRaisesRegex(RuntimeError, 'encoder start failed'):
+                camera.StreamingHandler.camera_settings.update({'framerate': 30})
+            self.assertEqual((camera.WIDTH, camera.HEIGHT, camera.FRAMERATE), (1280, 720, 25))
+            self.assertEqual(picam.stop_recording.call_count, 2)
+            raise KeyboardInterrupt
+        srv.serve_forever.side_effect = serve
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'settings.yaml'
+            config.write_text('camera:\n  framerate: 25\n'
+                              '  resolution: {width: 1280, height: 720}\n'
+                              f'  recording_dir: "{tmp}/recordings"\n')
+            with patch.object(camera, 'Picamera2', return_value=picam), \
+                    patch.object(camera, 'StreamingServer', return_value=srv):
+                camera.main(['--config', str(config)])
+        self.assertEqual(picam.start_recording.call_count, 3)
+        self.assertEqual(picam.stop_recording.call_count, 3)
+
+    def test_imx219_full_width_mode_is_cached_before_streaming_and_reused(self):
+        camera = import_camera_module(fresh=True)
+        class SensorCamera:
+            camera_properties = {'Model': 'imx219'}
+            camera_controls = {}
+
+            def __init__(self):
+                self.mode_queries = 0
+                self.streaming = False
+                self.configurations = []
+
+            @property
+            def sensor_modes(self):
+                assert not self.streaming, 'Sensor mode enumeration must never interrupt a live stream'
+                self.mode_queries += 1
+                return [{'size': (1920, 1080), 'bit_depth': 10},
+                        {'size': (1640, 1232), 'bit_depth': 10}]
+
+            def create_video_configuration(self, **kwargs):
+                self.configurations.append(kwargs)
+                return kwargs
+
+            def configure(self, _configuration):
+                assert not self.streaming
+
+            def set_controls(self, _controls):
+                pass
+
+            def start_recording(self, _encoder, _output):
+                self.streaming = True
+
+            def stop_recording(self):
+                self.streaming = False
+
+            def capture_metadata(self):
+                return {}
+
+            def close(self):
+                pass
+
+        picam, srv = SensorCamera(), Mock()
+        def serve():
+            manager = camera.StreamingHandler.camera_settings
+            manager.update({'resolution': {'width': 1280, 'height': 960}})
+            manager.update({'resolution': {'width': 1920, 'height': 1080}})
+            manager.update({'resolution': {'width': 1280, 'height': 720}})
+            raise KeyboardInterrupt
+        srv.serve_forever.side_effect = serve
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'settings.yaml'
+            config.write_text('camera:\n  framerate: 25\n'
+                              '  resolution: {width: 1280, height: 720}\n'
+                              f'  recording_dir: "{tmp}/recordings"\n')
+            with patch.object(camera, 'Picamera2', return_value=picam), \
+                    patch.object(camera, 'StreamingServer', return_value=srv):
+                camera.main(['--config', str(config)])
+        self.assertEqual(picam.mode_queries, 1)
+        selected = {'output_size': (1640, 1232), 'bit_depth': 10}
+        self.assertEqual(picam.configurations[0]['sensor'], selected)
+        self.assertEqual(picam.configurations[1]['sensor'], selected)
+        self.assertNotIn('sensor', picam.configurations[2])
+        self.assertEqual(picam.configurations[3]['sensor'], selected)
+
+    def test_other_camera_keeps_automatic_sensor_selection(self):
+        camera = import_camera_module(fresh=True)
+        picam, srv = Mock(), Mock()
+        picam.camera_properties = {'Model': 'ov5647'}
+        picam.camera_controls = {}
+        srv.serve_forever.side_effect = KeyboardInterrupt
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'settings.yaml'
+            config.write_text('camera:\n  framerate: 25\n'
+                              '  resolution: {width: 1280, height: 720}\n'
+                              f'  recording_dir: "{tmp}/recordings"\n')
+            with patch.object(camera, 'Picamera2', return_value=picam), \
+                    patch.object(camera, 'StreamingServer', return_value=srv):
+                camera.main(['--config', str(config)])
+        picam.create_video_configuration.assert_called_once_with(
+            main={'size': (1280, 720)}, controls={'FrameRate': 25},
+        )
+
+    def test_imx219_without_matching_sensor_mode_keeps_automatic_selection(self):
+        camera = import_camera_module(fresh=True)
+        picam, srv = Mock(), Mock()
+        picam.camera_properties = {'Model': 'imx219'}
+        picam.camera_controls = {}
+        picam.sensor_modes = [{'size': (1640, 1232), 'bit_depth': 8}]
+        srv.serve_forever.side_effect = KeyboardInterrupt
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'settings.yaml'
+            config.write_text('camera:\n  framerate: 25\n'
+                              '  resolution: {width: 1280, height: 720}\n'
+                              f'  recording_dir: "{tmp}/recordings"\n')
+            with patch.object(camera, 'Picamera2', return_value=picam), \
+                    patch.object(camera, 'StreamingServer', return_value=srv):
+                camera.main(['--config', str(config)])
+        picam.create_video_configuration.assert_called_once_with(
+            main={'size': (1280, 720)}, controls={'FrameRate': 25},
+        )
 
     def test_recording_download_is_limited_to_stat_size(self):
         with TemporaryDirectory() as tmp:

@@ -5,6 +5,205 @@
         let controlRequestPending = false;
         let lastWarning = null;
         let motorBackend = 'ev3';
+        let cameraSettings = null;
+        let cameraLimits = {};
+        let cameraSettingsPending = false;
+
+        // Camera controls are an explicit saved draft, independent of status polling.
+        function cameraMessage(message, type = '') {
+            const element = document.getElementById('camera-settings-status');
+            element.textContent = message;
+            element.className = 'camera-message' + (type ? ' ' + type : '');
+        }
+
+        function setStreamDimensions(width, height) {
+            const root = document.documentElement;
+            root.style.setProperty('--stream-width', width + 'px');
+            root.style.setProperty('--stream-aspect', width + '/' + height);
+            root.style.setProperty('--controls-width', width / height >= 1.6 ? '280px' : '300px');
+        }
+
+        function updateCameraResolutions(selected = '') {
+            const aspect = document.getElementById('camera-aspect').value;
+            const resolutions = aspect === '4:3'
+                ? [['1280x960', '1280 × 960 · HD']]
+                : [['1280x720', '1280 × 720 · HD'], ['1920x1080', '1920 × 1080 · Full HD']];
+            const select = document.getElementById('camera-resolution');
+            select.replaceChildren(...resolutions.map(([value, text]) => new Option(text, value)));
+            if (selected) {
+                if (!resolutions.some(([value]) => value === selected)) select.add(new Option(selected.replace('x', ' × ') + ' · current', selected));
+                select.value = selected;
+            }
+        }
+
+        function cameraLimit(name, bound, fallback) {
+            const value = cameraLimits[name] && cameraLimits[name][bound];
+            const values = Array.isArray(value) ? value : [value];
+            return values.every(Number.isFinite) ? (bound === 'min' ? Math.max(...values) : Math.min(...values)) : fallback;
+        }
+
+        function updateCameraManualFields() {
+            document.getElementById('camera-wb-manual').hidden = document.getElementById('camera-awb-mode').value !== 'manual';
+            document.getElementById('camera-exposure-manual').hidden = document.getElementById('camera-exposure-mode').value !== 'manual';
+            const exposure = document.getElementById('camera-exposure-ms');
+            const fps = Number(document.getElementById('camera-framerate').value);
+            exposure.min = Math.max(0.1, cameraLimit('ExposureTime', 'min', 100) / 1000);
+            exposure.max = Math.min(1000 / fps, cameraLimit('ExposureTime', 'max', 40000) / 1000);
+            document.getElementById('camera-exposure-hint').textContent =
+                'Shutter must be ' + Number(exposure.min).toFixed(2) + '–' + Number(exposure.max).toFixed(2) + ' ms at ' + fps + ' FPS.';
+            const gain = document.getElementById('camera-analogue-gain');
+            gain.min = Math.max(1, cameraLimit('AnalogueGain', 'min', 1));
+            gain.max = Math.min(16, cameraLimit('AnalogueGain', 'max', 16));
+            for (const id of ['camera-red-gain', 'camera-blue-gain']) {
+                document.getElementById(id).min = Math.max(0.1, cameraLimit('ColourGains', 'min', 0.1));
+                document.getElementById(id).max = Math.min(8, cameraLimit('ColourGains', 'max', 8));
+            }
+        }
+
+        function updateCameraAvailability() {
+            const locked = isRecording || recordingStopPending;
+            document.getElementById('camera-fields').disabled = cameraSettingsPending || !cameraSettings || locked;
+            document.getElementById('camera-save').disabled = cameraSettingsPending || !cameraSettings || locked || isStopping || controlRequestPending;
+            document.getElementById('camera-reload').disabled = cameraSettingsPending;
+            document.getElementById('camera-save').textContent = cameraSettingsPending ? 'Applying…' : 'Save & apply';
+            document.getElementById('camera-recording-note').hidden = !locked;
+            document.getElementById('camera-settings-form').setAttribute('aria-busy', String(cameraSettingsPending));
+        }
+
+        function showCameraReadings(metadata = {}) {
+            metadata = metadata || {};
+            const readings = [];
+            if (Number.isFinite(metadata.ExposureTime)) readings.push('Shutter ' + (metadata.ExposureTime / 1000).toFixed(1) + ' ms');
+            if (Number.isFinite(metadata.AnalogueGain)) readings.push('gain ' + metadata.AnalogueGain.toFixed(2));
+            if (Number.isFinite(metadata.ColourTemperature)) readings.push('white balance ' + Math.round(metadata.ColourTemperature) + ' K');
+            if (Array.isArray(metadata.ColourGains) && metadata.ColourGains.length === 2 && metadata.ColourGains.every(Number.isFinite)) {
+                readings.push('R/B ' + metadata.ColourGains.map(value => value.toFixed(2)).join(' / '));
+            }
+            if (Number.isFinite(metadata.FrameDuration) && metadata.FrameDuration > 0) readings.push((1000000 / metadata.FrameDuration).toFixed(1) + ' camera FPS');
+            const element = document.getElementById('camera-current-readings');
+            element.textContent = readings.length ? 'Measured: ' + readings.join(' · ') : '';
+            element.hidden = !readings.length;
+        }
+
+        function showCameraSettings(payload) {
+            const settings = payload.settings;
+            if (!settings || !settings.resolution || !Number.isFinite(settings.resolution.width) || !Number.isFinite(settings.resolution.height)) {
+                throw new Error('Invalid camera settings from server');
+            }
+            cameraSettings = settings;
+            cameraLimits = payload.limits || {};
+            const { width, height } = settings.resolution;
+            document.getElementById('camera-aspect').value = width / height >= 1.6 ? '16:9' : '4:3';
+            updateCameraResolutions(width + 'x' + height);
+            const fps = document.getElementById('camera-framerate');
+            if (!Array.from(fps.options).some(option => Number(option.value) === settings.framerate)) {
+                fps.add(new Option(settings.framerate + ' FPS', settings.framerate));
+            }
+            fps.value = settings.framerate;
+            document.getElementById('camera-awb-mode').value = settings.awb_mode;
+            document.getElementById('camera-red-gain').value = (settings.colour_gains || [1.5, 1.5])[0];
+            document.getElementById('camera-blue-gain').value = (settings.colour_gains || [1.5, 1.5])[1];
+            document.getElementById('camera-exposure-mode').value = settings.exposure_mode;
+            document.getElementById('camera-exposure-ms').value = (settings.exposure_time_us || 20000) / 1000;
+            document.getElementById('camera-analogue-gain').value = settings.analogue_gain || 1;
+            updateCameraManualFields();
+            showCameraReadings(payload.metadata);
+            setStreamDimensions(width, height);
+        }
+
+        async function cameraSettingsRequest(method = 'GET', settings) {
+            const options = { method };
+            if (settings) {
+                options.headers = { 'Content-Type': 'application/json' };
+                options.body = JSON.stringify(settings);
+            }
+            const response = await fetch('/api/camera/settings', options);
+            let payload;
+            try {
+                payload = await response.json();
+            } catch (_) {
+                throw new Error('Camera settings are unavailable (' + response.status + ').');
+            }
+            if (!response.ok || !payload || payload.status !== 'ok') {
+                throw new Error((payload && payload.message) || 'Camera settings are unavailable (' + response.status + ').');
+            }
+            return payload;
+        }
+
+        async function loadCameraSettings() {
+            if (cameraSettingsPending) return;
+            cameraSettingsPending = true;
+            updateCameraAvailability();
+            cameraMessage('Loading camera settings…');
+            try {
+                showCameraSettings(await cameraSettingsRequest());
+                cameraMessage('Saved camera settings loaded.');
+            } catch (error) {
+                cameraMessage(error.message + ' Use Reload saved to retry.', 'error');
+            } finally {
+                cameraSettingsPending = false;
+                updateUI();
+            }
+        }
+
+        function cameraNumber(id, label) {
+            const input = document.getElementById(id);
+            const value = input.valueAsNumber;
+            if (!Number.isFinite(value) || value < Number(input.min) || value > Number(input.max)) {
+                throw new Error(label + ' must be between ' + Number(input.min).toFixed(2) + ' and ' + Number(input.max).toFixed(2) + '.');
+            }
+            return value;
+        }
+
+        async function saveCameraSettings(event) {
+            event.preventDefault();
+            if (document.getElementById('camera-save').disabled) return;
+            let settings;
+            try {
+                const [width, height] = document.getElementById('camera-resolution').value.split('x').map(Number);
+                const framerate = Number(document.getElementById('camera-framerate').value);
+                const awb_mode = document.getElementById('camera-awb-mode').value;
+                const exposure_mode = document.getElementById('camera-exposure-mode').value;
+                if (![width, height, framerate].every(Number.isFinite) || width < 1280 || height < 720 || framerate < 25 || framerate > 40) {
+                    throw new Error('Choose at least HD resolution and 25–40 camera FPS.');
+                }
+                settings = {
+                    resolution: { width, height }, framerate, awb_mode,
+                    colour_gains: awb_mode === 'manual'
+                        ? [cameraNumber('camera-red-gain', 'Red gain'), cameraNumber('camera-blue-gain', 'Blue gain')]
+                        : cameraSettings.colour_gains,
+                    exposure_mode,
+                    exposure_time_us: exposure_mode === 'manual'
+                        ? Math.round(cameraNumber('camera-exposure-ms', 'Exposure in ms') * 1000)
+                        : Math.min(cameraSettings.exposure_time_us, Math.floor(1000000 / framerate)),
+                    analogue_gain: exposure_mode === 'manual' ? cameraNumber('camera-analogue-gain', 'Analogue gain') : cameraSettings.analogue_gain,
+                };
+            } catch (error) {
+                cameraMessage(error.message, 'error');
+                return;
+            }
+            cameraSettingsPending = true;
+            updateUI();
+            cameraMessage('Applying camera settings…');
+            try {
+                const payload = await cameraSettingsRequest('POST', settings);
+                showCameraSettings(payload);
+                document.getElementById('video-feed').src = '/video_feed?t=' + Date.now();
+                if (payload.warning) {
+                    cameraMessage('Camera settings saved. ' + payload.warning, 'warning');
+                    log('Camera settings saved. ' + payload.warning, 'error');
+                } else {
+                    cameraMessage('Camera settings saved and applied.', 'success');
+                    log('Camera settings saved and applied', 'success');
+                }
+                await updateStatus();
+            } catch (error) {
+                cameraMessage(error.message, 'error');
+            } finally {
+                cameraSettingsPending = false;
+                updateUI();
+            }
+        }
 
         function log(message, type = 'info') {
             const logEl = document.getElementById('log-output');
@@ -217,13 +416,14 @@
         }
 
         function updateUI() {
-            document.getElementById('btn-start').disabled = isTracking || isStopping || recordingStopPending || controlRequestPending;
+            document.getElementById('btn-start').disabled = isTracking || isStopping || recordingStopPending || controlRequestPending || cameraSettingsPending;
             document.getElementById('btn-stop').disabled = controlRequestPending;
             document.getElementById('btn-stop').textContent = recordingStopPending && !isTracking ? 'Retry camera stop' : 'Stop';
-            document.getElementById('btn-record').disabled = !isTracking || isStopping || controlRequestPending;
+            document.getElementById('btn-record').disabled = !isTracking || isStopping || controlRequestPending || cameraSettingsPending;
             document.getElementById('btn-record').textContent = isRecording ? 'Stop Rec' : 'Record';
             document.getElementById('btn-record').className = isRecording ? 'danger' : '';
             document.getElementById('status-recording').className = 'dot ' + (isRecording ? 'red' : 'yellow');
+            updateCameraAvailability();
         }
 
         function showRecordingWarning(warning) {
@@ -364,13 +564,7 @@
         async function loadConfig() {
             const res = await api('config');
             if (!res) return;
-            if (res.width && res.height) {
-                const root = document.documentElement;
-                root.style.setProperty('--stream-width', res.width + 'px');
-                root.style.setProperty('--stream-aspect', res.width + '/' + res.height);
-                const ratio = res.width / res.height;
-                root.style.setProperty('--controls-width', ratio >= 1.6 ? '280px' : '300px');
-            }
+            if (res.width && res.height && !cameraSettings) setStreamDimensions(res.width, res.height);
             if (res.confidence !== undefined) {
                 document.getElementById('conf-slider').value = res.confidence;
                 document.getElementById('conf-value').textContent = res.confidence;
@@ -396,4 +590,5 @@
         setInterval(updateStatus, 1000);
         updateStatus();
         loadConfig();
+        loadCameraSettings();
         log('Web interface loaded');

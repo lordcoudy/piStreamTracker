@@ -39,6 +39,11 @@ def default_config() -> dict:
             'max_stream_clients': 4,
             'recording_dir': 'recordings',
             'resolution': {'width': 1280, 'height': 960},
+            'awb_mode': 'auto',
+            'colour_gains': [1.5, 1.5],
+            'exposure_mode': 'auto',
+            'exposure_time_us': 20000,
+            'analogue_gain': 1.0,
         },
         'tracker': {
             'stream_url': None,
@@ -196,6 +201,10 @@ def validate_config(config: dict) -> dict:
     )
     resolution['width'] = _positive_int(resolution.get('width'), 'camera.resolution.width', 16384)
     resolution['height'] = _positive_int(resolution.get('height'), 'camera.resolution.height', 16384)
+
+    from pistream.camera_settings import validate_camera_controls
+
+    validate_camera_controls(camera)
 
     tracker['recording_fps'] = _bounded_number(
         tracker.get('recording_fps', camera['framerate']), 'tracker.recording_fps', 1, 240
