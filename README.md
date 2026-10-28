@@ -31,7 +31,7 @@ camera.py                     tracker.py  or  web.py
 - EV3 pan/tilt with deadzone, home-hold after Reset, D-pad
 - GPIO SG90 commands through local `pigpiod`, independent calibration and mechanical limits, speed caps, and a fresh-frame watchdog
 - Web UI: overlay or raw-camera proxy, zoom, horizon preview, recordings
-- Local H.264 (ffmpeg, hardware when available) or camera-side record
+- Local H.264 (ffmpeg, hardware when available) or camera-side H.264/MP4 via Picamera2/PyavOutput
 - Stream reconnects after a camera reboot; status shows `stream_lost`
 - Optional Bearer token on every `/record/*` operation; cap on concurrent `/stream` clients
 - Camera-mode recordings remain downloadable/deletable from the tracker UI; local fallback is automatic
@@ -39,8 +39,8 @@ camera.py                     tracker.py  or  web.py
 ## One Raspberry Pi 4: assembly and first run
 
 Use **Raspberry Pi OS Bookworm 64-bit with its system Python 3.11**, one CSI
-camera and two positional SG90 servos. The current `config.pi4.yaml` preserves
-the supplied Pi 4 settings for an IMX219 camera with a 160-degree lens. Other
+camera and two positional SG90 servos. The current `config.pi4.yaml` combines
+the supplied IMX219 160-degree camera profile with settings tuned on the Pi 4. Other
 sensors, including OV5647, can use their automatic tuning by setting
 `camera.tuning_file: null`. The separately
 prepared `piStreamTracker_Pi4_AD5X.3mf` supplies the mechanism; software limits must
@@ -116,10 +116,13 @@ Set `web.autostart_delay: null` to require manual Start instead; a numeric value
 sets the delay in seconds (0–86400). The same behavior applies to foreground
 web launches. Automatic startup does not start a recording.
 
-`config.pi4.yaml` preserves the supplied Pi's 1280×720 at 45 camera frames/s,
-JPEG quality 80 and 45 recording frames/s, with two MoveNet threads and at most
-10 annotated-preview frames/s. These are configured rates, not measured tracking
-performance. Camera recordings go to `camera-recordings/`; screenshots and
+`config.pi4.yaml` uses 1280×720 at 25 camera/recording frames/s, JPEG quality 80,
+one MoveNet thread and at most 10 annotated-preview frames/s. The original
+45-frame/s setting reached 82–84°C with only a passive radiator during the live
+test. Reducing the stream to 25 frames/s lowered camera-process CPU usage from
+about 107% to 65% of one core; it did not establish sustained thermal stability.
+Check cooling under the intended workload before prolonged operation.
+Camera recordings go to `camera-recordings/`; screenshots and
 fallback local recordings go to `recordings/`, avoiding duplicate list entries.
 
 Both Pi camera configurations load `tuning/imx219-160-no-alsc.json`, preserving the camera
@@ -133,8 +136,11 @@ startup instead of falling back to a different image configuration.
 ### Calibrate before automatic motion
 
 The current Pi configuration preserves its `gpio_servo.calibrated: true`
-approval, pan limits of −90…90° at 500°/s and tilt limits of −45…45° at 300°/s.
-These are settings from that mechanism. For a new or changed assembly, set
+approval and mechanical limits, with pan −90…90° at 25°/s and tilt −45…45° at
+15°/s. Both axes use `invert: true`, as verified by small manual movements on
+the supplied mechanism. Gain is 6, reduced from 30; the previous 500/300°/s speed
+caps were also reduced after the camera moved away from its target. These are
+settings for that mechanism. For a new or changed assembly, set
 `gpio_servo.calibrated: false` before starting services and commission it below.
 The built-in servo defaults remain uncalibrated with smaller working ranges and
 lower speeds. `calibrated: false` blocks automatic motor tracking; video
@@ -274,10 +280,31 @@ before touching the mechanism; a lost daemon connection cannot confirm PWM
 shutdown. Repeated import/ABI failures warrant checking the venv's Python and
 NumPy versions and rerunning setup with the supported OS/runtime combination.
 
-### Hardware acceptance checklist (still to run on the actual build)
+### Hardware acceptance checklist
 
 Automated tests use fake GPIO, camera and EV3 components. They do not establish
 physical motion, CSI capture, electrical stability or Pi 4 processing speed.
+The remote Pi 4 / IMX219 / SG90 check on 2026-10-28 verified the camera image,
+manual direction changes, Home and Stop. The operator confirmed horizontal
+following, seated vertical following and motion stopping after leaving the frame.
+A stationary run at 25 camera frames/s and two inference threads had 68/68
+positive detections over 20 seconds, with fixed pan commands and no motor errors;
+processing FPS had a median of 15.9. Tilt stayed at its −45° limit in that run,
+so it did not demonstrate vertical centering of a standing person. Reposition the
+camera or person before assessing vertical centering; these measurements do not
+justify widening the mechanical limits. The current one-thread setting was
+selected from an inference comparison under load: about 108 ms versus 78 ms
+with two threads. Repeat the full checklist for the final assembly and workload.
+A subsequent one-thread live test recorded 24 positive samples over 7.76 seconds,
+median processing FPS 16.32, no motor errors or stream loss, and holding the last
+angles after exit. A four-second camera-side H.264 MP4 at 1280×720 was checked
+with ffprobe and a decoded frame; a 10.48-second recording through the web UI
+also passed. The tracker and motors became active about
+121.5 seconds after service startup with the 120-second delay selected.
+A short one-thread post-start sample was 73.5°C, with no current thermal flags
+and camera/tracker CPU around 53%/126% of one core; it does not establish
+sustained thermal stability or complete mechanical acceptance. A later reading
+after the web recording was 79.3°C, still without active thermal flags.
 
 1. Verify supply polarity/common ground and unloaded Home; commission both
    calibrated axes and inspect the cable/printed stops through their full
@@ -293,7 +320,7 @@ physical motion, CSI capture, electrical stability or Pi 4 processing speed.
    files. Check camera and local fallback directories and available storage.
 6. Measure actual processing FPS, preview latency, CPU temperature, power and
    tracking quality with recording enabled before tuning detection/preview
-   settings; no achieved FPS is claimed here.
+   settings; a short tracking sample is not a sustained-performance guarantee.
 7. Reboot again and repeat image/manual/tracking/recording checks. Confirm the
    selected config, calibration and existing network settings persisted.
 
@@ -431,7 +458,7 @@ Use `config.yaml` for the original two-Pi setup and `config.pi4.yaml` for the
 standalone build. Missing settings use built-in defaults. CLI flags override a
 named `--preset`, which overrides the file. The built-in `pi4` performance preset
 still supplies conservative 640×480 at 15 camera frames/s; selecting it explicitly
-overrides the current Pi file's 1280×720 at 45 frames/s. Standalone services and
+overrides the current Pi file's 1280×720 at 25 frames/s. Standalone services and
 `run_standalone.sh` pass the shared config without a preset, so they keep the
 file's camera settings in both processes.
 

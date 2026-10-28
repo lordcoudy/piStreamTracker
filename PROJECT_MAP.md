@@ -1,6 +1,6 @@
 # piStreamTracker project map
 
-Agent orientation, updated for the supplied Pi 4 camera configuration and delayed
+Agent orientation, updated for live Pi 4 camera/motion tuning and delayed
 tracking startup on 2026-10-28, following the recording/recovery fixes in October. This is a
 navigation aid, not a specification. Source code and tests determine current
 behavior; recheck the relevant section before changing it.
@@ -119,8 +119,12 @@ and clamp pulse widths. The worker limits degrees/second with monotonic time and
 movement after `frame_timeout` even without frame processing. Manual/Home hold
 auto while moving and for the configured pause; Stop disconnects regardless of
 holds. `calibrated: false` blocks auto but permits commissioning commands.
-The current `config.pi4.yaml` preserves the supplied Pi's confirmed calibration,
-pan ±90° / 500°/s and tilt ±45° / 300°/s. Built-in servo defaults remain
+The current `config.pi4.yaml` preserves the supplied Pi's confirmed calibration
+and mechanical ranges: pan ±90° and tilt ±45°. Live direction checks found both
+axes reversed, so both use `invert: true`; speed caps are now 25°/s and 15°/s,
+with gain 6 rather than 30. A stationary live test held pan commands constant;
+tilt remained at its −45° limit and did not establish vertical centering.
+Built-in servo defaults remain
 uncalibrated with conservative working ranges/speeds for commissioning.
 Status distinguishes target and last commanded degrees; SG90 has no feedback.
 Failed PWM-off is an error with unknown pulse state, retained in web status after
@@ -150,6 +154,11 @@ each vector toward increasing screen-x, smooths and clamps it, and holds the las
 angle when the target is lost. The affine transform levels that signed screen angle.
 CLI keyboard events run even for missing/repeated frames; processing, recording,
 FPS and preview updates accept only new frames. Screenshots use the last displayed frame.
+
+Camera-side H.264 uses Picamera2's encoder with `PyavOutput` to mux MP4 in-process.
+`FfmpegOutput` starts FFmpeg with a parent-death signal; when called by a short-lived
+HTTP request thread, that child is killed after the request returns. The local
+tracker recorder's ffmpeg path is separate.
 
 Camera-mode recording first calls `/record/start`. If its response fails,
 the tracker checks `/record/status` before falling back locally. A failed
@@ -209,10 +218,14 @@ Web mode is selected by `web.py` or `run_tracker.sh --web`; the unused
 `web.autostart_delay` defaults to 120 seconds even for existing YAML files that
 omit it. Null disables the one-time automatic start; finite numeric values from
 0 to 86400 select another delay. The web UI remains available during the wait.
-`config.pi4.yaml` preserves the supplied Pi's localhost camera endpoints,
+`config.pi4.yaml` uses the supplied Pi's localhost camera endpoints,
 camera-side H.264 recording, separate `camera-recordings/` and tracker `recordings/`
-directories, 1280×720 at 45 camera/recording FPS, JPEG quality 80, 2 inference
-threads and 10 preview FPS. These are configured values, not measured throughput.
+directories, 1280×720 at 25 camera/recording FPS, JPEG quality 80, one inference
+thread and 10 preview FPS. The live session reduced the supplied 45 FPS to 25
+after 82–84°C readings with a passive radiator. Camera-process CPU fell from
+about 107% to 65% of one core, but cooling still needs validation under sustained
+load. The one-thread model comparison took about 108 ms versus 78 ms with two
+threads; these inference times are not tracking FPS guarantees.
 Its `camera.tuning_file` selects the bundled IMX219 160-degree profile without
 `rpi.alsc`. The two-Pi `config.yaml` selects the same profile for the matching
 IMX219 module on the Pi 3B+. Built-in configuration defaults retain null for
@@ -316,13 +329,34 @@ smoke with mocked hardware. All prior Pi YAML values and tuning bytes were prese
 A synthetic localhost MJPEG smoke exercised real OpenCV capture, web Start/Stop,
 preview, screenshot and a readable local MJPG recording with detector/motors
 disabled. Bookworm/Python 3.11 ARM wheel availability was checked against primary
-package sources; installation and operation on Pi hardware remain unverified.
+package sources; that synthetic smoke did not establish Pi hardware operation.
 [CI](.github/workflows/ci.yml) runs Ubuntu with Python 3.11/3.12, installing
 the declared `.[dev,desktop]` dependencies.
 Tests use mocked hardware and Flask's test client; they do not establish real
 Pi camera/EV3 behavior or MoveNet inference quality. Standalone browser checks
 cover mocked recovery, GPIO controls and responsiveness. A fresh macOS ARM desktop install was
 smoke-tested with LiteRT 2.3 and the cached MoveNet model (finite `(1,1,17,3)` output).
+The remote Pi 4 / IMX219 / SG90 live check on 2026-10-28 confirmed camera preview,
+manual axes, Home and Stop. The operator confirmed horizontal following, seated
+vertical following and stopping after leaving the frame. At 25 camera FPS and
+two inference threads, a stationary sample had 68/68 detections over 19.84 seconds,
+median processing FPS 15.91, no stream/motor errors and no pan command changes.
+Tilt was saturated at −45° throughout that sample. These are limited live checks,
+not a completed electrical, full-range mechanical or sustained thermal acceptance.
+The final one-thread live test had 24 positive samples over 7.76 seconds, median
+processing FPS 16.32, no motor/stream errors and held the last angles after exit.
+`PyavOutput` HTTP start/stop produced a 1,663,877-byte H.264 MP4 at 1280×720:
+100 frames over 4.002 seconds, verified by ffprobe, a decoded frame and an
+inactive entry in the web recordings list. The 120-second automatic start was
+also followed by a valid 10.482-second, 262-frame H.264 recording through the
+web controls, with stop confirmed and no pending warning. Automatic startup was
+observed running with connected motors at service age 121.46 seconds, after
+being idle at 33 seconds. A short post-start sample measured 73.5°C, current
+thermal flags clear and camera/tracker CPU 53%/126% of one core; the earlier
+two-thread 25-FPS sample was about 65%/198%. After the web recording, another
+sample was 79.3°C with active thermal flags still clear. These short samples do not establish
+sustained cooling. The updated development suite passed 339 tests and 57 subtests;
+Ruff passed.
 
 ## Observed caveats to recheck when working nearby
 
@@ -340,7 +374,10 @@ These are code observations at the revision above, not fixes made by this map.
 - **Native OpenCV finalization:** worker writes are guarded, but OpenCV's native
   `VideoWriter.release()` call has no timeout. The ffmpeg subprocess shutdown
   bounds do not guarantee a bound on native MJPG file finalization.
-- **Hardware verification:** no Pi 4, CSI camera, SG90, real pigpiod or timing benchmark
-  is available in the development environment. Follow README's hardware acceptance
-  checklist; initial position commands cannot limit physical motion from an unknown
-  startup position. Commission with unloaded horns and safe cable clearance.
+- **Hardware verification:** the remote Pi 4 check above covers preview and selected
+  motion cases; it does not certify full mechanical ranges, electrical stability
+  or sustained cooling. Follow README's acceptance checklist; initial position
+  commands cannot limit physical motion from an unknown startup position.
+  Commission with unloaded horns and safe cable clearance. A standing person can
+  remain above the framing target with tilt at −45°; change placement before
+  considering any mechanical-limit adjustment.

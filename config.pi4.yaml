@@ -1,5 +1,5 @@
 # Current Raspberry Pi 4 + IMX219 160-degree camera + positional SG90 settings.
-# Camera and servo values preserve the supplied configuration from the Pi.
+# Live-tuned on the supplied Pi; mechanical limits and pulse calibration are retained.
 # camera.py owns CSI; web.py reads local MJPEG. No network changes are required.
 network:
   camera_ip: "127.0.0.1"
@@ -9,7 +9,7 @@ camera:
   host: "127.0.0.1"
   port: 8000
   resolution: {width: 1280, height: 720}
-  framerate: 45
+  framerate: 25
   jpeg_quality: 80
   tuning_file: "tuning/imx219-160-no-alsc.json"
   recording_dir: "camera-recordings"
@@ -18,9 +18,9 @@ tracker:
   stream_url: "http://127.0.0.1:8000/stream"
   output_dir: "recordings"  # screenshots and fallback local recordings only
   recording_mode: "camera"
-  recording_fps: 45
+  recording_fps: 25
   detection: {interval: 8, scale: 0.5}
-  movenet: {threads: 2}
+  movenet: {threads: 1}
 
 motors:
   backend: "gpio_servo"
@@ -33,7 +33,7 @@ gpio_servo:
   home_hold: 3.0
   manual_hold: 1.0
   deadzone: 0.08  # fraction of half the image dimension, per axis
-  gain: 30.0
+  gain: 6.0
   min_step: 0.2  # degrees; suppress small command changes
   pan:
     gpio: 18  # BCM18, physical pin 12
@@ -41,16 +41,16 @@ gpio_servo:
     min_angle: -90
     max_angle: 90
     home: 0
-    invert: false
-    max_speed: 500  # degrees/second; preserves the supplied Pi setting
+    invert: true  # direction verified against image motion on the supplied mechanism
+    max_speed: 25  # degrees/second
   tilt:
     gpio: 19  # BCM19, physical pin 35
     calibration: {min_angle: -90, max_angle: 90, min_pulse_us: 1000, max_pulse_us: 2000}
     min_angle: -45
     max_angle: 45
     home: 0
-    invert: false
-    max_speed: 300  # degrees/second; preserves the supplied Pi setting
+    invert: true  # direction verified against image motion on the supplied mechanism
+    max_speed: 15  # degrees/second
 
 web:
   host: "0.0.0.0"
