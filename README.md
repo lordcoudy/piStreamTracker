@@ -1,18 +1,22 @@
 # piStreamTracker
 
-Follow-cam for a lecturer: run a CSI camera, MoveNet + OpenCV tracking, a web UI and two SG90 pan/tilt servos on one Raspberry Pi 4, or keep the original Pi 3B+ camera → Pi 5 tracker → USB EV3 setup.
+Follow-cam for a lecturer: run an IMX219 CSI camera, MoveNet + OpenCV tracking, a web UI and two SG90 pan/tilt servos on one Raspberry Pi 4, or use the Pi 3B+ IMX219 camera → Pi 5 tracker → USB EV3 setup.
 
 Run application Python processes as an ordinary user. The standalone setup keeps existing Ethernet/Wi-Fi settings; the two-Pi setup assigns its Ethernet addresses once (EV3 access uses udev).
 
-## Original two-Pi hardware
+## Two-Pi hardware
 
 | Device | Role | Address |
 |--------|------|---------|
-| Raspberry Pi 3B+ | Camera + MJPEG (and optional H.264 record) | 192.168.100.1 |
+| Raspberry Pi 3B+ | IMX219 camera + MJPEG (and optional H.264 record) | 192.168.100.1 |
 | Raspberry Pi 5 | Detection, web UI, EV3 | 192.168.100.2 |
 | EV3 brick (USB) | Port A pan, port B tilt | — |
 
 Direct Ethernet (or a switch) between the two Pis.
+The Pi 3B+ and Pi 4 use the same IMX219 camera module and share the
+`tuning/imx219-160-no-alsc.json` profile through `camera.tuning_file` in
+`config.yaml` and `config.pi4.yaml`. The profile preserves the camera correction
+from the supplied Pi 4 project.
 
 ```
 Pi 3B+  --MJPEG /record/*-->  Pi 5  --USB-->  EV3 (A=pan, B=tilt)
@@ -34,8 +38,11 @@ camera.py                     tracker.py  or  web.py
 
 ## One Raspberry Pi 4: assembly and first run
 
-Use **Raspberry Pi OS Bookworm 64-bit with its system Python 3.11**, one OV5647
-CSI camera (Camera v1.3 format), and two positional SG90 servos. The separately
+Use **Raspberry Pi OS Bookworm 64-bit with its system Python 3.11**, one CSI
+camera and two positional SG90 servos. The current `config.pi4.yaml` preserves
+the supplied Pi 4 settings for an IMX219 camera with a 160-degree lens. Other
+sensors, including OV5647, can use their automatic tuning by setting
+`camera.tuning_file: null`. The separately
 prepared `piStreamTracker_Pi4_AD5X.3mf` supplies the mechanism; software limits must
 be calibrated against its printed stops and the actual CSI cable routing.
 
@@ -102,21 +109,38 @@ Setup enables three services: `pigpiod`, `pistream-camera`, and
 `pistream-tracker`. The tracker starts after and requires the camera and daemon.
 Both applications receive the same absolute config path. A previous
 `pitracker.service` on this device is stopped and disabled to avoid a second
-camera owner. The web service opens the control panel; **tracking starts only
-when Start is pressed**, including after a reboot.
+camera owner. The web service opens the control panel immediately and starts
+tracking with the configured motors **120 seconds after startup**, including
+after a reboot. Manual **Start** or **Stop** cancels this pending one-time start.
+Set `web.autostart_delay: null` to require manual Start instead; a numeric value
+sets the delay in seconds (0–86400). The same behavior applies to foreground
+web launches. Automatic startup does not start a recording.
 
-`config.pi4.yaml` starts at 640×480, 15 camera frames/s, two MoveNet threads and
-at most 10 annotated-preview frames/s. Detection interval and processing scale
-remain adjustable. These are commissioning settings, not measured processing
+`config.pi4.yaml` preserves the supplied Pi's 1280×720 at 45 camera frames/s,
+JPEG quality 80 and 45 recording frames/s, with two MoveNet threads and at most
+10 annotated-preview frames/s. These are configured rates, not measured tracking
 performance. Camera recordings go to `camera-recordings/`; screenshots and
 fallback local recordings go to `recordings/`, avoiding duplicate list entries.
 
+Both Pi camera configurations load `tuning/imx219-160-no-alsc.json`, preserving the camera
+correction from the supplied project. The JSON omits `rpi.alsc`; it is specific
+to this IMX219 setup. `camera.tuning_file` accepts an absolute path or a path
+relative to the directory containing `camera.py`, independent of the working
+directory or the configuration file's location. Null selects Picamera2's normal
+sensor tuning; an explicitly selected profile that cannot be loaded fails camera
+startup instead of falling back to a different image configuration.
+
 ### Calibrate before automatic motion
 
-The shipped configuration has `gpio_servo.calibrated: false`, which blocks
-automatic tracking. Manual movement and Home remain available. **Start with the
-servo horns detached from the mechanism**: the first pulse uses the configured
-Home reference, and the application cannot know the actual shaft position.
+The current Pi configuration preserves its `gpio_servo.calibrated: true`
+approval, pan limits of −90…90° at 500°/s and tilt limits of −45…45° at 300°/s.
+These are settings from that mechanism. For a new or changed assembly, set
+`gpio_servo.calibrated: false` before starting services and commission it below.
+The built-in servo defaults remain uncalibrated with smaller working ranges and
+lower speeds. `calibrated: false` blocks automatic motor tracking; video
+tracking, manual movement and Home remain available. **Start with the servo
+horns detached from the mechanism**: the first pulse uses the configured Home
+reference, and the application cannot know the actual shaft position.
 Speed limits constrain subsequent command changes, not an unknown initial
 physical movement.
 
@@ -188,9 +212,12 @@ and controller errors; no SG90 position feedback is available.
 sudo systemctl start pistream-tracker
 ```
 
-Open `http://<Pi-LAN-IP>:5000`, press **Start**, check the image and use small
-D-pad steps. **Home / Reset** clears detection and returns to saved Home while
-holding automatic tracking for `gpio_servo.home_hold`; manual motion uses
+Open `http://<Pi-LAN-IP>:5000` and wait for the two-minute automatic start, or
+press **Start** to start immediately. Check the image and use small D-pad steps.
+**Stop** also cancels a pending automatic start, leaving tracking stopped until
+the next manual Start or web service restart. **Home / Reset** clears detection
+and returns to saved Home while holding automatic tracking for
+`gpio_servo.home_hold`; manual motion uses
 `manual_hold`. Stop cancels either motion immediately and disables pulses.
 Losing the person cancels automatic motion and holds the last issued position.
 The independent worker cancels automatic motion after `frame_timeout` seconds
@@ -235,9 +262,10 @@ sudo systemctl start pistream-camera pistream-tracker
 Bookworm uses the `rpicam-*` commands; see
 [Raspberry Pi camera software](https://www.raspberrypi.com/documentation/computers/camera_software.html).
 If the camera is absent, power down before reseating its cable and check the
-OV5647 entry with `--list-cameras`. If the UI reports `pigpiod` unavailable, check
+IMX219 entry (or the installed sensor) with `--list-cameras`. If the UI reports `pigpiod` unavailable, check
 its service log, run `sudo systemctl restart pigpiod` and
-`sudo systemctl start pistream-tracker`, then reload the UI and press Start.
+`sudo systemctl start pistream-tracker`, then reload the UI and wait for automatic
+startup or press Start immediately.
 For a transient client error while the service stays up, reconnect using
 **Motors Enabled** or Stop/Start the tracking session. There is no software-PWM
 fallback. Errors about unconfirmed PWM shutdown stay visible after Stop; an
@@ -346,6 +374,10 @@ Tracker Pi:
 ```
 
 `--web` forwards `--preset` (default `pi5`) to `web.py`. Presets live in `config.yaml`.
+The web interface starts tracking and connects the configured motor backend
+after `web.autostart_delay` seconds (120 by default). Manual Start/Stop cancels
+the pending start; `null` disables automatic startup. Disabled motor backends and
+the SG90 calibration gate still apply.
 
 Laptop (no Pi / no EV3):
 
@@ -368,7 +400,7 @@ first use; the synthetic stream exercises controls and transport, not pose quali
 
 | Control | What it does |
 |---------|----------------|
-| Start / Stop | Connects to the camera stream, then tracks. Start fails if the stream is down. |
+| Start / Stop | Starts/stops tracking and cancels a pending automatic start. Start connects to the camera stream and fails if it is down. |
 | Home / Reset | Clears detection and homes the selected controller; auto-track holds for its configured `home_hold` |
 | Record / Screenshot | Local files under `tracker.output_dir`, or camera Pi if `recording_mode: camera`; an unreachable camera recorder falls back locally |
 | Tracking overlay | Off = proxy the camera MJPEG (lowest delay). On = annotated preview at `preview_max_fps` / `preview_max_edge` |
@@ -398,8 +430,10 @@ protections, but it is still a trusted-LAN control surface rather than an Intern
 Use `config.yaml` for the original two-Pi setup and `config.pi4.yaml` for the
 standalone build. Missing settings use built-in defaults. CLI flags override a
 named `--preset`, which overrides the file. The built-in `pi4` performance preset
-also supplies camera and preview parameters; the standalone file already includes
-those values for both processes.
+still supplies conservative 640×480 at 15 camera frames/s; selecting it explicitly
+overrides the current Pi file's 1280×720 at 45 frames/s. Standalone services and
+`run_standalone.sh` pass the shared config without a preset, so they keep the
+file's camera settings in both processes.
 
 ```yaml
 network:
@@ -410,6 +444,7 @@ camera:
   port: 8000
   framerate: 30
   resolution: {width: 1280, height: 960}
+  tuning_file: tuning/imx219-160-no-alsc.json  # shared Pi3B+/Pi4 IMX219 profile
   token: null              # Bearer for /record/* ; empty = open LAN
   max_stream_clients: 4
 
@@ -431,6 +466,7 @@ ev3:
 web:
   host: null               # null = tracker_ip
   port: 5000
+  autostart_delay: 120      # seconds; null disables the one-time automatic start
   overlay: true
   preview_quality: 70
   preview_max_edge: 640
@@ -539,6 +575,7 @@ piStreamTracker/
 ├── tracker.py           # Display / CLI entry
 ├── web.py               # Flask entry
 ├── camera.py            # Camera Pi server
+├── tuning/imx219-160-no-alsc.json  # Current Pi4 camera correction profile
 ├── ev3_usb.py           # Shim → pistream.ev3_usb
 ├── setup.sh             # Bootstrap apt/venv; exec python -m pistream.install
 ├── run_cam.sh

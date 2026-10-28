@@ -36,10 +36,34 @@ async function main() {
         await page.locator('#btn-stop').click();
         assert.equal((await successfulStop).status(), 200);
         await page.waitForFunction(() => !document.getElementById('btn-start').disabled);
-        assert(await page.locator('#btn-stop').isDisabled());
+        assert(await page.locator('#btn-stop').isEnabled());
         assert(await page.locator('#btn-record').isDisabled());
         assert(await page.locator('#recording-warning').isHidden());
         assert.equal((await (await page.request.get(baseUrl + '/__fixture/state')).json()).stop_calls, 2);
+
+        // Idle Stop must remain available to cancel a pending automatic start.
+        let releaseIdleStop;
+        let idleStopEntered;
+        const idleStopGate = new Promise(resolve => { releaseIdleStop = resolve; });
+        const enteredIdleStop = new Promise(resolve => { idleStopEntered = resolve; });
+        await page.route('**/api/stop', async route => {
+            idleStopEntered();
+            await idleStopGate;
+            await route.continue();
+        });
+        const idleStopResponse = page.waitForResponse(response => response.url().endsWith('/api/stop'));
+        await page.locator('#btn-stop').click();
+        await enteredIdleStop;
+        assert(await page.locator('#btn-start').isDisabled());
+        assert(await page.locator('#btn-stop').isDisabled());
+        await page.waitForResponse(response => response.url().endsWith('/api/status'));
+        assert(await page.locator('#btn-stop').isDisabled());
+        releaseIdleStop();
+        assert.equal((await idleStopResponse).status(), 200);
+        await page.waitForFunction(() => !document.getElementById('btn-start').disabled);
+        assert(await page.locator('#btn-stop').isEnabled());
+        assert.equal((await (await page.request.get(baseUrl + '/__fixture/state')).json()).stop_calls, 3);
+        await page.unroute('**/api/stop');
 
         let releaseStart;
         let startEntered;
@@ -157,7 +181,7 @@ async function main() {
         assert(await servoPage.locator('#ev3-toggle').isDisabled());
         assert(await servoPage.locator('#btn-start').isEnabled());
         assert.deepEqual(errors, []);
-        console.log('Browser UI checks passed: recovery, recording, cleanup controls, GPIO status/calibration/errors/manual movement, 390/900/1200px layout.');
+        console.log('Browser UI checks passed: idle Stop/autostart cancellation, recovery, recording, cleanup controls, GPIO status/calibration/errors/manual movement, 390/900/1200px layout.');
     } finally {
         await browser.close();
     }

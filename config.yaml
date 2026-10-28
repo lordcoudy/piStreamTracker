@@ -14,10 +14,11 @@ network:
 
 # Camera Server Settings (Pi 3B+)
 camera:
-  host: null                # null = bind camera_ip only (set 0.0.0.0 to listen on all NICs)
+  host: 0.0.0.0                # null = bind camera_ip only (set 0.0.0.0 to listen on all NICs)
   port: 8000
   framerate: 30
   jpeg_quality: 80        # MJPEG quality (1-100)
+  tuning_file: "tuning/imx219-160-no-alsc.json"  # shared IMX219 profile; null = automatic sensor tuning
   token: null               # optional Bearer token for /record/* (empty = open LAN)
   max_stream_clients: 4     # concurrent /stream connections
   recording_dir: "recordings"   # Server-side recording output (used when recording_mode: camera)
@@ -84,8 +85,10 @@ ev3:
 
 # Web Interface Settings
 web:
-  host: null              # null = bind tracker_ip only (set 0.0.0.0 to listen on all NICs)
+  host: 0.0.0.0              # null = bind tracker_ip only (set 0.0.0.0 to listen on all NICs)
   port: 5000
+  # One automatic tracking/motor start; manual Start/Stop cancels the pending start.
+  autostart_delay: 120     # delay in seconds (0-86400); null disables
   overlay: true           # false = proxy raw camera MJPEG (no re-encode)
   preview_quality: 70     # JPEG quality for the annotated preview
   preview_max_edge: 640   # Long-side cap in pixels (0 = native)

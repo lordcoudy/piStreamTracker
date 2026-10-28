@@ -2,10 +2,12 @@
 
 import importlib
 import io
+import json
 import os
 import sys
 import types
 import unittest
+from contextlib import chdir
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import BoundedSemaphore, Condition
@@ -75,10 +77,12 @@ class CameraServerTests(unittest.TestCase):
             config = default_config()
             config['camera']['recording_dir'] = tmp
             with patch.object(camera, 'load_config', return_value=config) as load, \
-                    patch.object(camera, 'Picamera2', return_value=Mock()), \
+                    patch.object(camera, 'Picamera2', return_value=Mock()) as make_camera, \
                     patch.object(camera, 'StreamingServer', return_value=server):
                 camera.main([])
         load.assert_called_once_with('config.yaml')
+        make_camera.assert_called_once_with()
+        make_camera.load_tuning_file.assert_not_called()
         self.assertEqual(camera.WIDTH, 1280)
         self.assertEqual(camera.HEIGHT, 960)
         self.assertEqual(camera.PORT, 8000)
@@ -118,6 +122,72 @@ class CameraServerTests(unittest.TestCase):
         make_server.assert_called_once_with(('127.0.0.1', 8123), camera.StreamingHandler)
         self.assertEqual(picam.start_recording.call_args.args[0].kwargs, {'q': 62})
         picam.stop_recording.assert_called_once()
+
+    def test_pi4_tuning_is_loaded_from_checkout_even_with_a_different_working_directory(self):
+        camera = import_camera_module(fresh=True)
+        picam, srv = Mock(), Mock()
+        srv.serve_forever.side_effect = KeyboardInterrupt
+        root = Path(__file__).resolve().parents[1]
+        profile = root / 'tuning' / 'imx219-160-no-alsc.json'
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'pi4.yaml'
+            config.write_text(
+                'camera:\n  tuning_file: tuning/imx219-160-no-alsc.json\n'
+                '  resolution: {width: 1280, height: 720}\n  framerate: 45\n'
+                f'  recording_dir: "{tmp}/recordings"\n'
+            )
+            with chdir(tmp), \
+                    patch.object(camera, 'Picamera2', return_value=picam) as make_camera, \
+                    patch.object(camera, 'StreamingServer', return_value=srv):
+                make_camera.load_tuning_file.side_effect = lambda path: json.loads(
+                    Path(path).read_text()
+                )
+                camera.main(['--config', str(config)])
+        make_camera.load_tuning_file.assert_called_once_with(str(profile))
+        tuning = make_camera.call_args.kwargs['tuning']
+        self.assertEqual(tuning['target'], 'bcm2835')
+        self.assertNotIn('rpi.alsc', {name for item in tuning['algorithms'] for name in item})
+        picam.create_video_configuration.assert_called_once_with(
+            main={'size': (1280, 720)}, controls={'FrameRate': 45},
+        )
+        picam.close.assert_called_once()
+
+    def test_camera_accepts_an_absolute_tuning_path(self):
+        camera = import_camera_module(fresh=True)
+        srv = Mock()
+        srv.serve_forever.side_effect = KeyboardInterrupt
+        with TemporaryDirectory() as tmp:
+            profile = Path(tmp) / 'custom.json'
+            config = Path(tmp) / 'camera.yaml'
+            config.write_text(
+                f'camera:\n  tuning_file: "{profile}"\n  recording_dir: "{tmp}/recordings"\n'
+            )
+            with patch.object(camera, 'Picamera2', return_value=Mock()) as make_camera, \
+                    patch.object(camera, 'StreamingServer', return_value=srv):
+                camera.main(['--config', str(config)])
+        make_camera.load_tuning_file.assert_called_once_with(str(profile))
+        make_camera.assert_called_once_with(tuning=make_camera.load_tuning_file.return_value)
+
+    def test_invalid_tuning_does_not_open_camera_and_restores_signal_handler(self):
+        import signal
+
+        for error in (FileNotFoundError('missing profile'), ValueError('invalid tuning JSON')):
+            with self.subTest(error=error):
+                camera = import_camera_module(fresh=True)
+                previous = signal.getsignal(signal.SIGTERM)
+                with TemporaryDirectory() as tmp:
+                    config = Path(tmp) / 'camera.yaml'
+                    config.write_text(
+                        f'camera:\n  tuning_file: missing.json\n  recording_dir: "{tmp}/rec"\n'
+                    )
+                    with patch.object(camera, 'Picamera2') as make_camera, \
+                            patch.object(camera, 'StreamingServer') as make_server:
+                        make_camera.load_tuning_file.side_effect = error
+                        with self.assertRaisesRegex(type(error), str(error)):
+                            camera.main(['--config', str(config)])
+                make_camera.assert_not_called()
+                make_server.assert_not_called()
+                self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
     def test_termination_signal_closes_stream_camera_and_listener(self):
         import signal

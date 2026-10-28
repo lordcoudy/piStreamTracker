@@ -1,14 +1,18 @@
 # piStreamTracker project map
 
-Agent orientation, updated for standalone Pi 4 / SG90 support on 2026-10-25,
-following the recording/recovery fixes and simplification in October. This is a
+Agent orientation, updated for the supplied Pi 4 camera configuration and delayed
+tracking startup on 2026-10-28, following the recording/recovery fixes in October. This is a
 navigation aid, not a specification. Source code and tests determine current
 behavior; recheck the relevant section before changing it.
 
 ## System at a glance
 
-A lecturer-following camera system with two deployment choices: Pi 3B+ camera
-and Pi 5 tracker with USB EV3, or one Pi 4 with OV5647 and two GPIO SG90 servos.
+A lecturer-following camera system with two deployment choices: Pi 3B+ with an
+IMX219 camera and Pi 5 tracker with USB EV3, or one Pi 4 with an IMX219 camera
+and two GPIO SG90 servos. Both deployments use the same IMX219 camera module
+and select the shared 160-degree profile without ALSC through `camera.tuning_file`
+in `config.yaml` and `config.pi4.yaml`. Automatic
+sensor tuning also remains available for OV5647 and other cameras.
 In standalone, `camera.py` alone opens CSI and `web.py` consumes its local MJPEG
 at `127.0.0.1:8000`; the Flask UI binds to the LAN. Tracking can also run with an
 OpenCV window or without motors. Persistent artifacts are files; no database.
@@ -35,10 +39,11 @@ use the source and this map for current ownership.
 
 | Area | Start here | Responsibility |
 |---|---|---|
-| Camera service | [camera.py](camera.py) | Picamera2, threaded MJPEG HTTP server, camera H.264 recorder and `/record/*` API |
+| Camera service | [camera.py](camera.py) | Picamera2 and optional sensor tuning, threaded MJPEG HTTP server, camera H.264 recorder and `/record/*` API |
+| Shared IMX219 camera profile | [imx219-160-no-alsc.json](tuning/imx219-160-no-alsc.json) | Supplied IMX219 tuning without `rpi.alsc`; selected by `camera.tuning_file` on Pi 3B+ and Pi 4 |
 | Desktop/headless tracker | [tracker.py](tracker.py), [track.py](pistream/track.py) | CLI parsing, `HumanTracker`, `ObjectTracker`, rendering, screenshots, recording coordination |
 | Web controls | [web.py](web.py), [web_app.py](pistream/web_app.py) | Flask routes, preview, runtime settings, recordings proxy, background tracker loop |
-| Session lifetime | [lifecycle.py](pistream/lifecycle.py) | Serialized web start/stop, startup confirmation, cancellation, cleanup ownership |
+| Session lifetime | [lifecycle.py](pistream/lifecycle.py) | Serialized web start/stop, delayed automatic start, startup confirmation, cancellation, cleanup ownership |
 | Capture | [capture.py](pistream/capture.py) | Latest-frame buffer, OpenCV backends, automatic stream reconnect |
 | Detection | [detect.py](pistream/detect.py) | MoveNet model acquisition/interpreter, pose parsing, asynchronous inference |
 | Motors | [motors.py](pistream/motors.py), [motors_math.py](pistream/motors_math.py), [ev3_usb.py](pistream/ev3_usb.py) | USB command serialization, deadzones, speed, home/manual holds; pure axis math; ev3-dc wrapper |
@@ -91,6 +96,11 @@ only new negatives count toward `DETECTION_MISS_LIMIT` (currently three).
   writer closure, unfinished capture/detection workers or an unconfirmed camera
   stop, blocking replacement sessions.
   Concurrent Stop requests serialize; only explicit Stop retries pending work.
+  Each web process schedules one automatic start after `web.autostart_delay`
+  seconds (120 by default, null disables). Manual Start/Stop cancels the pending
+  start; process shutdown cancels it before cleanup. Automatic startup uses the
+  same lifecycle and configured motor backend as manual Start, retaining motor
+  disable flags and the SG90 calibration gate, and does not start recording.
 - Motor USB calls share an I/O lock; recording coordination uses an `RLock`.
   Local encoding and ffmpeg stderr draining have their own workers.
 
@@ -109,6 +119,9 @@ and clamp pulse widths. The worker limits degrees/second with monotonic time and
 movement after `frame_timeout` even without frame processing. Manual/Home hold
 auto while moving and for the configured pause; Stop disconnects regardless of
 holds. `calibrated: false` blocks auto but permits commissioning commands.
+The current `config.pi4.yaml` preserves the supplied Pi's confirmed calibration,
+pan ±90° / 500°/s and tilt ±45° / 300°/s. Built-in servo defaults remain
+uncalibrated with conservative working ranges/speeds for commissioning.
 Status distinguishes target and last commanded degrees; SG90 has no feedback.
 Failed PWM-off is an error with unknown pulse state, retained in web status after
 Stop; use the recovery instructions in README before reconnecting.
@@ -193,18 +206,32 @@ built-in defaults. Most web settings mutate the current tracker only. Overlay
 also changes in-memory web config; UI controls do not write `config.yaml`.
 Web mode is selected by `web.py` or `run_tracker.sh --web`; the unused
 `web.enabled` default and YAML entry have been removed.
-`config.pi4.yaml` selects localhost camera endpoints, camera-side H.264 recording,
-separate `camera-recordings/` and tracker `recordings/` directories, 640×480 at
-15 camera FPS, 2 inference threads and 10 preview FPS. These are initial settings,
-not measured throughput. The built-in `pi4` performance preset also supplies
-camera/detection/preview settings; only the config file is shared by both processes.
+`web.autostart_delay` defaults to 120 seconds even for existing YAML files that
+omit it. Null disables the one-time automatic start; finite numeric values from
+0 to 86400 select another delay. The web UI remains available during the wait.
+`config.pi4.yaml` preserves the supplied Pi's localhost camera endpoints,
+camera-side H.264 recording, separate `camera-recordings/` and tracker `recordings/`
+directories, 1280×720 at 45 camera/recording FPS, JPEG quality 80, 2 inference
+threads and 10 preview FPS. These are configured values, not measured throughput.
+Its `camera.tuning_file` selects the bundled IMX219 160-degree profile without
+`rpi.alsc`. The two-Pi `config.yaml` selects the same profile for the matching
+IMX219 module on the Pi 3B+. Built-in configuration defaults retain null for
+automatic sensor tuning with other camera modules.
+Relative tuning paths resolve from the directory containing `camera.py`,
+not the working directory or YAML directory; absolute paths are supported.
+An explicitly selected profile must load successfully before camera acquisition;
+there is no silent fallback to a different profile.
+The built-in `pi4` performance preset remains 640×480 at 15 camera FPS and
+overrides file settings when explicitly selected. Standalone services and the
+standalone wrapper share the config without a preset, preserving its camera values.
 `camera_stream_url()` and `camera_base_url()` in `preview.py` share camera addressing
 for tracking, raw preview, recorder control and file operations. An explicit
 HTTP(S) tracker stream URL supplies the control/file origin too.
 
 Paths to remember: camera `recording_dir`, tracker `output_dir`, optional log
 file, and the downloaded `models/movenet_lightning.tflite`. Relative output,
-config and log paths depend on the working directory; launch wrappers and
+config and log paths depend on the working directory; tuning paths are the exception
+described above. Launch wrappers and
 systemd use the checkout directory. The installer resolves the selected config to
 an absolute path and quotes it in service arguments for both roles. Model lookup uses `project_root()`.
 Recordings, model cache, logs and virtual environments are gitignored.
@@ -227,7 +254,8 @@ the same absolute config and an ordinary user with video/render groups. An exist
 legacy `pitracker.service` is disabled/stopped to avoid a second camera owner.
 Pi 4 auto-selects standalone. `run_standalone.sh` owns two subprocesses with a
 checkout lock, service guards and bounded signal/child-failure cleanup. Reboots
-restore the three services; tracking starts explicitly from the web UI.
+restore the three services; tracking and configured motor connection start
+automatically after the web process's delay unless manual Start/Stop cancels it.
 
 Laptop setup uses `pip install -e ".[dev,desktop]"`. The optional extra selects
 `ai-edge-litert>=2.3,<2.4`, or `tensorflow>=2.16,<2.17` on Intel macOS. The base Pi
@@ -259,19 +287,19 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 
 | Change area | Relevant tests |
 |---|---|
-| Config/presets/validation | [test_config.py](tests/test_config.py) |
+| Config/presets/validation and automatic-start delay | [test_config.py](tests/test_config.py) |
 | Reconnect and frame identity | [test_capture_policy.py](tests/test_capture_policy.py), [test_frame_gate.py](tests/test_frame_gate.py) |
 | Async result semantics and tracker refresh/loss | [test_async_detector.py](tests/test_async_detector.py), [test_track_box.py](tests/test_track_box.py) |
 | Motor commands and holds | [test_motors.py](tests/test_motors.py) |
 | SG90 mapping, speed, holds/watchdog, ownership/errors and calibration | [test_servo.py](tests/test_servo.py), [test_calibrate.py](tests/test_calibrate.py) |
 | Controller selection, local URLs, stop and stale-work boundaries | [test_motion_integration.py](tests/test_motion_integration.py), [test_motion_safety_review.py](tests/test_motion_safety_review.py) |
-| Web session startup/stop/timeout/recovery | [test_lifecycle.py](tests/test_lifecycle.py), [test_web_routes.py](tests/test_web_routes.py) |
+| Web session automatic/manual startup/stop/timeout/recovery | [test_lifecycle.py](tests/test_lifecycle.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Leveling, preview geometry and rate caps | [test_horizon.py](tests/test_horizon.py), [test_preview.py](tests/test_preview.py) |
 | Writer health, bounded encoder shutdown and ownership | [test_record_writer.py](tests/test_record_writer.py), [test_recording_backend.py](tests/test_recording_backend.py) |
 | CLI controls and camera recovery | [test_tracker_cli.py](tests/test_tracker_cli.py), [test_recording_integration.py](tests/test_recording_integration.py) |
 | Interpreter fallback | [test_detector_runtime.py](tests/test_detector_runtime.py) |
 | Artifact paths and remote files | [test_recordings.py](tests/test_recordings.py), [test_web_routes.py](tests/test_web_routes.py) |
-| Camera API/auth/client slots | [test_camera_server.py](tests/test_camera_server.py), [test_camera_auth.py](tests/test_camera_auth.py) |
+| Camera tuning/startup/API/auth/client slots | [test_camera_server.py](tests/test_camera_server.py), [test_camera_auth.py](tests/test_camera_auth.py), [test_config.py](tests/test_config.py) |
 | UI/package layout and API errors/validation | [test_package.py](tests/test_package.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Network/service/udev planning | [test_install.py](tests/test_install.py) |
 | Standalone wrapper signals, services, children and setup dispatch | [test_standalone_launch.py](tests/test_standalone_launch.py) |
@@ -282,6 +310,9 @@ After these fixes, a fresh Python 3.12 desktop environment passed 231 tests and
 25 subtests; Ruff and Chromium checks at 390/900/1200px also passed.
 Standalone validation on 2026-10-25 uses Python 3.12.12 on the development Mac:
 314 tests and 35 subtests, Ruff, shell syntax and Chromium at 390/900/1200px.
+The supplied Pi configuration and delayed-start integration were reconciled on
+2026-10-28: 338 tests and 57 subtests passed, plus Ruff and an accelerated real-timer
+smoke with mocked hardware. All prior Pi YAML values and tuning bytes were preserved.
 A synthetic localhost MJPEG smoke exercised real OpenCV capture, web Start/Stop,
 preview, screenshot and a readable local MJPG recording with detector/motors
 disabled. Bookworm/Python 3.11 ARM wheel availability was checked against primary
@@ -309,7 +340,7 @@ These are code observations at the revision above, not fixes made by this map.
 - **Native OpenCV finalization:** worker writes are guarded, but OpenCV's native
   `VideoWriter.release()` call has no timeout. The ffmpeg subprocess shutdown
   bounds do not guarantee a bound on native MJPG file finalization.
-- **Hardware verification:** no Pi 4, OV5647, SG90, real pigpiod or timing benchmark
+- **Hardware verification:** no Pi 4, CSI camera, SG90, real pigpiod or timing benchmark
   is available in the development environment. Follow README's hardware acceptance
   checklist; initial position commands cannot limit physical motion from an unknown
   startup position. Commission with unloaded horns and safe cable clearance.

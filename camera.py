@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # Initialized by main before the camera or HTTP server starts.
 HOST = PORT = WIDTH = HEIGHT = FRAMERATE = JPEG_QUALITY = CAMERA_IP = None
 OUTPUT_DIR = None
+TUNING_FILE = None
 CAMERA_TOKEN = ''
 STREAM_LIMIT = None
 HTML_PAGE = ''
@@ -43,7 +44,7 @@ HTML_PAGE = ''
 def configure_camera(config_path: str) -> None:
     """Load startup settings before creating their dependent resources."""
     global HOST, PORT, WIDTH, HEIGHT, FRAMERATE, JPEG_QUALITY, CAMERA_IP
-    global OUTPUT_DIR, CAMERA_TOKEN, STREAM_LIMIT, HTML_PAGE
+    global OUTPUT_DIR, TUNING_FILE, CAMERA_TOKEN, STREAM_LIMIT, HTML_PAGE
     config = load_config(config_path)
     camera_cfg = config['camera']
     HOST = camera_bind_host(config)
@@ -52,6 +53,10 @@ def configure_camera(config_path: str) -> None:
     HEIGHT = camera_cfg['resolution']['height']
     FRAMERATE = camera_cfg['framerate']
     JPEG_QUALITY = camera_cfg['jpeg_quality']
+    tuning_file = camera_cfg.get('tuning_file')
+    TUNING_FILE = Path(tuning_file) if tuning_file else None
+    if TUNING_FILE is not None and not TUNING_FILE.is_absolute():
+        TUNING_FILE = Path(__file__).resolve().parent / TUNING_FILE
     CAMERA_IP = config['network']['camera_ip']
     OUTPUT_DIR = Path(camera_cfg['recording_dir'])
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -409,8 +414,12 @@ def main(argv: list[str] | None = None):
     picam2 = recorder = srv = None
     streaming = False
     try:
+        camera_options = {}
+        if TUNING_FILE is not None:
+            logger.info('Camera tuning: %s', TUNING_FILE)
+            camera_options['tuning'] = Picamera2.load_tuning_file(str(TUNING_FILE))
         try:
-            picam2 = Picamera2()
+            picam2 = Picamera2(**camera_options)
         except RuntimeError:
             logger.error(camera_busy_hint(CAMERA_IP, PORT))
             raise

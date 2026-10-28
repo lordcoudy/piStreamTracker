@@ -34,6 +34,7 @@ def default_config() -> dict:
             'port': 8000,
             'framerate': 30,
             'jpeg_quality': 80,
+            'tuning_file': None,
             'token': None,
             'max_stream_clients': 4,
             'recording_dir': 'recordings',
@@ -67,6 +68,7 @@ def default_config() -> dict:
         'gpio_servo': default_servo_config(),
         'web': {
             'host': None, 'port': 5000,
+            'autostart_delay': 120,
             'preview_quality': 70, 'preview_max_edge': 640,
             'preview_max_fps': 15, 'overlay': True,
         },
@@ -246,6 +248,7 @@ def validate_config(config: dict) -> dict:
     if not camera['recording_dir']:
         raise ValueError('camera.recording_dir must not be empty')
     camera['token'] = _optional_string(camera.get('token'), 'camera.token')
+    camera['tuning_file'] = _optional_string(camera.get('tuning_file'), 'camera.tuning_file')
     camera['host'] = _optional_string(camera.get('host'), 'camera.host')
     tracker['stream_url'] = _optional_string(tracker.get('stream_url'), 'tracker.stream_url')
 
@@ -267,6 +270,9 @@ def validate_config(config: dict) -> dict:
             raise ValueError(f'ev3.ports.{axis} must be a non-empty string')
 
     web['port'] = _positive_int(web.get('port'), 'web.port', 65535)
+    delay = web.setdefault('autostart_delay', 120)
+    if delay is not None:
+        web['autostart_delay'] = _bounded_number(delay, 'web.autostart_delay', 0, 86400)
     web['preview_quality'] = _positive_int(web.get('preview_quality'), 'web.preview_quality', 100)
     web['preview_max_edge'] = _bounded_int(
         web.get('preview_max_edge'), 'web.preview_max_edge', 0, 16384

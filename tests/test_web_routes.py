@@ -782,13 +782,69 @@ class WebProcessCleanupTests(unittest.TestCase):
         from pistream import web_app
 
         previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
-        lifecycle = SimpleNamespace(stop=Mock())
+        lifecycle = SimpleNamespace(stop=Mock(), schedule_start=Mock())
         with (
             patch.object(web_app, 'TrackerLifecycle', return_value=lifecycle),
             patch.object(web_app.app, 'run', side_effect=SystemExit(143)),
         ):
             with self.assertRaises(SystemExit):
                 web_app.run_web({})
+        lifecycle.schedule_start.assert_called_once_with(120)
         lifecycle.stop.assert_called_once_with()
         for sig, handler in previous.items():
             self.assertIs(signal.getsignal(sig), handler)
+
+    def test_web_startup_uses_configured_autostart_delay(self):
+        from pistream import web_app
+
+        lifecycle = SimpleNamespace(stop=Mock(), schedule_start=Mock())
+        with (
+            patch.object(web_app, 'TrackerLifecycle', return_value=lifecycle),
+            patch.object(web_app.app, 'run'),
+            patch.object(web_app, '_lifecycle', None),
+        ):
+            web_app.run_web({'web': {'autostart_delay': 30}})
+        lifecycle.schedule_start.assert_called_once_with(30)
+
+    def test_null_autostart_delay_keeps_manual_startup(self):
+        from pistream import web_app
+
+        lifecycle = SimpleNamespace(stop=Mock(), schedule_start=Mock())
+        with (
+            patch.object(web_app, 'TrackerLifecycle', return_value=lifecycle),
+            patch.object(web_app.app, 'run'),
+            patch.object(web_app, '_lifecycle', None),
+        ):
+            web_app.run_web({'web': {'autostart_delay': None}})
+        lifecycle.schedule_start.assert_not_called()
+        lifecycle.stop.assert_called_once_with()
+
+    def test_web_is_available_during_delay_and_exit_prevents_late_autostart(self):
+        from threading import Timer
+        from pistream import web_app
+        from pistream.lifecycle import TrackerLifecycle
+
+        factory = Mock()
+        lifecycle = TrackerLifecycle(factory, Mock())
+        timers = []
+
+        def timer_factory(delay, callback):
+            timer = Timer(delay, callback)
+            timer.start = Mock()
+            timers.append(timer)
+            return timer
+
+        def serve(**_kwargs):
+            self.assertEqual(timers[0].interval, 120)
+            factory.assert_not_called()
+
+        with (
+            patch('pistream.lifecycle.Timer', side_effect=timer_factory),
+            patch.object(web_app, 'TrackerLifecycle', return_value=lifecycle),
+            patch.object(web_app.app, 'run', side_effect=serve),
+            patch.object(web_app, '_lifecycle', None),
+        ):
+            web_app.run_web({})
+        self.assertTrue(timers[0].finished.is_set())
+        timers[0].function()
+        factory.assert_not_called()

@@ -872,6 +872,9 @@ def run_web(config: dict, host: str = '0.0.0.0', port: int = 5000):
         for signum in (signal.SIGTERM, signal.SIGINT):
             previous_handlers[signum] = signal.signal(signum, terminate)
     try:
+        delay = (config.get('web') or {}).get('autostart_delay', 120)
+        if delay is not None:
+            _lifecycle.schedule_start(delay)
         app.run(host=host, port=port, threaded=True, debug=False, use_reloader=False)
     finally:
         if _lifecycle is not None:
