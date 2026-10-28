@@ -44,6 +44,12 @@ def default_config() -> dict:
             'exposure_mode': 'auto',
             'exposure_time_us': 20000,
             'analogue_gain': 1.0,
+            'brightness': 0.0,
+            'contrast': 1.0,
+            'saturation': 1.0,
+            'sharpness': 1.0,
+            'noise_reduction': 'fast',
+            'exposure_value': 0.0,
         },
         'tracker': {
             'stream_url': None,

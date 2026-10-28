@@ -19,9 +19,15 @@ camera:
   framerate: 30
   awb_mode: manual          # white-card balance on the camera Pi 4 under room lighting
   colour_gains: [1.1368712, 1.86235795]  # red, blue; use auto after changing lighting
-  exposure_mode: auto
-  exposure_time_us: 30000   # starting values when switching to manual exposure
+  exposure_mode: auto      # current saved camera setting
+  exposure_time_us: 33300
   analogue_gain: 10.66
+  brightness: 0.0          # -1..1; neutral 0
+  contrast: 1.0            # 0..32; neutral 1
+  saturation: 1.0          # 0..32; neutral 1
+  sharpness: 1.0           # 0..16; neutral 1
+  noise_reduction: fast    # off | fast | high_quality | minimal
+  exposure_value: 0.0      # EV stops, -8..8; applies with automatic exposure
   jpeg_quality: 80        # MJPEG quality (1-100)
   tuning_file: "tuning/imx219-160-colour.json"  # shared IMX219 160° profile; null = automatic sensor tuning
   token: null               # optional Bearer token for /record/* and /camera/settings
@@ -95,7 +101,7 @@ web:
   port: 5000
   # One automatic tracking/motor start; manual Start/Stop cancels the pending start.
   autostart_delay: 120     # delay in seconds (0-86400); null disables
-  overlay: true           # false = proxy raw camera MJPEG (no re-encode)
+  overlay: true           # false = camera image without annotations; preview settings still apply
   preview_quality: 70     # JPEG quality for the annotated preview
   preview_max_edge: 640   # Long-side cap in pixels (0 = native)
   preview_max_fps: 15     # Do not re-encode faster than this

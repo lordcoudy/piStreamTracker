@@ -14,6 +14,7 @@ from pistream import web_app
 @pytest.fixture(autouse=True)
 def idle_tracker(monkeypatch):
     monkeypatch.setattr(web_app, '_lifecycle', None)
+    monkeypatch.setattr(web_app, '_config', {})
 
 
 class CameraResponse:
@@ -75,7 +76,17 @@ def multipart(image, boundary='upstream', *, content_length=True):
 def assert_part(part, image):
     assert part.startswith(b'--frame\r\n')
     assert b'Content-Type: image/jpeg\r\n' in part
-    assert part.endswith(image + b'\r\n')
+    assert part.endswith(b'\r\n')
+    assert same_image(part, image)
+
+
+def same_image(part, image):
+    """Preview re-encoding preserves visible pixels, not source JPEG metadata."""
+    actual = part.split(b'\r\n\r\n', 1)[1][:-2]
+    actual = cv2.imdecode(np.frombuffer(actual, dtype=np.uint8), cv2.IMREAD_COLOR)
+    expected = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return (actual is not None and expected is not None and actual.shape == expected.shape
+            and np.allclose(actual, expected, atol=2))
 
 
 def next_image(stream, image, placeholder):
@@ -83,7 +94,7 @@ def next_image(stream, image, placeholder):
     # next connection attempt so a closed viewer can be detected before open.
     for _ in range(8):
         part = next(stream)
-        if part.endswith(image + b'\r\n'):
+        if same_image(part, image):
             assert_part(part, image)
             return
         assert_part(part, placeholder)

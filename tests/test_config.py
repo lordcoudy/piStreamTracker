@@ -108,6 +108,26 @@ class EV3KeepAliveConfigTests(unittest.TestCase):
                         load_config(str(path))
 
 
+class CameraImageControlsConfigTests(unittest.TestCase):
+    def test_legacy_config_keeps_manual_exposure_and_wb_with_neutral_image_controls(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('camera:\n  exposure_mode: manual\n  exposure_time_us: 33300\n'
+                            '  analogue_gain: 10.66\n  awb_mode: manual\n'
+                            '  colour_gains: [1.1368712, 1.86235795]\n')
+            camera = load_config(str(path))['camera']
+        self.assertEqual(camera['exposure_mode'], 'manual')
+        self.assertEqual(camera['exposure_time_us'], 33300)
+        self.assertEqual(camera['analogue_gain'], 10.66)
+        self.assertEqual(camera['colour_gains'], [1.1368712, 1.86235795])
+        self.assertEqual(camera['brightness'], 0)
+        self.assertEqual(camera['contrast'], 1)
+        self.assertEqual(camera['saturation'], 1)
+        self.assertEqual(camera['sharpness'], 1)
+        self.assertEqual(camera['noise_reduction'], 'fast')
+        self.assertEqual(camera['exposure_value'], 0)
+
+
 class MotorBackendTests(unittest.TestCase):
     def test_legacy_enabled_flag_selects_ev3_or_none(self):
         from pistream.config import motor_backend
