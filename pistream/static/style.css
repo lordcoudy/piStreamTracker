@@ -59,6 +59,28 @@
             gap: 15px;
             min-width: 0;
         }
+        .preview-controls {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px 12px;
+        }
+        .preview-controls p {
+            flex: 1 1 220px;
+            font-size: 0.8rem;
+            color: #cbd5e1;
+            line-height: 1.5;
+        }
+        .preview-controls p.error { color: #fca5a5; }
+        .preview-placeholder {
+            position: absolute;
+            inset: 0;
+            display: grid;
+            place-items: center;
+            color: #94a3b8;
+            font-size: 0.9rem;
+        }
+        .video-container [hidden] { display: none; }
 
         .video-container {
             background: #000;

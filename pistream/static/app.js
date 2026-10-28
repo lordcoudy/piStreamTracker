@@ -8,6 +8,63 @@
         let cameraSettings = null;
         let cameraLimits = {};
         let cameraSettingsPending = false;
+        let previewEnabled = false;
+        let previewRequestPending = false;
+        let previewMode = null;
+        let previewRevision = 0;
+
+        function reconnectPreview() {
+            if (!previewEnabled) return;
+            previewMode = isTracking && document.getElementById('overlay-toggle').checked ? 'overlay' : 'camera';
+            document.getElementById('video-feed').src = '/video_feed?t=' + Date.now() + '&v=' + (++previewRevision);
+        }
+
+        function updatePreviewUI() {
+            const button = document.getElementById('btn-preview');
+            button.disabled = previewRequestPending;
+            button.textContent = previewRequestPending ? 'Opening camera…' : previewEnabled ? 'Hide camera' : 'Show camera';
+            button.setAttribute('aria-pressed', String(previewEnabled));
+            document.getElementById('video-feed').hidden = !previewEnabled;
+            document.getElementById('preview-placeholder').hidden = previewEnabled;
+            const mode = isTracking && document.getElementById('overlay-toggle').checked ? 'overlay' : 'camera';
+            const display = document.getElementById('fps-display');
+            display.hidden = !previewEnabled;
+            display.textContent = !isTracking ? 'Camera only · tracking off' : mode === 'overlay' ? 'Tracking preview' : 'Camera · tracking on';
+            if (previewEnabled && previewMode !== mode) reconnectPreview();
+        }
+
+        function setPreviewVisible(enabled) {
+            previewEnabled = enabled;
+            previewMode = null;
+            if (!enabled) document.getElementById('video-feed').removeAttribute('src');
+            updatePreviewUI();
+        }
+
+        async function togglePreview() {
+            if (previewRequestPending) return;
+            const status = document.getElementById('preview-status');
+            status.className = '';
+            if (previewEnabled) {
+                setPreviewVisible(false);
+                status.textContent = 'Preview is off. Tracking and recording continue unchanged.';
+                return;
+            }
+            previewRequestPending = true;
+            updatePreviewUI();
+            try {
+                const result = await api('preview', 'POST', { enabled: true });
+                if (!result || result.status !== 'ok') throw new Error((result && result.message) || 'Could not open camera preview');
+                setPreviewVisible(true);
+                status.textContent = 'Camera preview enabled. Pending automatic start cancelled. Start tracking when needed.';
+                await updateStatus();
+            } catch (error) {
+                status.textContent = error.message;
+                status.className = 'error';
+            } finally {
+                previewRequestPending = false;
+                updatePreviewUI();
+            }
+        }
 
         // Camera controls are an explicit saved draft, independent of status polling.
         function cameraMessage(message, type = '') {
@@ -188,7 +245,7 @@
             try {
                 const payload = await cameraSettingsRequest('POST', settings);
                 showCameraSettings(payload);
-                document.getElementById('video-feed').src = '/video_feed?t=' + Date.now();
+                reconnectPreview();
                 if (payload.warning) {
                     cameraMessage('Camera settings saved. ' + payload.warning, 'warning');
                     log('Camera settings saved. ' + payload.warning, 'error');
@@ -249,6 +306,7 @@
                 const res = await api('start', 'POST');
                 if (res && (res.status === 'ok' || res.status === 'already_running')) {
                     isTracking = true;
+                    setPreviewVisible(true);
                     log('Tracking started', 'success');
                 } else {
                     log('Start failed: ' + ((res && res.message) || 'unknown error'), 'error');
@@ -329,7 +387,7 @@
             const enabled = document.getElementById('overlay-toggle').checked;
             const res = await api('settings', 'POST', { overlay: enabled });
             if (res && res.status === 'ok') {
-                document.getElementById('video-feed').src = '/video_feed?t=' + Date.now();
+                reconnectPreview();
                 log(enabled ? 'Overlay ON' : 'Overlay OFF (raw camera)', 'success');
             } else {
                 document.getElementById('overlay-toggle').checked = !enabled;
@@ -424,6 +482,7 @@
             document.getElementById('btn-record').className = isRecording ? 'danger' : '';
             document.getElementById('status-recording').className = 'dot ' + (isRecording ? 'red' : 'yellow');
             updateCameraAvailability();
+            updatePreviewUI();
         }
 
         function showRecordingWarning(warning) {

@@ -343,8 +343,8 @@ def _proxy_camera_stream():
 
 @app.route('/video_feed')
 def video_feed():
-    """Annotated preview, or raw camera MJPEG when overlay is off."""
-    if not _overlay_enabled:
+    """Use the camera directly while tracking is stopped or overlay is off."""
+    if not _overlay_enabled or _active_tracker() is None:
         proxied = _proxy_camera_stream()
         if proxied is not None:
             return proxied
@@ -352,6 +352,20 @@ def video_feed():
         _generate_overlay_preview(),
         content_type='multipart/x-mixed-replace; boundary=frame',
     )
+
+
+@app.route('/api/preview', methods=['POST'])
+@_serialize_camera_control
+def api_preview():
+    """Open a per-viewer preview without creating or stopping a tracker."""
+    data, error = _json_object()
+    if error:
+        return _error(error)
+    if data.keys() != {'enabled'} or not isinstance(data['enabled'], bool):
+        return _error('Expected an enabled boolean')
+    if data['enabled'] and _lifecycle:
+        _lifecycle.cancel_scheduled_start()
+    return jsonify({'status': 'ok', 'enabled': data['enabled']})
 
 
 @app.route('/api/status')

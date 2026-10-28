@@ -127,7 +127,7 @@ class MotorBackendTests(unittest.TestCase):
         self.assertEqual(cfg['camera']['resolution'], {'width': 1280, 'height': 720})
         self.assertEqual(cfg['camera']['framerate'], 25)
         self.assertEqual(cfg['camera']['jpeg_quality'], 80)
-        self.assertEqual(cfg['camera']['tuning_file'], 'tuning/imx219-160-no-alsc.json')
+        self.assertEqual(cfg['camera']['tuning_file'], 'tuning/imx219-160-colour.json')
         self.assertEqual(cfg['tracker']['recording_fps'], 25)
         self.assertEqual(cfg['tracker']['movenet']['threads'], 1)
         self.assertLessEqual(cfg['web']['preview_max_fps'], 15)

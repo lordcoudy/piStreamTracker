@@ -10,7 +10,7 @@ behavior; recheck the relevant section before changing it.
 A lecturer-following camera system with two deployment choices: Pi 3B+ with an
 IMX219 camera and Pi 5 tracker with USB EV3, or one Pi 4 with an IMX219 camera
 and two GPIO SG90 servos. Both deployments use the same IMX219 camera module
-and select the shared 160-degree profile without ALSC through `camera.tuning_file`
+and select the shared 160-degree profile with static colour shading through `camera.tuning_file`
 in `config.yaml` and `config.pi4.yaml`. Automatic
 sensor tuning also remains available for OV5647 and other cameras.
 In standalone, `camera.py` alone opens CSI and `web.py` consumes its local MJPEG
@@ -41,7 +41,7 @@ use the source and this map for current ownership.
 |---|---|---|
 | Camera service | [camera.py](camera.py) | Picamera2 and optional sensor tuning, threaded MJPEG HTTP server, camera H.264 recorder, `/record/*` and `/camera/settings` APIs |
 | Persisted camera controls | [camera_settings.py](pistream/camera_settings.py), [camera_api.py](pistream/camera_api.py) | Validated WB/exposure/format controls, atomic camera-host YAML save and runtime rollback; bounded authenticated tracker proxy |
-| Shared IMX219 camera profile | [imx219-160-no-alsc.json](tuning/imx219-160-no-alsc.json) | Supplied IMX219 tuning without `rpi.alsc`; selected by `camera.tuning_file` on Pi 3B+ and Pi 4 |
+| Shared IMX219 camera profile | [imx219-160-colour.json](tuning/imx219-160-colour.json), [tuning notes](tuning/README.md) | Original sensor tuning plus measured static colour shading; previous no-ALSC file retained for rollback |
 | Desktop/headless tracker | [tracker.py](tracker.py), [track.py](pistream/track.py) | CLI parsing, `HumanTracker`, `ObjectTracker`, rendering, screenshots, recording coordination |
 | Web controls | [web.py](web.py), [web_app.py](pistream/web_app.py) | Flask routes, preview, runtime settings, recordings proxy, background tracker loop |
 | Session lifetime | [lifecycle.py](pistream/lifecycle.py) | Serialized web start/stop, delayed automatic start, startup confirmation, cancellation, cleanup ownership |
@@ -156,6 +156,15 @@ angle when the target is lost. The affine transform levels that signed screen an
 CLI keyboard events run even for missing/repeated frames; processing, recording,
 FPS and preview updates accept only new frames. Screenshots use the last displayed frame.
 
+The browser preview is independent of tracker ownership and initially off per
+tab, with no image URL/stream connection. **Show camera** calls `/api/preview`
+to consume pending autostart without constructing or stopping a tracker, then
+opens `/video_feed`. With tracking stopped that route proxies raw MJPEG even
+when the overlay preference is on; Start shows tracking output and Stop leaves
+camera-only viewing available. Status transitions reconnect the image source.
+**Hide camera** releases only that viewer and remains hidden across polling,
+overlay changes and camera-setting saves. The overlay preference is preserved.
+
 Camera-side H.264 uses Picamera2's encoder with `PyavOutput` to mux MP4 in-process.
 `FfmpegOutput` starts FFmpeg with a parent-death signal; when called by a short-lived
 HTTP request thread, that child is killed after the request returns. The local
@@ -191,7 +200,7 @@ an OpenCV writer is never released while its worker is writing.
   without blocking and released when each client disconnects.
 - Tracker: `/`, `/video_feed`; `/api/status`, `/api/config`; start/stop/reset,
   record/screenshot, `/api/motors` connection toggle, manual movement, zoom/settings,
-  recordings and GET/POST `/api/camera/settings`. `/api/ev3` remains specific to the EV3 backend.
+  recordings, POST `/api/preview` and GET/POST `/api/camera/settings`. `/api/ev3` remains specific to the EV3 backend.
   Definitions are grouped in `pistream/web_app.py`.
   Status adds `recording_error`, `recording_stop_pending`, `stopping` and `warning`.
   `motors` includes backend, connection/error and SG90 calibration, command/target
@@ -246,17 +255,23 @@ after 82–84°C readings with a passive radiator. Camera-process CPU fell from
 about 107% to 65% of one core, but cooling still needs validation under sustained
 load. The one-thread model comparison took about 108 ms versus 78 ms with two
 threads; these inference times are not tracking FPS guarantees.
-White-card tuning for the tested room uses manual WB gains 1.15644/2.24688;
+White-card tuning for the tested room uses manual WB gains 1.0606/1.87502;
 switch to auto after lighting changes. Autoexposure is retained because 10/20 ms
 manual exposures were too dark at the sensor's maximum analogue gain. Direct
 capture measured 39,999 µs frame duration (25.000 FPS), about 30 ms exposure with
-50 Hz flicker control, and central white-card RGB ratios within 0.3%. Residual
-spatial color shading remains in this no-ALSC profile. On IMX219, startup caches
+50 Hz flicker control, and central white-card RGB ratios within 0.3%. The static
+colour-shading profile reduced left-edge blue excess from about 84% to 39% and
+red ratios relative to centre to within about 5% in six sampled regions. Residual
+cold shading remains; the measurement is warm-room empirical tuning, not full
+RAW calibration. On IMX219, startup caches
 the 1640×1232/10-bit sensor mode for 720p/1280×960 to retain full sensor width;
 the former automatic 720p mode selected a cropped 1920×1080 readout. Sensor modes
 are queried once before streaming; Full HD and other sensors use auto selection.
-Its `camera.tuning_file` selects the bundled IMX219 160-degree profile without
-`rpi.alsc`. The two-Pi `config.yaml` selects the same profile for the matching
+Its `camera.tuning_file` selects the bundled IMX219 160-degree profile with
+`rpi.alsc` colour tables derived from Arducam's module profile and empirically
+adjusted strengths (see `tuning/README.md`). `n_iter: 0` prevents scene-dependent
+adaptation and `luminance_strength: 0` preserves brightness shading/noise.
+The original no-ALSC profile is retained for rollback. The two-Pi `config.yaml` selects the same profile for the matching
 IMX219 module on the Pi 3B+. Built-in configuration defaults retain null for
 automatic sensor tuning with other camera modules.
 Relative tuning paths resolve from the directory containing `camera.py`,
@@ -343,10 +358,23 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 | Artifact paths and remote files | [test_recordings.py](tests/test_recordings.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Camera tuning/startup/API/auth/client slots | [test_camera_server.py](tests/test_camera_server.py), [test_camera_auth.py](tests/test_camera_auth.py), [test_config.py](tests/test_config.py) |
 | Camera controls, atomic persistence/rollback and proxy lifecycle | [test_camera_settings.py](tests/test_camera_settings.py), [test_camera_settings_routes.py](tests/test_camera_settings_routes.py) |
+| Independent preview and shared static colour shading | [test_web_preview.py](tests/test_web_preview.py), [test_camera_profiles.py](tests/test_camera_profiles.py) |
 | UI/package layout and API errors/validation | [test_package.py](tests/test_package.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Network/service/udev planning | [test_install.py](tests/test_install.py) |
 | Standalone wrapper signals, services, children and setup dispatch | [test_standalone_launch.py](tests/test_standalone_launch.py) |
 | Mocked browser recovery and mobile layout | [browser_ui.cjs](tests/browser_ui.cjs), [web_ui_fixture.py](tests/web_ui_fixture.py) |
+
+The independent-preview/static-colour update passed 453 tests and 71 subtests,
+Ruff and the Chromium Show/Hide/Start/Stop, hidden-save and responsive flows.
+On Pi 4, camera-only viewing delivered 100 raw 1280×720 frames over 3.959 seconds
+(25.008 arrival FPS), with tracker, recording and motors off before/after.
+Show consumed autostart: at web service age 151.83 seconds the tracker remained
+stopped and servo PWM remained disabled, without an intervening Start/Stop.
+Saving camera settings in that state did not construct a tracker. A subsequent
+real UI Start/Stop switched to tracking output and back to camera-only viewing.
+Static colour shading and the new WB retained 25 FPS; all 12 sampled colour
+deviations improved over the no-ALSC baseline, with residual blue shading as
+documented in `tuning/README.md`. The former sensor-tuning file is unchanged.
 
 The persisted camera-controls update on 2026-10-28 passed 427 tests and 71
 subtests, Ruff, and Chromium camera-control/recovery flows at 320–1200px. The

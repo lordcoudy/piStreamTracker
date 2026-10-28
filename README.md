@@ -14,7 +14,7 @@ Run application Python processes as an ordinary user. The standalone setup keeps
 
 Direct Ethernet (or a switch) between the two Pis.
 The Pi 3B+ and Pi 4 use the same IMX219 camera module and share the
-`tuning/imx219-160-no-alsc.json` profile through `camera.tuning_file` in
+`tuning/imx219-160-colour.json` profile through `camera.tuning_file` in
 `config.yaml` and `config.pi4.yaml`. The profile preserves the camera correction
 from the supplied Pi 4 project.
 
@@ -125,6 +125,12 @@ Check cooling under the intended workload before prolonged operation.
 Camera recordings go to `camera-recordings/`; screenshots and
 fallback local recordings go to `recordings/`, avoiding duplicate list entries.
 
+**Show camera** below the video opens a stream without starting tracking,
+MoveNet or motors and cancels pending automatic startup. Each browser tab starts
+with viewing off. **Hide camera** releases that viewer; it does not stop tracking
+or recording. **Start** opens the preview, and **Stop** keeps camera-only viewing
+available. The tracking-overlay preference is kept for the next tracking session.
+
 The **Camera settings** panel below the preview changes and saves capture format,
 FPS, white balance and exposure on the camera Pi. **Save & apply** writes the
 camera service's active YAML atomically; changes survive service restarts and
@@ -135,8 +141,8 @@ recording must be stopped first. Other tracker settings remain session-only.
 The supplied Pi 4 was measured at 25.000 capture frames/s (39,999 µs frame
 duration). IMX219 uses the binned 1640×1232/10-bit sensor mode for 720p and
 1280×960, preserving full sensor width; automatic 720p selection had cropped the
-view to a 1920×1080 readout. Its room-light white-card calibration is red gain 1.15644, blue gain
-2.24688; this manual balance is saved in `config.pi4.yaml`. Select **Auto** when
+view to a 1920×1080 readout. Its room-light white-card calibration is red gain 1.0606, blue gain
+1.87502 with the colour-shading profile; this manual balance is saved in `config.pi4.yaml`. Select **Auto** when
 the lighting changes. Autoexposure with 50 Hz flicker correction (when supported)
 is retained: in the measured dim scene it chose about 30 ms, maximum analogue
 gain and some digital gain. Fixed 10/20 ms exposures were substantially darker.
@@ -144,9 +150,14 @@ Manual exposure is available in milliseconds with separate analogue gain; its
 upper limit follows both the sensor and frame period. The panel reports actual
 exposure/gain/frame rate separately from the tracker's processing FPS.
 
-Both Pi camera configurations load `tuning/imx219-160-no-alsc.json`, preserving the camera
-correction from the supplied project. The JSON omits `rpi.alsc`; it is specific
-to this IMX219 setup. `camera.tuning_file` accepts an absolute path or a path
+Both Pi camera configurations load `tuning/imx219-160-colour.json`, preserving
+the supplied sensor tuning and adding static colour shading based on Arducam's
+160-degree tables with measured strengths. It reduced the purple cast on the
+tested Pi 4: red ratios stayed within about 5% of the centre in six white-paper
+regions, while left-edge blue excess fell from 84% to 39%. Some cold shading
+remains. This warm-light adjustment is not a full RAW calibration; see
+[profile sources, measurements and rollback](tuning/README.md).
+`camera.tuning_file` accepts an absolute path or a path
 relative to the directory containing `camera.py`, independent of the working
 directory or the configuration file's location. Null selects Picamera2's normal
 sensor tuning; an explicitly selected profile that cannot be loaded fails camera
@@ -490,7 +501,7 @@ camera:
   port: 8000
   framerate: 30
   resolution: {width: 1280, height: 960}
-  tuning_file: tuning/imx219-160-no-alsc.json  # shared Pi3B+/Pi4 IMX219 profile
+  tuning_file: tuning/imx219-160-colour.json  # shared Pi3B+/Pi4 IMX219 profile
   awb_mode: auto           # auto | indoor | daylight | cloudy | manual
   colour_gains: [1.5, 1.5] # red, blue; used in manual WB
   exposure_mode: auto      # auto | manual
@@ -626,7 +637,7 @@ piStreamTracker/
 ├── tracker.py           # Display / CLI entry
 ├── web.py               # Flask entry
 ├── camera.py            # Camera Pi server
-├── tuning/imx219-160-no-alsc.json  # Current Pi4 camera correction profile
+├── tuning/imx219-160-colour.json  # Current Pi4 camera correction profile
 ├── ev3_usb.py           # Shim → pistream.ev3_usb
 ├── setup.sh             # Bootstrap apt/venv; exec python -m pistream.install
 ├── run_cam.sh

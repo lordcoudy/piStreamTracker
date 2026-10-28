@@ -25,6 +25,9 @@ async function main() {
                     metadata: { ExposureTime: 12000, AnalogueGain: 1.2, ColourGains: [1.5, 1.6], ColourTemperature: 4500, FrameDuration: 40000 },
                 } });
             });
+            await page.route('**/api/preview', route => route.fulfill({ json: {
+                status: 'ok', enabled: route.request().postDataJSON().enabled,
+            } }));
             return page;
         }
         const page = await newPage({ viewport: { width: 390, height: 844 } });
@@ -61,6 +64,18 @@ async function main() {
         assert(await page.locator('#btn-record').isDisabled());
         assert(await page.locator('#recording-warning').isHidden());
         assert.equal((await (await page.request.get(baseUrl + '/__fixture/state')).json()).stop_calls, 2);
+
+        assert.equal(await page.locator('#video-feed').getAttribute('src'), null);
+        await page.locator('#btn-preview').click();
+        await page.waitForFunction(() => document.getElementById('btn-preview').getAttribute('aria-pressed') === 'true');
+        assert.match(await page.locator('#video-feed').getAttribute('src'), /\/video_feed\?t=/);
+        assert(await page.locator('#overlay-toggle').isChecked());
+        assert(await page.locator('#btn-start').isEnabled());
+        await page.locator('#btn-preview').click();
+        assert.equal(await page.locator('#video-feed').getAttribute('src'), null);
+        assert(await page.locator('#preview-placeholder').isVisible());
+        await page.locator('#btn-preview').click();
+        await page.waitForFunction(() => document.getElementById('btn-preview').getAttribute('aria-pressed') === 'true');
 
         // Idle Stop must remain available to cancel a pending automatic start.
         let releaseIdleStop;
@@ -233,6 +248,71 @@ async function main() {
         await healthyPage.goto(baseUrl);
         await healthyPage.waitForFunction(() => !document.getElementById('btn-record').disabled);
         assert(await healthyPage.locator('#recording-warning').isHidden());
+
+        const previewPage = await newPage();
+        previewPage.on('pageerror', error => errors.push(error.message));
+        let previewRunning = false;
+        let previewOverlay = true;
+        let previewStarts = 0;
+        let previewStops = 0;
+        let previewRequests = 0;
+        previewPage.on('request', request => {
+            if (request.url().includes('/video_feed')) previewRequests++;
+        });
+        await previewPage.route('**/api/status', route => route.fulfill({ json: {
+            running: previewRunning, recording: false, fps: previewRunning ? 10 : 0,
+            shift_x: null, shift_y: null, overlay: previewOverlay,
+            stopping: false, recording_stop_pending: false, warning: null,
+        } }));
+        await previewPage.route('**/api/start', route => {
+            previewRunning = true;
+            previewStarts++;
+            return route.fulfill({ json: { status: 'ok' } });
+        });
+        await previewPage.route('**/api/stop', route => {
+            previewRunning = false;
+            previewStops++;
+            return route.fulfill({ json: { status: 'ok' } });
+        });
+        await previewPage.route('**/api/settings', route => {
+            const body = route.request().postDataJSON();
+            if (typeof body.overlay === 'boolean') previewOverlay = body.overlay;
+            return route.fulfill({ json: { status: 'ok' } });
+        });
+        await previewPage.goto(baseUrl);
+        await previewPage.waitForFunction(() => !document.getElementById('camera-save').disabled);
+        assert.equal(previewRequests, 0, 'An idle page must not consume a stream client');
+        await previewPage.locator('#btn-preview').click();
+        await previewPage.waitForFunction(() => document.getElementById('btn-preview').getAttribute('aria-pressed') === 'true');
+        assert.equal(previewStarts, 0);
+        assert.equal(previewStops, 0);
+        assert.match(await previewPage.locator('#preview-status').textContent(), /automatic start.*cancelled/i);
+        const rawSource = await previewPage.locator('#video-feed').getAttribute('src');
+        await previewPage.locator('#btn-start').click();
+        await previewPage.waitForFunction(() => document.getElementById('fps-display').textContent.includes('Tracking preview'));
+        assert.notEqual(await previewPage.locator('#video-feed').getAttribute('src'), rawSource);
+        await previewPage.locator('#btn-preview').click();
+        await previewPage.waitForResponse(response => response.url().endsWith('/api/status'));
+        assert.equal(await previewPage.locator('#video-feed').getAttribute('src'), null);
+        const hiddenRequests = previewRequests;
+        await previewPage.getByText('Tracking overlay', { exact: true }).click();
+        await previewPage.locator('#camera-save').click();
+        await previewPage.waitForFunction(() => document.getElementById('camera-settings-status').textContent.includes('saved and applied'));
+        assert.equal(previewRequests, hiddenRequests, 'Saving settings and overlay changes must keep a hidden preview disconnected');
+        await previewPage.locator('#btn-preview').click();
+        await previewPage.waitForFunction(() => document.getElementById('btn-preview').getAttribute('aria-pressed') === 'true');
+        assert.equal(previewStarts, 1);
+        assert.equal(previewStops, 0);
+        await previewPage.locator('#btn-stop').click();
+        await previewPage.waitForFunction(() => document.getElementById('fps-display').textContent.includes('Camera only'));
+        assert(await previewPage.locator('#video-feed').isVisible());
+        assert.equal(previewStops, 1);
+        assert(!(await previewPage.locator('#overlay-toggle').isChecked()));
+        await previewPage.locator('#btn-preview').click();
+        await previewPage.route('**/api/preview', route => route.fulfill({ status: 503, json: { status: 'error', message: 'Preview unavailable' } }));
+        await previewPage.locator('#btn-preview').click();
+        await previewPage.waitForFunction(() => document.getElementById('preview-status').textContent.includes('Preview unavailable'));
+        assert.equal(await previewPage.locator('#video-feed').getAttribute('src'), null);
 
         const unavailablePage = await newPage();
         unavailablePage.on('pageerror', error => errors.push(error.message));

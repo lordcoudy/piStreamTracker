@@ -18,7 +18,7 @@ camera:
   port: 8000
   framerate: 30
   jpeg_quality: 80        # MJPEG quality (1-100)
-  tuning_file: "tuning/imx219-160-no-alsc.json"  # shared IMX219 profile; null = automatic sensor tuning
+  tuning_file: "tuning/imx219-160-colour.json"  # shared IMX219 160° profile; null = automatic sensor tuning
   token: null               # optional Bearer token for /record/* (empty = open LAN)
   max_stream_clients: 4     # concurrent /stream connections
   recording_dir: "recordings"   # Server-side recording output (used when recording_mode: camera)

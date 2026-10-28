@@ -49,6 +49,11 @@ class TrackerLifecycle:
             timer.start()
         logger.info('Tracking and configured motors will start in %s seconds', delay)
 
+    def cancel_scheduled_start(self) -> None:
+        """Consume delayed startup while preserving any admitted tracker session."""
+        with self._lock:
+            self._cancel_start_timer_unlocked()
+
     def start(self, connect_timeout: float = 15.0, *,
               unless_cancelled: Optional[Event] = None) -> dict:
         return self._start(connect_timeout, unless_cancelled=unless_cancelled)

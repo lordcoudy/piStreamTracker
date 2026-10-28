@@ -29,8 +29,13 @@
         <div class="main-grid">
             <div class="video-column">
                 <div class="video-container">
-                    <img id="video-feed" src="/video_feed" alt="Video Feed">
-                    <div class="video-overlay" id="fps-display">-- FPS</div>
+                    <img id="video-feed" alt="Video Feed" hidden>
+                    <div id="preview-placeholder" class="preview-placeholder">Preview is off</div>
+                    <div class="video-overlay" id="fps-display" hidden>Camera only · tracking off</div>
+                </div>
+                <div class="preview-controls">
+                    <button id="btn-preview" type="button" class="secondary" onclick="togglePreview()" aria-pressed="false" aria-controls="video-feed">Show camera</button>
+                    <p id="preview-status" role="status" aria-live="polite">Show camera without tracking or motors. This cancels the pending automatic start.</p>
                 </div>
                 <section class="panel camera-settings" aria-labelledby="camera-settings-title">
                     <h2 id="camera-settings-title">Camera settings</h2>
