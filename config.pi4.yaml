@@ -1,4 +1,5 @@
-# Raspberry Pi 4 + OV5647 + positional SG90, Raspberry Pi OS Bookworm 64-bit.
+# Current Raspberry Pi 4 + IMX219 160-degree camera + positional SG90 settings.
+# Camera and servo values preserve the supplied configuration from the Pi.
 # camera.py owns CSI; web.py reads local MJPEG. No network changes are required.
 network:
   camera_ip: "127.0.0.1"
@@ -7,16 +8,17 @@ network:
 camera:
   host: "127.0.0.1"
   port: 8000
-  resolution: {width: 640, height: 480}
-  framerate: 15
-  jpeg_quality: 75
+  resolution: {width: 1280, height: 720}
+  framerate: 45
+  jpeg_quality: 80
+  tuning_file: "tuning/imx219-160-no-alsc.json"
   recording_dir: "camera-recordings"
 
 tracker:
   stream_url: "http://127.0.0.1:8000/stream"
   output_dir: "recordings"  # screenshots and fallback local recordings only
   recording_mode: "camera"
-  recording_fps: 15
+  recording_fps: 45
   detection: {interval: 8, scale: 0.5}
   movenet: {threads: 2}
 
@@ -24,7 +26,7 @@ motors:
   backend: "gpio_servo"
 
 gpio_servo:
-  calibrated: false  # set only after checking directions and mechanical limits
+  calibrated: true  # approval preserved from the supplied Pi; recalibrate a different mechanism
   frame_timeout: 0.75  # seconds; worker cancels auto movement if frames stop
   update_interval: 0.02
   max_dt: 0.1  # maximum credited time after a delayed control cycle
@@ -36,19 +38,19 @@ gpio_servo:
   pan:
     gpio: 18  # BCM18, physical pin 12
     calibration: {min_angle: -90, max_angle: 90, min_pulse_us: 1000, max_pulse_us: 2000}
-    min_angle: -30  # provisional mechanism limits; inspect printed stops/CSI cable
-    max_angle: 30
+    min_angle: -90
+    max_angle: 90
     home: 0
     invert: false
-    max_speed: 30  # degrees/second
+    max_speed: 500  # degrees/second; preserves the supplied Pi setting
   tilt:
     gpio: 19  # BCM19, physical pin 35
     calibration: {min_angle: -90, max_angle: 90, min_pulse_us: 1000, max_pulse_us: 2000}
-    min_angle: -15
-    max_angle: 15
+    min_angle: -45
+    max_angle: 45
     home: 0
     invert: false
-    max_speed: 20
+    max_speed: 300  # degrees/second; preserves the supplied Pi setting
 
 web:
   host: "0.0.0.0"

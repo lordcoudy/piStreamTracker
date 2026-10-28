@@ -124,12 +124,32 @@ class MotorBackendTests(unittest.TestCase):
         self.assertEqual(web_bind_host(cfg), '0.0.0.0')
         self.assertEqual(camera_stream_url(cfg), 'http://127.0.0.1:8000/stream')
         self.assertEqual(cfg['tracker']['stream_url'], camera_stream_url(cfg))
-        self.assertEqual(cfg['camera']['resolution'], {'width': 640, 'height': 480})
-        self.assertEqual(cfg['camera']['framerate'], 15)
+        self.assertEqual(cfg['camera']['resolution'], {'width': 1280, 'height': 720})
+        self.assertEqual(cfg['camera']['framerate'], 45)
+        self.assertEqual(cfg['camera']['jpeg_quality'], 80)
+        self.assertEqual(cfg['camera']['tuning_file'], 'tuning/imx219-160-no-alsc.json')
+        self.assertEqual(cfg['tracker']['recording_fps'], 45)
         self.assertEqual(cfg['tracker']['movenet']['threads'], 2)
         self.assertLessEqual(cfg['web']['preview_max_fps'], 15)
         self.assertNotEqual(cfg['camera']['recording_dir'], cfg['tracker']['output_dir'])
-        self.assertFalse(cfg['gpio_servo']['calibrated'])
+        self.assertTrue(cfg['gpio_servo']['calibrated'])
+        self.assertEqual(cfg['web']['autostart_delay'], 120)
+
+    def test_pi4_config_preserves_confirmed_servo_limits_and_speeds(self):
+        cfg = load_config(str(Path(__file__).resolve().parents[1] / 'config.pi4.yaml'))
+        for axis, minimum, maximum, speed in (
+            ('pan', -90, 90, 500), ('tilt', -45, 45, 300),
+        ):
+            with self.subTest(axis=axis):
+                settings = cfg['gpio_servo'][axis]
+                self.assertEqual(settings['min_angle'], minimum)
+                self.assertEqual(settings['max_angle'], maximum)
+                self.assertEqual(settings['max_speed'], speed)
+
+    def test_builtin_servo_defaults_still_require_calibration(self):
+        from pistream.config import default_config
+
+        self.assertFalse(default_config()['gpio_servo']['calibrated'])
 
     def test_pi4_preset_sets_camera_and_inference_defaults(self):
         from pistream.config import default_config
@@ -195,6 +215,34 @@ class ConfigValidationTests(unittest.TestCase):
             with patch.dict('os.environ', {'PISTREAM_CAMERA_TOKEN': 'env-secret'}):
                 config = load_config(str(path))
         self.assertEqual(config['camera']['token'], 'env-secret')
+
+
+class CameraTuningConfigTests(unittest.TestCase):
+    def test_default_camera_uses_automatic_tuning(self):
+        from pistream.config import default_config
+
+        self.assertIsNone(default_config()['camera']['tuning_file'])
+        with TemporaryDirectory() as tmp:
+            config = load_config(str(Path(tmp) / 'missing.yaml'))
+        self.assertIsNone(config['camera']['tuning_file'])
+
+    def test_custom_tuning_path_or_null_is_preserved(self):
+        for value in ('tuning/imx219-160-no-alsc.json', '/opt/camera/profile.json', None):
+            with self.subTest(value=value), TemporaryDirectory() as tmp:
+                import yaml
+
+                path = Path(tmp) / 'config.yaml'
+                path.write_text(yaml.safe_dump({'camera': {'tuning_file': value}}))
+                config = load_config(str(path))
+                self.assertEqual(config['camera']['tuning_file'], value)
+
+    def test_non_string_tuning_file_is_rejected(self):
+        for value in ('true', '123', '[]', '{}'):
+            with self.subTest(value=value), TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'config.yaml'
+                path.write_text(f'camera:\n  tuning_file: {value}\n')
+                with self.assertRaisesRegex(ValueError, 'camera.tuning_file'):
+                    load_config(str(path))
 
 
 class WebAutostartConfigTests(unittest.TestCase):
