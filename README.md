@@ -1,6 +1,6 @@
 # piStreamTracker
 
-Follow-cam for a lecturer: run an IMX219 CSI camera, MoveNet + OpenCV tracking, a web UI and two SG90 pan/tilt servos on one Raspberry Pi 4, or use the Pi 3B+ IMX219 camera → Pi 5 tracker → USB EV3 setup.
+Follow-cam for a lecturer: run an IMX219 CSI camera, MoveNet + OpenCV tracking, a web UI and two SG90 pan/tilt servos on one Raspberry Pi 4, or use a Pi 4/Pi 3B+ IMX219 camera → Pi 5 tracker → USB EV3 setup.
 
 Run application Python processes as an ordinary user. The standalone setup keeps existing Ethernet/Wi-Fi settings; the two-Pi setup assigns its Ethernet addresses once (EV3 access uses udev).
 
@@ -8,7 +8,7 @@ Run application Python processes as an ordinary user. The standalone setup keeps
 
 | Device | Role | Address |
 |--------|------|---------|
-| Raspberry Pi 3B+ | IMX219 camera + MJPEG (and optional H.264 record) | 192.168.100.1 |
+| Raspberry Pi 4 (Pi 3B+ also supported) | IMX219 camera + MJPEG + H.264 recording | 192.168.100.1 |
 | Raspberry Pi 5 | Detection, web UI, EV3 | 192.168.100.2 |
 | EV3 brick (USB) | Port A pan, port B tilt | — |
 
@@ -19,10 +19,58 @@ The Pi 3B+ and Pi 4 use the same IMX219 camera module and share the
 from the supplied Pi 4 project.
 
 ```
-Pi 3B+  --MJPEG /record/*-->  Pi 5  --USB-->  EV3 (A=pan, B=tilt)
+Camera  --MJPEG /record/*-->  Pi 5  --USB-->  EV3 (A=pan, B=tilt)
 192.168.100.1                 192.168.100.2
 camera.py                     tracker.py  or  web.py
 ```
+
+The current `config.yaml` was checked on a camera Pi 4 (`pi3.local`) and tracker
+Pi 5 on 2026-10-29: 1280×960, 4:3, 30 capture/recording FPS, JPEG quality 80,
+camera-side H.264 and two MoveNet threads. Its room-light WB is red 1.1368712 /
+blue 1.86235795; use automatic WB after lighting changes. Confidence 0.4 retained
+the dim-room person detection that was borderline at 0.5, and the exit check
+showed no detections in the final ten seconds. The `pi5` launcher preset keeps
+two threads; fast/quality presets are separate choices.
+
+EV3 directions were checked with small manual moves: pan inversion false,
+tilt inversion true, max speed 25 and cooldown 0.25 seconds on this mechanism.
+The operator confirmed horizontal and vertical following and stopping after
+leaving the frame. Other mechanisms need their own direction check.
+
+EV3 keep-alive resets the brick's sleep timer immediately on connection and
+every 60 seconds while connected. It sends the official
+[LEGO keep-alive command, page 99](https://www.lego.com/cdn/cs/set/assets/blt77bd61c3ac436ea3/LEGO_MINDSTORMS_EV3_Firmware_Developer_Kit.pdf),
+without moving motors or changing the sleep setting. Set
+`ev3.keep_alive_interval` to 1–300 seconds, or null to disable it. **Stop** or
+disconnect ends keep-alive; a disconnected brick can sleep normally.
+
+USB replies have a one-second transaction deadline, and Stop sends each motor's
+stop command without a preliminary state query. USB resources are released
+explicitly so Start works again after Stop. If release fails, the web interface
+retains the owner and shows an error; press Stop again to retry before starting
+a replacement session.
+
+Camera-only/raw preview automatically recovers after a camera restart or network
+interruption. It displays No Signal during the outage and keeps the same viewer
+connection; **Hide camera** releases that connection. An unavailable raw source
+still falls back to processed preview when an active tracker can supply it.
+
+For a Pi 4 used as the separate camera host, choose the camera installation role:
+`./setup.sh --camera --config config.yaml`. If a third-party IMX219 is not
+autodetected, the tested `/boot/firmware/config.txt` configuration is:
+
+```ini
+[all]
+camera_auto_detect=0
+dtoverlay=imx219
+```
+
+Reboot the camera Pi after that change. See the
+[official manual camera configuration](https://www.raspberrypi.com/documentation/accessories/camera-software.html#configuration).
+The tested Bookworm camera venv uses NumPy 1.26.4 / OpenCV contrib 4.9.0.80.
+An independently upgraded NumPy 2.x / OpenCV 5 combination caused `simplejpeg`
+to fail with `numpy.dtype size changed`; restoring the project's dependency
+bounds fixed imports. Picamera2/libcamera remain installed through apt.
 
 ## Features
 
@@ -511,7 +559,7 @@ camera:
   max_stream_clients: 4
 
 tracker:
-  recording_mode: local    # or camera (files on the 3B+)
+  recording_mode: camera   # hardware H.264 on camera Pi; local enables tracker encoding
   recording_encoder: auto  # h264_v4l2m2m | libx264 | mjpg
   recording_fps: 30        # capped to camera.framerate
   detection:
@@ -521,7 +569,10 @@ tracker:
 
 ev3:
   deadzone: {x: 90, y: 90}
-  max_speed: 50
+  max_speed: 25
+  invert: {x: false, y: true}  # measured on the current mechanism
+  cooldown: 0.25
+  keep_alive_interval: 60  # while connected; null disables
   home_hold: 3.0
   ports: {pan: "a", tilt: "b"}
 

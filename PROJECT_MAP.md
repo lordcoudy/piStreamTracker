@@ -1,14 +1,14 @@
 # piStreamTracker project map
 
-Agent orientation, updated for live Pi 4 camera/motion tuning and delayed
-tracking startup on 2026-10-28, following the recording/recovery fixes in October. This is a
+Agent orientation, updated for the Pi 4 camera + Pi 5/EV3 deployment on
+2026-10-29, following the recording/recovery fixes in October. This is a
 navigation aid, not a specification. Source code and tests determine current
 behavior; recheck the relevant section before changing it.
 
 ## System at a glance
 
-A lecturer-following camera system with two deployment choices: Pi 3B+ with an
-IMX219 camera and Pi 5 tracker with USB EV3, or one Pi 4 with an IMX219 camera
+A lecturer-following camera system with two deployment choices: a Pi 4 (also
+Pi 3B+) with an IMX219 camera and Pi 5 tracker with USB EV3, or one Pi 4 with an IMX219 camera
 and two GPIO SG90 servos. Both deployments use the same IMX219 camera module
 and select the shared 160-degree profile with static colour shading through `camera.tuning_file`
 in `config.yaml` and `config.pi4.yaml`. Automatic
@@ -110,6 +110,29 @@ an existing move first. Home is the encoder position captured at connection.
 Home/manual holds suppress automatic updates and ordinary `stop()`;
 `disconnect()` stops directly.
 
+An EV3 connection sends the official `opKeep_Alive` immediately and every
+`ev3.keep_alive_interval` seconds (default 60; null disables; valid 1–300).
+It resets the brick's idle timer without changing its configured sleep timeout
+or sending movement commands. One daemon worker shares the USB I/O lock and
+never reopens a disconnected brick. Disconnect signals cancellation before
+taking that lock, releases the owner and joins outside the lock. A failed
+heartbeat remains visible in controller status until a successful retry or
+explicit reconnect; ownership is retained for Stop. Stop also ends keep-alive:
+a disconnected brick follows its normal sleep setting.
+
+`ev3_usb.py` adapts the shared physical connection in ev3-dc 0.9.10.2. Each
+command/reply transaction has a one-second absolute deadline, including nested
+waits and unrelated replies; exceptions unwind only the calling thread's lock
+acquisitions. Motor and LED introspection use that same transport. Stop sends
+each axis's stop command directly, without first waiting for a busy reply.
+Successful close explicitly disposes PyUSB resources and removes the owned
+host registration, allowing Start after Stop in the same process. Failed close
+retains the owner and reports cleanup pending; Start stays blocked until an
+explicit Stop confirms release. Partial initialization follows the same rule.
+The reply deadline does not bound native USB enumeration/configuration or
+resource disposal. Avoid a second USB client while tracking owns the brick:
+ev3-dc's host registry covers only one Python process.
+
 `motors.backend` selects `ev3`, `gpio_servo` or `none`; null preserves the old
 `ev3.enabled` selection. `--no-motors` wins over all backend flags; `--no-ev3`
 disables only a resolved EV3 backend. GPIO mode never opens EV3 USB. SG90 uses
@@ -164,6 +187,14 @@ when the overlay preference is on; Start shows tracking output and Stop leaves
 camera-only viewing available. Status transitions reconnect the image source.
 **Hide camera** releases only that viewer and remains hidden across polling,
 overlay changes and camera-setting saves. The overlay preference is preserved.
+Raw preview reads complete multipart JPEG parts without decoding/re-encoding,
+preserving APP/EXIF bytes and normalizing the downstream boundary. Frames are
+bounded to 8 MiB and MIME headers to 16 KiB. Initial offline state and upstream
+EOF/reset produce a cached No Signal frame and retry with 0.5–3 second backoff
+and a five-second connection/read timeout. A browser disconnect closes its
+single upstream connection. An active tracker's initial raw-source failure
+still falls back to the processed preview. Tests include a real browser that
+recovers through the same downstream request after a partial-JPEG EOF.
 
 Camera-side H.264 uses Picamera2's encoder with `PyavOutput` to mux MP4 in-process.
 `FfmpegOutput` starts FFmpeg with a parent-death signal; when called by a short-lived
@@ -244,6 +275,15 @@ A mutation timeout is never retried;
 the tracker stays stopped until the user reloads settings and explicitly starts.
 Web mode is selected by `web.py` or `run_tracker.sh --web`; the unused
 `web.enabled` default and YAML entry have been removed.
+The current two-Pi `config.yaml` targets a Pi 4 camera and Pi 5 tracker:
+1280×960/30, full-width IMX219 mode, manual room-light WB 1.1368712/1.86235795,
+autoexposure, camera-side H.264, two inference threads and confidence 0.4.
+Its `pi5` file preset also uses two threads so the launcher preserves that budget;
+built-in defaults and explicit fast/quality presets retain their own values.
+EV3 pan=A/tilt=B use inversions false/true, max speed 25, cooldown 0.25 seconds
+and 90-pixel deadzones on the tested mechanism. These are separate from the
+standalone Pi 4 SG90 calibration. Camera saves belong to the camera host's YAML;
+keep the tracker copy's capture/recording defaults aligned across restarts.
 `web.autostart_delay` defaults to 120 seconds even for existing YAML files that
 omit it. Null disables the one-time automatic start; finite numeric values from
 0 to 86400 select another delay. The web UI remains available during the wait.
@@ -272,7 +312,7 @@ Its `camera.tuning_file` selects the bundled IMX219 160-degree profile with
 adjusted strengths (see `tuning/README.md`). `n_iter: 0` prevents scene-dependent
 adaptation and `luminance_strength: 0` preserves brightness shading/noise.
 The original no-ALSC profile is retained for rollback. The two-Pi `config.yaml` selects the same profile for the matching
-IMX219 module on the Pi 3B+. Built-in configuration defaults retain null for
+IMX219 module on the camera Pi 4 (previously Pi 3B+). Built-in configuration defaults retain null for
 automatic sensor tuning with other camera modules.
 Relative tuning paths resolve from the directory containing `camera.py`,
 not the working directory or YAML directory; absolute paths are supported.
@@ -309,7 +349,8 @@ and writes `pistream-camera.service`, `pistream-tracker.service`, plus a localho
 `pigpiod.service`. Tracker Requires/After camera and pigpiod; both applications get
 the same absolute config and an ordinary user with video/render groups. An existing
 legacy `pitracker.service` is disabled/stopped to avoid a second camera owner.
-Pi 4 auto-selects standalone. `run_standalone.sh` owns two subprocesses with a
+Pi 4 auto-selects standalone; a separate camera Pi 4 explicitly uses
+`setup.sh --camera --config config.yaml`. `run_standalone.sh` owns two subprocesses with a
 checkout lock, service guards and bounded signal/child-failure cleanup. Reboots
 restore the three services; tracking and configured motor connection start
 automatically after the web process's delay unless manual Start/Stop cancels it.
@@ -347,7 +388,7 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 | Config/presets/validation and automatic-start delay | [test_config.py](tests/test_config.py) |
 | Reconnect and frame identity | [test_capture_policy.py](tests/test_capture_policy.py), [test_frame_gate.py](tests/test_frame_gate.py) |
 | Async result semantics and tracker refresh/loss | [test_async_detector.py](tests/test_async_detector.py), [test_track_box.py](tests/test_track_box.py) |
-| Motor commands and holds | [test_motors.py](tests/test_motors.py) |
+| Motor commands, holds, keep-alive and bounded USB release | [test_motors.py](tests/test_motors.py), [test_ev3_usb.py](tests/test_ev3_usb.py) |
 | SG90 mapping, speed, holds/watchdog, ownership/errors and calibration | [test_servo.py](tests/test_servo.py), [test_calibrate.py](tests/test_calibrate.py) |
 | Controller selection, local URLs, stop and stale-work boundaries | [test_motion_integration.py](tests/test_motion_integration.py), [test_motion_safety_review.py](tests/test_motion_safety_review.py) |
 | Web session automatic/manual startup/stop/timeout/recovery | [test_lifecycle.py](tests/test_lifecycle.py), [test_web_routes.py](tests/test_web_routes.py) |
@@ -358,11 +399,45 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 | Artifact paths and remote files | [test_recordings.py](tests/test_recordings.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Camera tuning/startup/API/auth/client slots | [test_camera_server.py](tests/test_camera_server.py), [test_camera_auth.py](tests/test_camera_auth.py), [test_config.py](tests/test_config.py) |
 | Camera controls, atomic persistence/rollback and proxy lifecycle | [test_camera_settings.py](tests/test_camera_settings.py), [test_camera_settings_routes.py](tests/test_camera_settings_routes.py) |
+| Raw preview EOF/offline/MIME recovery and viewer cleanup | [test_web_preview_recovery.py](tests/test_web_preview_recovery.py), [browser_preview_recovery.cjs](tests/browser_preview_recovery.cjs), [preview_recovery_fixture.py](tests/preview_recovery_fixture.py) |
 | Independent preview and shared static colour shading | [test_web_preview.py](tests/test_web_preview.py), [test_camera_profiles.py](tests/test_camera_profiles.py) |
 | UI/package layout and API errors/validation | [test_package.py](tests/test_package.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Network/service/udev planning | [test_install.py](tests/test_install.py) |
 | Standalone wrapper signals, services, children and setup dispatch | [test_standalone_launch.py](tests/test_standalone_launch.py) |
 | Mocked browser recovery and mobile layout | [browser_ui.cjs](tests/browser_ui.cjs), [web_ui_fixture.py](tests/web_ui_fixture.py) |
+
+The Pi 4 camera + Pi 5/EV3 check on 2026-10-29 repaired a fresh Bookworm camera
+venv (NumPy 2.4.6/OpenCV 5 violated the project bounds and broke apt simplejpeg).
+NumPy 1.26.4/OpenCV contrib 4.9.0.80 passed imports and pip check. Camera discovery
+then required explicit `camera_auto_detect=0` plus `dtoverlay=imx219` under `[all]`
+in `/boot/firmware/config.txt`; the boot file was backed up before the change.
+The camera host remains named `pi3.local` although its model is Pi 4 B Rev 1.5.
+Wired camera/tracker addresses are 192.168.100.1/2, LAN addresses .165/.138.
+An actual raw stream delivered 100 1280×960 frames at 30.095 arrival FPS. Camera
+CPU was about 59% of one core, with 38.4°C and no power/thermal flags after startup.
+An actual camera restart recovered HD through one downstream request in 4.71s
+and retained saved WB. Real `opKeep_Alive` replies reported a 30-minute configured
+sleep timeout; three test packets caused no motor-position change and stopped
+after disconnect. The production interval is 60 seconds while connected.
+
+At confidence 0.4, a stationary run had 42/43 detections after initial catchup
+and median processing 29.97 FPS; the horizontal run had 107/107 at 30.00 FPS.
+Vertical following and exit produced no detections in the final ten-second
+sample. The operator confirmed both axes following and stopping after exit.
+Camera-side H.264 recording produced 301 1280×960 frames at 30 FPS over 10.04s;
+web download matched the 5,092,484-byte file and ffmpeg decoded a frame. Tracking
+continued at 29.97 FPS during recording. A later camera/tracker sample measured
+43.3°C/61.5°C with `throttled=0x0` and no service restarts on either host. These
+are measured live checks, not a sustained thermal or full mechanical-range test.
+
+The paired-camera/EV3 update passed 510 tests and 85 subtests, plus Ruff.
+USB regression tests cover missing replies, lock recovery, explicit disposal,
+partial connection failure and retained ownership through Stop retry. Three live
+Start/Stop cycles each connected EV3 in the same web process; the 65-second
+cycle crossed the production heartbeat interval. Stop returned in 0.076, 0.092
+and 0.078 seconds, with no motor error or retained cleanup. The earlier
+unbounded-USB version had hung on Stop and failed its next connection with
+“host already connected”; its original hang stack was not captured.
 
 The independent-preview/static-colour update passed 453 tests and 71 subtests,
 Ruff and the Chromium Show/Hide/Start/Stop, hidden-save and responsive flows.
@@ -450,3 +525,8 @@ These are code observations at the revision above, not fixes made by this map.
   Commission with unloaded horns and safe cable clearance. A standing person can
   remain above the framing target with tilt at −45°; change placement before
   considering any mechanical-limit adjustment.
+- **Camera environment and discovery:** Bookworm's apt simplejpeg/Picamera2 must
+  remain compatible with the venv NumPy ABI. Keep the declared NumPy/OpenCV
+  bounds, and test imports before starting the camera service. A missing
+  auto-detected third-party IMX219 may need the explicit boot overlay above;
+  a loaded driver's I²C probe errors still require a cable/connector check.

@@ -66,6 +66,7 @@ def default_config() -> dict:
             'enabled': True, 'deadzone': {'x': 90, 'y': 90},
             'speed_factor': 1.0, 'max_speed': 50, 'cooldown': 0.5,
             'home_hold': 3.0,
+            'keep_alive_interval': 60,
             'invert': {'x': False, 'y': False}, 'ports': {'pan': 'a', 'tilt': 'b'}
         },
         # null preserves the legacy ev3.enabled selection.
@@ -265,6 +266,11 @@ def validate_config(config: dict) -> dict:
     ev3['max_speed'] = _positive_int(ev3.get('max_speed'), 'ev3.max_speed', 100)
     ev3['cooldown'] = _bounded_number(ev3.get('cooldown'), 'ev3.cooldown', 0, 60)
     ev3['home_hold'] = _bounded_number(ev3.get('home_hold'), 'ev3.home_hold', 0, 60)
+    keep_alive = ev3.setdefault('keep_alive_interval', 60)
+    if keep_alive is not None:
+        ev3['keep_alive_interval'] = _bounded_number(
+            keep_alive, 'ev3.keep_alive_interval', 1, 300
+        )
     ev3['enabled'] = _boolean(ev3.get('enabled'), 'ev3.enabled')
     deadzone = _mapping(ev3.get('deadzone'), 'ev3.deadzone')
     for axis in ('x', 'y'):
