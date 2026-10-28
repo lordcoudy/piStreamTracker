@@ -14,7 +14,7 @@ network:
 
 # Camera Server Settings (Pi 3B+)
 camera:
-  host: null                # null = bind camera_ip only (set 0.0.0.0 to listen on all NICs)
+  host: 0.0.0.0                # null = bind camera_ip only (set 0.0.0.0 to listen on all NICs)
   port: 8000
   framerate: 30
   jpeg_quality: 80        # MJPEG quality (1-100)
@@ -85,7 +85,7 @@ ev3:
 
 # Web Interface Settings
 web:
-  host: null              # null = bind tracker_ip only (set 0.0.0.0 to listen on all NICs)
+  host: 0.0.0.0              # null = bind tracker_ip only (set 0.0.0.0 to listen on all NICs)
   port: 5000
   # One automatic tracking/motor start; manual Start/Stop cancels the pending start.
   autostart_delay: 120     # delay in seconds (0-86400); null disables
