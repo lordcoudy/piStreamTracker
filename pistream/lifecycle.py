@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from threading import Event, Lock, Thread
+import logging
+from threading import Event, Lock, Thread, Timer
 from typing import Any, Callable, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class TrackerLifecycle:
@@ -25,9 +29,36 @@ class TrackerLifecycle:
         self.tracker = None
         self.last_motor_error = None
         self.thread: Optional[Thread] = None
+        self._start_timer: Optional[Timer] = None
+
+    def schedule_start(self, delay: float) -> None:
+        """Schedule one start; manual Start/Stop consumes the pending request."""
+        with self._lock:
+            self._cancel_start_timer_unlocked()
+
+            def autostart():
+                result = self._start(scheduled=timer)
+                if result['status'] == 'ok':
+                    logger.info('Automatic tracking start completed')
+                elif result['status'] != 'cancelled':
+                    logger.warning('Automatic tracking start: %s', result)
+
+            timer = Timer(delay, autostart)
+            timer.daemon = True
+            self._start_timer = timer
+            timer.start()
+        logger.info('Tracking and configured motors will start in %s seconds', delay)
 
     def start(self, connect_timeout: float = 15.0) -> dict:
+        return self._start(connect_timeout)
+
+    def _start(self, connect_timeout: float = 15.0, scheduled: Optional[Timer] = None) -> dict:
         with self._lock:
+            # Cancel and admit starts under the same lock as Stop: an already
+            # entered timer callback must never reopen hardware after Stop.
+            if scheduled is not None and scheduled is not self._start_timer:
+                return {'status': 'cancelled'}
+            self._cancel_start_timer_unlocked()
             if self._stopping_unlocked():
                 return {'status': 'stopping'}
             if self._starting or (self.thread is not None and self.thread.is_alive()):
@@ -104,6 +135,7 @@ class TrackerLifecycle:
 
     def stop(self) -> dict:
         with self._lock:
+            self._cancel_start_timer_unlocked()
             retry_pending = (
                 not self._worker_alive_unlocked()
                 and self.tracker is not None
@@ -125,6 +157,11 @@ class TrackerLifecycle:
                     return self._pending_result()
                 return {'status': 'ok'}
             return {'status': 'stopping'}
+
+    def _cancel_start_timer_unlocked(self) -> None:
+        if self._start_timer is not None:
+            self._start_timer.cancel()
+            self._start_timer = None
 
     @property
     def stopping(self) -> bool:

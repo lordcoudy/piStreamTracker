@@ -86,6 +86,8 @@ ev3:
 web:
   host: null              # null = bind tracker_ip only (set 0.0.0.0 to listen on all NICs)
   port: 5000
+  # One automatic tracking/motor start; manual Start/Stop cancels the pending start.
+  autostart_delay: 120     # delay in seconds (0-86400); null disables
   overlay: true           # false = proxy raw camera MJPEG (no re-encode)
   preview_quality: 70     # JPEG quality for the annotated preview
   preview_max_edge: 640   # Long-side cap in pixels (0 = native)

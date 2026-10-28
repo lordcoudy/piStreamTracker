@@ -38,7 +38,7 @@ use the source and this map for current ownership.
 | Camera service | [camera.py](camera.py) | Picamera2, threaded MJPEG HTTP server, camera H.264 recorder and `/record/*` API |
 | Desktop/headless tracker | [tracker.py](tracker.py), [track.py](pistream/track.py) | CLI parsing, `HumanTracker`, `ObjectTracker`, rendering, screenshots, recording coordination |
 | Web controls | [web.py](web.py), [web_app.py](pistream/web_app.py) | Flask routes, preview, runtime settings, recordings proxy, background tracker loop |
-| Session lifetime | [lifecycle.py](pistream/lifecycle.py) | Serialized web start/stop, startup confirmation, cancellation, cleanup ownership |
+| Session lifetime | [lifecycle.py](pistream/lifecycle.py) | Serialized web start/stop, delayed automatic start, startup confirmation, cancellation, cleanup ownership |
 | Capture | [capture.py](pistream/capture.py) | Latest-frame buffer, OpenCV backends, automatic stream reconnect |
 | Detection | [detect.py](pistream/detect.py) | MoveNet model acquisition/interpreter, pose parsing, asynchronous inference |
 | Motors | [motors.py](pistream/motors.py), [motors_math.py](pistream/motors_math.py), [ev3_usb.py](pistream/ev3_usb.py) | USB command serialization, deadzones, speed, home/manual holds; pure axis math; ev3-dc wrapper |
@@ -91,6 +91,11 @@ only new negatives count toward `DETECTION_MISS_LIMIT` (currently three).
   writer closure, unfinished capture/detection workers or an unconfirmed camera
   stop, blocking replacement sessions.
   Concurrent Stop requests serialize; only explicit Stop retries pending work.
+  Each web process schedules one automatic start after `web.autostart_delay`
+  seconds (120 by default, null disables). Manual Start/Stop cancels the pending
+  start; process shutdown cancels it before cleanup. Automatic startup uses the
+  same lifecycle and configured motor backend as manual Start, retaining motor
+  disable flags and the SG90 calibration gate, and does not start recording.
 - Motor USB calls share an I/O lock; recording coordination uses an `RLock`.
   Local encoding and ffmpeg stderr draining have their own workers.
 
@@ -193,6 +198,9 @@ built-in defaults. Most web settings mutate the current tracker only. Overlay
 also changes in-memory web config; UI controls do not write `config.yaml`.
 Web mode is selected by `web.py` or `run_tracker.sh --web`; the unused
 `web.enabled` default and YAML entry have been removed.
+`web.autostart_delay` defaults to 120 seconds even for existing YAML files that
+omit it. Null disables the one-time automatic start; finite numeric values from
+0 to 86400 select another delay. The web UI remains available during the wait.
 `config.pi4.yaml` selects localhost camera endpoints, camera-side H.264 recording,
 separate `camera-recordings/` and tracker `recordings/` directories, 640×480 at
 15 camera FPS, 2 inference threads and 10 preview FPS. These are initial settings,
@@ -227,7 +235,8 @@ the same absolute config and an ordinary user with video/render groups. An exist
 legacy `pitracker.service` is disabled/stopped to avoid a second camera owner.
 Pi 4 auto-selects standalone. `run_standalone.sh` owns two subprocesses with a
 checkout lock, service guards and bounded signal/child-failure cleanup. Reboots
-restore the three services; tracking starts explicitly from the web UI.
+restore the three services; tracking and configured motor connection start
+automatically after the web process's delay unless manual Start/Stop cancels it.
 
 Laptop setup uses `pip install -e ".[dev,desktop]"`. The optional extra selects
 `ai-edge-litert>=2.3,<2.4`, or `tensorflow>=2.16,<2.17` on Intel macOS. The base Pi
@@ -259,13 +268,13 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 
 | Change area | Relevant tests |
 |---|---|
-| Config/presets/validation | [test_config.py](tests/test_config.py) |
+| Config/presets/validation and automatic-start delay | [test_config.py](tests/test_config.py) |
 | Reconnect and frame identity | [test_capture_policy.py](tests/test_capture_policy.py), [test_frame_gate.py](tests/test_frame_gate.py) |
 | Async result semantics and tracker refresh/loss | [test_async_detector.py](tests/test_async_detector.py), [test_track_box.py](tests/test_track_box.py) |
 | Motor commands and holds | [test_motors.py](tests/test_motors.py) |
 | SG90 mapping, speed, holds/watchdog, ownership/errors and calibration | [test_servo.py](tests/test_servo.py), [test_calibrate.py](tests/test_calibrate.py) |
 | Controller selection, local URLs, stop and stale-work boundaries | [test_motion_integration.py](tests/test_motion_integration.py), [test_motion_safety_review.py](tests/test_motion_safety_review.py) |
-| Web session startup/stop/timeout/recovery | [test_lifecycle.py](tests/test_lifecycle.py), [test_web_routes.py](tests/test_web_routes.py) |
+| Web session automatic/manual startup/stop/timeout/recovery | [test_lifecycle.py](tests/test_lifecycle.py), [test_web_routes.py](tests/test_web_routes.py) |
 | Leveling, preview geometry and rate caps | [test_horizon.py](tests/test_horizon.py), [test_preview.py](tests/test_preview.py) |
 | Writer health, bounded encoder shutdown and ownership | [test_record_writer.py](tests/test_record_writer.py), [test_recording_backend.py](tests/test_recording_backend.py) |
 | CLI controls and camera recovery | [test_tracker_cli.py](tests/test_tracker_cli.py), [test_recording_integration.py](tests/test_recording_integration.py) |

@@ -102,8 +102,12 @@ Setup enables three services: `pigpiod`, `pistream-camera`, and
 `pistream-tracker`. The tracker starts after and requires the camera and daemon.
 Both applications receive the same absolute config path. A previous
 `pitracker.service` on this device is stopped and disabled to avoid a second
-camera owner. The web service opens the control panel; **tracking starts only
-when Start is pressed**, including after a reboot.
+camera owner. The web service opens the control panel immediately and starts
+tracking with the configured motors **120 seconds after startup**, including
+after a reboot. Manual **Start** or **Stop** cancels this pending one-time start.
+Set `web.autostart_delay: null` to require manual Start instead; a numeric value
+sets the delay in seconds (0–86400). The same behavior applies to foreground
+web launches. Automatic startup does not start a recording.
 
 `config.pi4.yaml` starts at 640×480, 15 camera frames/s, two MoveNet threads and
 at most 10 annotated-preview frames/s. Detection interval and processing scale
@@ -114,8 +118,9 @@ fallback local recordings go to `recordings/`, avoiding duplicate list entries.
 ### Calibrate before automatic motion
 
 The shipped configuration has `gpio_servo.calibrated: false`, which blocks
-automatic tracking. Manual movement and Home remain available. **Start with the
-servo horns detached from the mechanism**: the first pulse uses the configured
+automatic motor tracking; video tracking can run. Manual movement and Home
+remain available. **Start with the servo horns detached from the mechanism**:
+the first pulse uses the configured
 Home reference, and the application cannot know the actual shaft position.
 Speed limits constrain subsequent command changes, not an unknown initial
 physical movement.
@@ -188,9 +193,12 @@ and controller errors; no SG90 position feedback is available.
 sudo systemctl start pistream-tracker
 ```
 
-Open `http://<Pi-LAN-IP>:5000`, press **Start**, check the image and use small
-D-pad steps. **Home / Reset** clears detection and returns to saved Home while
-holding automatic tracking for `gpio_servo.home_hold`; manual motion uses
+Open `http://<Pi-LAN-IP>:5000` and wait for the two-minute automatic start, or
+press **Start** to start immediately. Check the image and use small D-pad steps.
+**Stop** also cancels a pending automatic start, leaving tracking stopped until
+the next manual Start or web service restart. **Home / Reset** clears detection
+and returns to saved Home while holding automatic tracking for
+`gpio_servo.home_hold`; manual motion uses
 `manual_hold`. Stop cancels either motion immediately and disables pulses.
 Losing the person cancels automatic motion and holds the last issued position.
 The independent worker cancels automatic motion after `frame_timeout` seconds
@@ -237,7 +245,8 @@ Bookworm uses the `rpicam-*` commands; see
 If the camera is absent, power down before reseating its cable and check the
 OV5647 entry with `--list-cameras`. If the UI reports `pigpiod` unavailable, check
 its service log, run `sudo systemctl restart pigpiod` and
-`sudo systemctl start pistream-tracker`, then reload the UI and press Start.
+`sudo systemctl start pistream-tracker`, then reload the UI and wait for automatic
+startup or press Start immediately.
 For a transient client error while the service stays up, reconnect using
 **Motors Enabled** or Stop/Start the tracking session. There is no software-PWM
 fallback. Errors about unconfirmed PWM shutdown stay visible after Stop; an
@@ -346,6 +355,10 @@ Tracker Pi:
 ```
 
 `--web` forwards `--preset` (default `pi5`) to `web.py`. Presets live in `config.yaml`.
+The web interface starts tracking and connects the configured motor backend
+after `web.autostart_delay` seconds (120 by default). Manual Start/Stop cancels
+the pending start; `null` disables automatic startup. Disabled motor backends and
+the SG90 calibration gate still apply.
 
 Laptop (no Pi / no EV3):
 
@@ -368,7 +381,7 @@ first use; the synthetic stream exercises controls and transport, not pose quali
 
 | Control | What it does |
 |---------|----------------|
-| Start / Stop | Connects to the camera stream, then tracks. Start fails if the stream is down. |
+| Start / Stop | Starts/stops tracking and cancels a pending automatic start. Start connects to the camera stream and fails if it is down. |
 | Home / Reset | Clears detection and homes the selected controller; auto-track holds for its configured `home_hold` |
 | Record / Screenshot | Local files under `tracker.output_dir`, or camera Pi if `recording_mode: camera`; an unreachable camera recorder falls back locally |
 | Tracking overlay | Off = proxy the camera MJPEG (lowest delay). On = annotated preview at `preview_max_fps` / `preview_max_edge` |
@@ -431,6 +444,7 @@ ev3:
 web:
   host: null               # null = tracker_ip
   port: 5000
+  autostart_delay: 120      # seconds; null disables the one-time automatic start
   overlay: true
   preview_quality: 70
   preview_max_edge: 640

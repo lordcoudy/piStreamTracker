@@ -2,7 +2,8 @@
 
 import time
 import unittest
-from threading import Event, Thread
+from threading import Event, Thread, Timer
+from unittest.mock import Mock, patch
 
 from pistream.lifecycle import TrackerLifecycle
 
@@ -264,6 +265,96 @@ class TrackerLifecycleTests(unittest.TestCase):
             allow_assignment.set()
             life.stop()
             starter.join(1)
+
+
+class DelayedTrackerLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.timers = []
+
+        def timer_factory(delay, callback):
+            timer = Timer(delay, callback)
+            timer.start = Mock()
+            self.timers.append(timer)
+            return timer
+
+        timer_patch = patch('pistream.lifecycle.Timer', side_effect=timer_factory)
+        timer_patch.start()
+        self.addCleanup(timer_patch.stop)
+        self.factory = Mock(side_effect=FakeTracker)
+        self.life = TrackerLifecycle(self.factory, _loop_until_stopped)
+        self.addCleanup(self.life.stop)
+
+    def test_scheduled_start_waits_two_minutes_before_acquiring_tracker(self):
+        self.life.schedule_start(120)
+        timer = self.timers[0]
+        self.assertEqual(timer.interval, 120)
+        self.assertTrue(timer.daemon)
+        timer.start.assert_called_once_with()
+        self.factory.assert_not_called()
+        self.assertIsNone(self.life.tracker)
+
+        timer.function()
+
+        self.factory.assert_called_once_with()
+        self.assertTrue(self.life.tracker.running)
+        self.assertTrue(self.life.tracker.connected)
+
+    def test_manual_start_consumes_pending_autostart(self):
+        self.life.schedule_start(120)
+        timer = self.timers[0]
+        self.assertEqual(self.life.start()['status'], 'ok')
+        tracker = self.life.tracker
+        self.assertTrue(timer.finished.is_set())
+        timer.function()  # A callback already entered before cancellation.
+        self.factory.assert_called_once_with()
+        self.assertIs(self.life.tracker, tracker)
+
+    def test_manual_stop_cancels_even_an_already_entered_callback(self):
+        self.life.schedule_start(120)
+        timer = self.timers[0]
+        self.assertEqual(self.life.stop()['status'], 'ok')
+        self.assertTrue(timer.finished.is_set())
+        timer.function()
+        self.factory.assert_not_called()
+        self.assertIsNone(self.life.tracker)
+
+    def test_old_callback_cannot_consume_a_replacement_schedule(self):
+        self.life.schedule_start(120)
+        old_timer = self.timers[0]
+        self.life.schedule_start(30)
+        self.assertTrue(old_timer.finished.is_set())
+        old_timer.function()
+        self.factory.assert_not_called()
+        self.timers[1].function()
+        self.assertTrue(self.life.tracker.running)
+        self.factory.assert_called_once_with()
+
+    def test_callback_is_one_shot_even_after_tracker_is_stopped(self):
+        self.life.schedule_start(120)
+        timer = self.timers[0]
+        timer.function()
+        self.life.stop()
+        timer.function()
+        self.factory.assert_called_once_with()
+        self.assertIsNone(self.life.tracker)
+
+    def test_autostart_does_not_replace_an_existing_session(self):
+        self.assertEqual(self.life.start()['status'], 'ok')
+        tracker = self.life.tracker
+        self.life.schedule_start(120)
+        self.timers[0].function()
+        self.assertIs(self.life.tracker, tracker)
+        self.factory.assert_called_once_with()
+
+    def test_failed_autostart_is_logged_without_retry(self):
+        self.factory.side_effect = lambda: FakeTracker(connect_ok=False)
+        self.life.schedule_start(120)
+        with self.assertLogs('pistream.lifecycle', level='WARNING') as logs:
+            self.timers[0].function()
+        self.assertIn('Failed to connect', '\n'.join(logs.output))
+        self.factory.assert_called_once_with()
+        self.assertIsNone(self.life.tracker)
+        self.assertEqual(len(self.timers), 1)
 
 
 if __name__ == '__main__':

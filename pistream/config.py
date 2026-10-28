@@ -67,6 +67,7 @@ def default_config() -> dict:
         'gpio_servo': default_servo_config(),
         'web': {
             'host': None, 'port': 5000,
+            'autostart_delay': 120,
             'preview_quality': 70, 'preview_max_edge': 640,
             'preview_max_fps': 15, 'overlay': True,
         },
@@ -267,6 +268,9 @@ def validate_config(config: dict) -> dict:
             raise ValueError(f'ev3.ports.{axis} must be a non-empty string')
 
     web['port'] = _positive_int(web.get('port'), 'web.port', 65535)
+    delay = web.setdefault('autostart_delay', 120)
+    if delay is not None:
+        web['autostart_delay'] = _bounded_number(delay, 'web.autostart_delay', 0, 86400)
     web['preview_quality'] = _positive_int(web.get('preview_quality'), 'web.preview_quality', 100)
     web['preview_max_edge'] = _bounded_int(
         web.get('preview_max_edge'), 'web.preview_max_edge', 0, 16384

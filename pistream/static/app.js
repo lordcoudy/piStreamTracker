@@ -218,7 +218,7 @@
 
         function updateUI() {
             document.getElementById('btn-start').disabled = isTracking || isStopping || recordingStopPending || controlRequestPending;
-            document.getElementById('btn-stop').disabled = !(isTracking || isStopping || recordingStopPending) || controlRequestPending;
+            document.getElementById('btn-stop').disabled = controlRequestPending;
             document.getElementById('btn-stop').textContent = recordingStopPending && !isTracking ? 'Retry camera stop' : 'Stop';
             document.getElementById('btn-record').disabled = !isTracking || isStopping || controlRequestPending;
             document.getElementById('btn-record').textContent = isRecording ? 'Stop Rec' : 'Record';

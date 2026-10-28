@@ -197,6 +197,51 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertEqual(config['camera']['token'], 'env-secret')
 
 
+class WebAutostartConfigTests(unittest.TestCase):
+    def test_default_delay_is_two_minutes(self):
+        from pistream.config import default_config
+
+        self.assertEqual(default_config()['web']['autostart_delay'], 120)
+
+    def test_existing_config_without_autostart_key_gets_default(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('web:\n  overlay: false\n')
+            config = load_config(str(path))
+        self.assertEqual(config['web']['autostart_delay'], 120)
+        self.assertFalse(config['web']['overlay'])
+
+    def test_missing_config_gets_default_delay(self):
+        with TemporaryDirectory() as tmp:
+            config = load_config(str(Path(tmp) / 'missing.yaml'))
+        self.assertEqual(config['web']['autostart_delay'], 120)
+
+    def test_configured_delay_accepts_seconds_and_boundary_values(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            for delay in (0, 2.5, 86400):
+                with self.subTest(delay=delay):
+                    path.write_text(f'web:\n  autostart_delay: {delay}\n')
+                    config = load_config(str(path))
+                    self.assertEqual(config['web']['autostart_delay'], delay)
+
+    def test_null_disables_autostart(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('web:\n  autostart_delay: null\n')
+            config = load_config(str(path))
+        self.assertIsNone(config['web']['autostart_delay'])
+
+    def test_invalid_autostart_delays_are_rejected(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            for delay in ('true', 'false', '-1', '86401', '.nan', '.inf', '-.inf', 'later'):
+                with self.subTest(delay=delay):
+                    path.write_text(f'web:\n  autostart_delay: {delay}\n')
+                    with self.assertRaisesRegex(ValueError, 'web.autostart_delay'):
+                        load_config(str(path))
+
+
 class NetworkFieldTests(unittest.TestCase):
     def test_rejects_interface_with_spaces(self):
         with TemporaryDirectory() as tmp:
