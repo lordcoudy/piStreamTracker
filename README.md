@@ -13,9 +13,10 @@ Run application Python processes as an ordinary user. The standalone setup keeps
 | EV3 brick (USB) | Port A pan, port B tilt | — |
 
 Direct Ethernet (or a switch) between the two Pis.
-The Pi 3B+ uses `config.yaml` with `camera.tuning_file: null`, letting Picamera2
-select the standard IMX219 tuning. The custom 160-degree profile without ALSC
-in `config.pi4.yaml` is specific to the supplied Pi 4 camera configuration.
+The Pi 3B+ and Pi 4 use the same IMX219 camera module and share the
+`tuning/imx219-160-no-alsc.json` profile through `camera.tuning_file` in
+`config.yaml` and `config.pi4.yaml`. The profile preserves the camera correction
+from the supplied Pi 4 project.
 
 ```
 Pi 3B+  --MJPEG /record/*-->  Pi 5  --USB-->  EV3 (A=pan, B=tilt)
@@ -121,7 +122,7 @@ JPEG quality 80 and 45 recording frames/s, with two MoveNet threads and at most
 performance. Camera recordings go to `camera-recordings/`; screenshots and
 fallback local recordings go to `recordings/`, avoiding duplicate list entries.
 
-The Pi profile loads `tuning/imx219-160-no-alsc.json`, preserving the camera
+Both Pi camera configurations load `tuning/imx219-160-no-alsc.json`, preserving the camera
 correction from the supplied project. The JSON omits `rpi.alsc`; it is specific
 to this IMX219 setup. `camera.tuning_file` accepts an absolute path or a path
 relative to the directory containing `camera.py`, independent of the working
@@ -443,7 +444,7 @@ camera:
   port: 8000
   framerate: 30
   resolution: {width: 1280, height: 960}
-  tuning_file: null        # standard IMX219 tuning on Pi3B+; Pi4 selects its custom JSON
+  tuning_file: tuning/imx219-160-no-alsc.json  # shared Pi3B+/Pi4 IMX219 profile
   token: null              # Bearer for /record/* ; empty = open LAN
   max_stream_clients: 4
 

@@ -9,9 +9,9 @@ behavior; recheck the relevant section before changing it.
 
 A lecturer-following camera system with two deployment choices: Pi 3B+ with an
 IMX219 camera and Pi 5 tracker with USB EV3, or one Pi 4 with an IMX219 camera
-and two GPIO SG90 servos. The Pi 3B+ uses standard automatic sensor tuning via
-`camera.tuning_file: null` in `config.yaml`. The supplied Pi 4 profile targets
-an IMX219 with a 160-degree lens and custom tuning without ALSC. Automatic
+and two GPIO SG90 servos. Both deployments use the same IMX219 camera module
+and select the shared 160-degree profile without ALSC through `camera.tuning_file`
+in `config.yaml` and `config.pi4.yaml`. Automatic
 sensor tuning also remains available for OV5647 and other cameras.
 In standalone, `camera.py` alone opens CSI and `web.py` consumes its local MJPEG
 at `127.0.0.1:8000`; the Flask UI binds to the LAN. Tracking can also run with an
@@ -40,7 +40,7 @@ use the source and this map for current ownership.
 | Area | Start here | Responsibility |
 |---|---|---|
 | Camera service | [camera.py](camera.py) | Picamera2 and optional sensor tuning, threaded MJPEG HTTP server, camera H.264 recorder and `/record/*` API |
-| Pi 4 camera profile | [imx219-160-no-alsc.json](tuning/imx219-160-no-alsc.json) | Supplied IMX219 tuning without `rpi.alsc`; selected only by `camera.tuning_file` |
+| Shared IMX219 camera profile | [imx219-160-no-alsc.json](tuning/imx219-160-no-alsc.json) | Supplied IMX219 tuning without `rpi.alsc`; selected by `camera.tuning_file` on Pi 3B+ and Pi 4 |
 | Desktop/headless tracker | [tracker.py](tracker.py), [track.py](pistream/track.py) | CLI parsing, `HumanTracker`, `ObjectTracker`, rendering, screenshots, recording coordination |
 | Web controls | [web.py](web.py), [web_app.py](pistream/web_app.py) | Flask routes, preview, runtime settings, recordings proxy, background tracker loop |
 | Session lifetime | [lifecycle.py](pistream/lifecycle.py) | Serialized web start/stop, delayed automatic start, startup confirmation, cancellation, cleanup ownership |
@@ -214,8 +214,9 @@ camera-side H.264 recording, separate `camera-recordings/` and tracker `recordin
 directories, 1280×720 at 45 camera/recording FPS, JPEG quality 80, 2 inference
 threads and 10 preview FPS. These are configured values, not measured throughput.
 Its `camera.tuning_file` selects the bundled IMX219 160-degree profile without
-`rpi.alsc`. The two-Pi `config.yaml` uses null for standard IMX219 tuning on
-the Pi 3B+; built-in configuration defaults also leave sensor tuning to Picamera2.
+`rpi.alsc`. The two-Pi `config.yaml` selects the same profile for the matching
+IMX219 module on the Pi 3B+. Built-in configuration defaults retain null for
+automatic sensor tuning with other camera modules.
 Relative tuning paths resolve from the directory containing `camera.py`,
 not the working directory or YAML directory; absolute paths are supported.
 An explicitly selected profile must load successfully before camera acquisition;
