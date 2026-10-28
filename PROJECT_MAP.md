@@ -7,10 +7,12 @@ behavior; recheck the relevant section before changing it.
 
 ## System at a glance
 
-A lecturer-following camera system with two deployment choices: Pi 3B+ camera
-and Pi 5 tracker with USB EV3, or one Pi 4 with a CSI camera and two GPIO SG90
-servos. The current Pi 4 profile targets an IMX219 with a 160-degree lens;
-automatic sensor tuning remains available for OV5647 and other cameras.
+A lecturer-following camera system with two deployment choices: Pi 3B+ with an
+IMX219 camera and Pi 5 tracker with USB EV3, or one Pi 4 with an IMX219 camera
+and two GPIO SG90 servos. The Pi 3B+ uses standard automatic sensor tuning via
+`camera.tuning_file: null` in `config.yaml`. The supplied Pi 4 profile targets
+an IMX219 with a 160-degree lens and custom tuning without ALSC. Automatic
+sensor tuning also remains available for OV5647 and other cameras.
 In standalone, `camera.py` alone opens CSI and `web.py` consumes its local MJPEG
 at `127.0.0.1:8000`; the Flask UI binds to the LAN. Tracking can also run with an
 OpenCV window or without motors. Persistent artifacts are files; no database.
@@ -212,8 +214,9 @@ camera-side H.264 recording, separate `camera-recordings/` and tracker `recordin
 directories, 1280×720 at 45 camera/recording FPS, JPEG quality 80, 2 inference
 threads and 10 preview FPS. These are configured values, not measured throughput.
 Its `camera.tuning_file` selects the bundled IMX219 160-degree profile without
-`rpi.alsc`. Generic configuration defaults to null and leaves sensor tuning to
-Picamera2. Relative tuning paths resolve from the directory containing `camera.py`,
+`rpi.alsc`. The two-Pi `config.yaml` uses null for standard IMX219 tuning on
+the Pi 3B+; built-in configuration defaults also leave sensor tuning to Picamera2.
+Relative tuning paths resolve from the directory containing `camera.py`,
 not the working directory or YAML directory; absolute paths are supported.
 An explicitly selected profile must load successfully before camera acquisition;
 there is no silent fallback to a different profile.

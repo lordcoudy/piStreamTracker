@@ -1,18 +1,21 @@
 # piStreamTracker
 
-Follow-cam for a lecturer: run a CSI camera, MoveNet + OpenCV tracking, a web UI and two SG90 pan/tilt servos on one Raspberry Pi 4, or keep the original Pi 3B+ camera → Pi 5 tracker → USB EV3 setup.
+Follow-cam for a lecturer: run an IMX219 CSI camera, MoveNet + OpenCV tracking, a web UI and two SG90 pan/tilt servos on one Raspberry Pi 4, or use the Pi 3B+ IMX219 camera → Pi 5 tracker → USB EV3 setup.
 
 Run application Python processes as an ordinary user. The standalone setup keeps existing Ethernet/Wi-Fi settings; the two-Pi setup assigns its Ethernet addresses once (EV3 access uses udev).
 
-## Original two-Pi hardware
+## Two-Pi hardware
 
 | Device | Role | Address |
 |--------|------|---------|
-| Raspberry Pi 3B+ | Camera + MJPEG (and optional H.264 record) | 192.168.100.1 |
+| Raspberry Pi 3B+ | IMX219 camera + MJPEG (and optional H.264 record) | 192.168.100.1 |
 | Raspberry Pi 5 | Detection, web UI, EV3 | 192.168.100.2 |
 | EV3 brick (USB) | Port A pan, port B tilt | — |
 
 Direct Ethernet (or a switch) between the two Pis.
+The Pi 3B+ uses `config.yaml` with `camera.tuning_file: null`, letting Picamera2
+select the standard IMX219 tuning. The custom 160-degree profile without ALSC
+in `config.pi4.yaml` is specific to the supplied Pi 4 camera configuration.
 
 ```
 Pi 3B+  --MJPEG /record/*-->  Pi 5  --USB-->  EV3 (A=pan, B=tilt)
@@ -440,7 +443,7 @@ camera:
   port: 8000
   framerate: 30
   resolution: {width: 1280, height: 960}
-  tuning_file: null        # automatic sensor tuning; Pi4 selects its IMX219 JSON
+  tuning_file: null        # standard IMX219 tuning on Pi3B+; Pi4 selects its custom JSON
   token: null              # Bearer for /record/* ; empty = open LAN
   max_stream_clients: 4
 
