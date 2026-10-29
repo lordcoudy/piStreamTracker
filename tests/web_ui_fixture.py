@@ -1,8 +1,10 @@
 """Hardware-free Flask fixture for the standalone browser regression checks."""
 
 import argparse
+import json
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -42,6 +44,9 @@ class PendingCameraLifecycle:
         self.tracker = None
         return {'status': 'ok'}
 
+    def cancel_scheduled_start(self):
+        pass
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -59,7 +64,10 @@ def main():
     def fixture_state():
         return jsonify({'stop_calls': lifecycle.stop_calls})
 
-    web_app.app.run(host='127.0.0.1', port=args.port, threaded=True, debug=False)
+    with TemporaryDirectory(prefix='pistream-ui-') as temporary:
+        web_app._config_path = Path(temporary) / 'config.yaml'
+        web_app._config_path.write_text(json.dumps(web_app._config), encoding='utf-8')
+        web_app.app.run(host='127.0.0.1', port=args.port, threaded=True, debug=False)
 
 
 if __name__ == '__main__':

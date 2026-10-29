@@ -425,6 +425,14 @@
         .camera-settings fieldset:disabled {
             opacity: 0.65;
         }
+        .camera-settings input:disabled, .camera-settings select:disabled {
+            opacity: 0.65;
+            cursor: not-allowed;
+        }
+        .camera-fields-grid .camera-fields-heading {
+            grid-column: 1 / -1;
+            margin: 8px 0 0;
+        }
         .camera-manual, .camera-help {
             grid-column: 1 / -1;
         }

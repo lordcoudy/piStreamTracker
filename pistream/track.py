@@ -493,7 +493,7 @@ class HumanTracker:
             if enabled:
                 return self.motors.connect()
             self.motors.disconnect()
-            return True
+            return getattr(self.motors, 'cleanup_pending', False) is not True
 
     def start_recording(self):
         """Start video recording.
@@ -674,7 +674,7 @@ class HumanTracker:
     @property
     def cleanup_pending(self) -> bool:
         with self._record_lock:
-            return any(
+            return getattr(self.motors, 'cleanup_pending', False) is True or any(
                 resource is not None and not getattr(resource, 'closed', True)
                 for resource in (self._async_detector, self.capture)
             ) or self.remote_stop_pending or (

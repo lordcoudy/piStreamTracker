@@ -25,6 +25,7 @@ models/*.tflite
 # Temporary files
 .DS_Store
 .standalone.lock
+.*.yaml.lock
 
 # Recordings
 recordings/

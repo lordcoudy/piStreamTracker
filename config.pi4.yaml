@@ -16,6 +16,12 @@ camera:
   exposure_mode: auto  # keeps brightness in dim light, with 50 Hz flicker correction
   exposure_time_us: 30000  # starting value when switching to manual exposure
   analogue_gain: 10.66
+  brightness: 0.0
+  contrast: 1.0
+  saturation: 1.0
+  sharpness: 1.0
+  noise_reduction: fast
+  exposure_value: 0.0  # EV compensation only while exposure_mode is auto
   jpeg_quality: 80
   tuning_file: "tuning/imx219-160-colour.json"
   recording_dir: "camera-recordings"

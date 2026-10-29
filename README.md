@@ -1,6 +1,6 @@
 # piStreamTracker
 
-Follow-cam for a lecturer: run an IMX219 CSI camera, MoveNet + OpenCV tracking, a web UI and two SG90 pan/tilt servos on one Raspberry Pi 4, or use the Pi 3B+ IMX219 camera → Pi 5 tracker → USB EV3 setup.
+Follow-cam for a lecturer: run an IMX219 CSI camera, MoveNet + OpenCV tracking, a web UI and two SG90 pan/tilt servos on one Raspberry Pi 4, or use a Pi 4/Pi 3B+ IMX219 camera → Pi 5 tracker → USB EV3 setup.
 
 Run application Python processes as an ordinary user. The standalone setup keeps existing Ethernet/Wi-Fi settings; the two-Pi setup assigns its Ethernet addresses once (EV3 access uses udev).
 
@@ -8,7 +8,7 @@ Run application Python processes as an ordinary user. The standalone setup keeps
 
 | Device | Role | Address |
 |--------|------|---------|
-| Raspberry Pi 3B+ | IMX219 camera + MJPEG (and optional H.264 record) | 192.168.100.1 |
+| Raspberry Pi 4 (Pi 3B+ also supported) | IMX219 camera + MJPEG + H.264 recording | 192.168.100.1 |
 | Raspberry Pi 5 | Detection, web UI, EV3 | 192.168.100.2 |
 | EV3 brick (USB) | Port A pan, port B tilt | — |
 
@@ -19,10 +19,59 @@ The Pi 3B+ and Pi 4 use the same IMX219 camera module and share the
 from the supplied Pi 4 project.
 
 ```
-Pi 3B+  --MJPEG /record/*-->  Pi 5  --USB-->  EV3 (A=pan, B=tilt)
+Camera  --MJPEG /record/*-->  Pi 5  --USB-->  EV3 (A=pan, B=tilt)
 192.168.100.1                 192.168.100.2
 camera.py                     tracker.py  or  web.py
 ```
+
+The current `config.yaml` was checked on a camera Pi 4 (`pi3.local`) and tracker
+Pi 5 on 2026-10-29: 1280×960, 4:3, 30 capture/recording FPS, JPEG quality 80,
+camera-side H.264 and two MoveNet threads. The current saved exposure mode is Auto, with a retained manual draft of
+33.3 ms / gain 10.66. Its room-light WB is red 1.1368712 /
+blue 1.86235795; use automatic WB after lighting changes. Confidence 0.4 retained
+the dim-room person detection that was borderline at 0.5, and the exit check
+showed no detections in the final ten seconds. The `pi5` launcher preset keeps
+two threads; fast/quality presets are separate choices.
+
+EV3 directions were checked with small manual moves: pan inversion false,
+tilt inversion true, max speed 25 and cooldown 0.25 seconds on this mechanism.
+The operator confirmed horizontal and vertical following and stopping after
+leaving the frame. Other mechanisms need their own direction check.
+
+EV3 keep-alive resets the brick's sleep timer immediately on connection and
+every 60 seconds while connected. It sends the official
+[LEGO keep-alive command, page 99](https://www.lego.com/cdn/cs/set/assets/blt77bd61c3ac436ea3/LEGO_MINDSTORMS_EV3_Firmware_Developer_Kit.pdf),
+without moving motors or changing the sleep setting. Set
+`ev3.keep_alive_interval` to 1–300 seconds, or null to disable it. **Stop** or
+disconnect ends keep-alive; a disconnected brick can sleep normally.
+
+USB replies have a one-second transaction deadline, and Stop sends each motor's
+stop command without a preliminary state query. USB resources are released
+explicitly so Start works again after Stop. If release fails, the web interface
+retains the owner and shows an error; press Stop again to retry before starting
+a replacement session.
+
+Camera-only/raw preview automatically recovers after a camera restart or network
+interruption. It displays No Signal during the outage and keeps the same viewer
+connection; **Hide camera** releases that connection. An unavailable raw source
+still falls back to processed preview when an active tracker can supply it.
+
+For a Pi 4 used as the separate camera host, choose the camera installation role:
+`./setup.sh --camera --config config.yaml`. If a third-party IMX219 is not
+autodetected, the tested `/boot/firmware/config.txt` configuration is:
+
+```ini
+[all]
+camera_auto_detect=0
+dtoverlay=imx219
+```
+
+Reboot the camera Pi after that change. See the
+[official manual camera configuration](https://www.raspberrypi.com/documentation/accessories/camera-software.html#configuration).
+The tested Bookworm camera venv uses NumPy 1.26.4 / OpenCV contrib 4.9.0.80.
+An independently upgraded NumPy 2.x / OpenCV 5 combination caused `simplejpeg`
+to fail with `numpy.dtype size changed`; restoring the project's dependency
+bounds fixed imports. Picamera2/libcamera remain installed through apt.
 
 ## Features
 
@@ -30,7 +79,7 @@ camera.py                     tracker.py  or  web.py
 - Aims at the upper half of the box (head/torso)
 - EV3 pan/tilt with deadzone, home-hold after Reset, D-pad
 - GPIO SG90 commands through local `pigpiod`, independent calibration and mechanical limits, speed caps, and a fresh-frame watchdog
-- Web UI: overlay or raw-camera proxy, zoom, horizon preview, recordings
+- Web UI: camera-only or annotated preview, saved image/preview settings, zoom, horizon preview, recordings
 - Local H.264 (ffmpeg, hardware when available) or camera-side H.264/MP4 via Picamera2/PyavOutput
 - Stream reconnects after a camera reboot; status shows `stream_lost`
 - Optional Bearer token on every `/record/*` operation; cap on concurrent `/stream` clients
@@ -132,11 +181,30 @@ or recording. **Start** opens the preview, and **Stop** keeps camera-only viewin
 available. The tracking-overlay preference is kept for the next tracking session.
 
 The **Camera settings** panel below the preview changes and saves capture format,
-FPS, white balance and exposure on the camera Pi. **Save & apply** writes the
+FPS, white balance, exposure, brightness, contrast, saturation, sharpness,
+noise reduction and exposure compensation on the camera Pi. **Save & apply** writes the
 camera service's active YAML atomically; changes survive service restarts and
 reboots. It offers 1280×720/1920×1080 at 16:9 and 1280×960 at 4:3, with 25 or
 30 camera frames/s. Format/FPS changes briefly stop and resume an active tracker;
-recording must be stopped first. Other tracker settings remain session-only.
+recording must be stopped first. Unsupported image controls are disabled.
+Exposure compensation is measured in EV stops and applies only with automatic
+exposure; its saved value is retained while manual exposure is selected.
+Neutral values are brightness/EV 0 and contrast/saturation/sharpness 1.
+Noise reduction offers Off, Fast, High quality and Minimal; Fast preserves the
+existing video default. Higher sharpening can emphasize noise, and stronger
+denoising can smooth fine detail.
+
+The separate **Web preview** panel saves resolution (maximum edge, retaining
+aspect ratio) and JPEG quality on the tracker Pi. Native uses the camera's
+dimensions; smaller limits never upscale the source. These settings affect both
+annotated and camera-only viewing, without changing capture, detection or video
+recordings. Both preview paths now resize/re-encode at the configured preview
+FPS budget; camera-only viewing also incurs that processing cost. The defaults
+are a 640-pixel maximum edge and JPEG quality 70. Save updates an existing viewer
+and keeps a hidden viewer hidden, without starting/stopping the tracker or
+consuming pending autostart. Both settings panels persist across service restarts.
+On a standalone Pi, shared file locking prevents concurrent camera/preview saves
+from overwriting each other's YAML fields. Other tracker settings remain session-only.
 
 The supplied Pi 4 was measured at 25.000 capture frames/s (39,999 µs frame
 duration). IMX219 uses the binned 1640×1232/10-bit sensor mode for 720p and
@@ -460,7 +528,8 @@ first use; the synthetic stream exercises controls and transport, not pose quali
 | Start / Stop | Starts/stops tracking and cancels a pending automatic start. Start connects to the camera stream and fails if it is down. |
 | Home / Reset | Clears detection and homes the selected controller; auto-track holds for its configured `home_hold` |
 | Record / Screenshot | Local files under `tracker.output_dir`, or camera Pi if `recording_mode: camera`; an unreachable camera recorder falls back locally |
-| Tracking overlay | Off = proxy the camera MJPEG (lowest delay). On = annotated preview at `preview_max_fps` / `preview_max_edge` |
+| Tracking overlay | Off = camera image without annotations. On = tracked annotations. Both use saved Web preview resolution/quality and `preview_max_fps`. |
+| Camera settings / Web preview | Independent saved camera image controls and browser resolution/JPEG quality; preview saves keep hidden viewing off. |
 | Auto-Level | Rotate the **preview** to level shoulders/hips; motors still use the raw box |
 | D-pad / Zoom | Manual pan/tilt; digital zoom on the preview only |
 | Recordings | Lists, downloads, and deletes `.mp4` / `.avi` / stills from both Pis. Active recordings cannot be deleted. |
@@ -507,11 +576,17 @@ camera:
   exposure_mode: auto      # auto | manual
   exposure_time_us: 20000  # used in manual exposure, must fit one frame
   analogue_gain: 1.0       # used in manual exposure
+  brightness: 0.0         # -1..1
+  contrast: 1.0           # 0..32
+  saturation: 1.0         # 0..32
+  sharpness: 1.0          # 0..16
+  noise_reduction: fast   # off | fast | high_quality | minimal
+  exposure_value: 0.0     # -8..8 EV stops, automatic exposure only
   token: null              # Bearer for /record/* and /camera/settings; empty = open LAN
   max_stream_clients: 4
 
 tracker:
-  recording_mode: local    # or camera (files on the 3B+)
+  recording_mode: camera   # hardware H.264 on camera Pi; local enables tracker encoding
   recording_encoder: auto  # h264_v4l2m2m | libx264 | mjpg
   recording_fps: 30        # capped to camera.framerate
   detection:
@@ -521,7 +596,10 @@ tracker:
 
 ev3:
   deadzone: {x: 90, y: 90}
-  max_speed: 50
+  max_speed: 25
+  invert: {x: false, y: true}  # measured on the current mechanism
+  cooldown: 0.25
+  keep_alive_interval: 60  # while connected; null disables
   home_hold: 3.0
   ports: {pan: "a", tilt: "b"}
 

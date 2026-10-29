@@ -12,6 +12,24 @@
         let previewRequestPending = false;
         let previewMode = null;
         let previewRevision = 0;
+        let previewSettings = null;
+        let previewSettingsPending = false;
+        const cameraImageFields = [
+            { key: 'brightness', control: 'Brightness', label: 'Brightness', min: -1, max: 1, default: 0 },
+            { key: 'contrast', control: 'Contrast', label: 'Contrast', min: 0, max: 32, default: 1 },
+            { key: 'saturation', control: 'Saturation', label: 'Saturation', min: 0, max: 32, default: 1 },
+            { key: 'sharpness', control: 'Sharpness', label: 'Sharpness', min: 0, max: 16, default: 1 },
+            { key: 'exposure_value', control: 'ExposureValue', label: 'Exposure compensation', min: -8, max: 8, default: 0 },
+        ];
+        const noiseReductionModes = ['off', 'fast', 'high_quality', 'minimal'];
+
+        function cameraImageId(key) {
+            return 'camera-' + key.replaceAll('_', '-');
+        }
+
+        function hasCameraControl(name) {
+            return Object.prototype.hasOwnProperty.call(cameraLimits, name);
+        }
 
         function reconnectPreview() {
             if (!previewEnabled) return;
@@ -115,6 +133,24 @@
                 document.getElementById(id).min = Math.max(0.1, cameraLimit('ColourGains', 'min', 0.1));
                 document.getElementById(id).max = Math.min(8, cameraLimit('ColourGains', 'max', 8));
             }
+            const manualExposure = document.getElementById('camera-exposure-mode').value === 'manual';
+            for (const field of cameraImageFields) {
+                const input = document.getElementById(cameraImageId(field.key));
+                input.min = Math.max(field.min, cameraLimit(field.control, 'min', field.min));
+                input.max = Math.min(field.max, cameraLimit(field.control, 'max', field.max));
+                input.disabled = !hasCameraControl(field.control) || (field.key === 'exposure_value' && manualExposure);
+                input.title = hasCameraControl(field.control) ? '' : 'Unsupported by this camera';
+            }
+            const noise = document.getElementById('camera-noise-reduction');
+            noise.disabled = !hasCameraControl('NoiseReductionMode');
+            noise.title = noise.disabled ? 'Unsupported by this camera' : '';
+            for (const option of noise.options) {
+                const value = noiseReductionModes.indexOf(option.value);
+                option.disabled = value < cameraLimit('NoiseReductionMode', 'min', 0) || value > cameraLimit('NoiseReductionMode', 'max', 3);
+            }
+            document.getElementById('camera-ev-hint').textContent = manualExposure
+                ? 'Exposure compensation is saved for Auto exposure; it has no effect in Manual mode. Unsupported controls are disabled.'
+                : 'Exposure compensation applies to Auto exposure. Unsupported controls are disabled for this camera.';
         }
 
         function updateCameraAvailability() {
@@ -163,26 +199,30 @@
             document.getElementById('camera-exposure-mode').value = settings.exposure_mode;
             document.getElementById('camera-exposure-ms').value = (settings.exposure_time_us || 20000) / 1000;
             document.getElementById('camera-analogue-gain').value = settings.analogue_gain || 1;
+            for (const field of cameraImageFields) {
+                document.getElementById(cameraImageId(field.key)).value = settings[field.key] ?? field.default;
+            }
+            document.getElementById('camera-noise-reduction').value = settings.noise_reduction ?? 'fast';
             updateCameraManualFields();
             showCameraReadings(payload.metadata);
             setStreamDimensions(width, height);
         }
 
-        async function cameraSettingsRequest(method = 'GET', settings) {
+        async function savedSettingsRequest(endpoint, label, method = 'GET', settings) {
             const options = { method };
             if (settings) {
                 options.headers = { 'Content-Type': 'application/json' };
                 options.body = JSON.stringify(settings);
             }
-            const response = await fetch('/api/camera/settings', options);
+            const response = await fetch('/api/' + endpoint, options);
             let payload;
             try {
                 payload = await response.json();
             } catch (_) {
-                throw new Error('Camera settings are unavailable (' + response.status + ').');
+                throw new Error(label + ' are unavailable (' + response.status + ').');
             }
-            if (!response.ok || !payload || payload.status !== 'ok') {
-                throw new Error((payload && payload.message) || 'Camera settings are unavailable (' + response.status + ').');
+            if (!response.ok || !payload || (payload.status !== undefined && payload.status !== 'ok')) {
+                throw new Error((payload && payload.message) || label + ' are unavailable (' + response.status + ').');
             }
             return payload;
         }
@@ -193,7 +233,7 @@
             updateCameraAvailability();
             cameraMessage('Loading camera settings…');
             try {
-                showCameraSettings(await cameraSettingsRequest());
+                showCameraSettings(await savedSettingsRequest('camera/settings', 'Camera settings'));
                 cameraMessage('Saved camera settings loaded.');
             } catch (error) {
                 cameraMessage(error.message + ' Use Reload saved to retry.', 'error');
@@ -235,6 +275,14 @@
                         : Math.min(cameraSettings.exposure_time_us, Math.floor(1000000 / framerate)),
                     analogue_gain: exposure_mode === 'manual' ? cameraNumber('camera-analogue-gain', 'Analogue gain') : cameraSettings.analogue_gain,
                 };
+                for (const field of cameraImageFields) {
+                    if (hasCameraControl(field.control)) settings[field.key] = cameraNumber(cameraImageId(field.key), field.label);
+                }
+                if (hasCameraControl('NoiseReductionMode')) {
+                    const noise = document.getElementById('camera-noise-reduction');
+                    if (!noiseReductionModes.includes(noise.value) || noise.selectedOptions[0].disabled) throw new Error('Choose a supported noise reduction mode.');
+                    settings.noise_reduction = noise.value;
+                }
             } catch (error) {
                 cameraMessage(error.message, 'error');
                 return;
@@ -243,7 +291,7 @@
             updateUI();
             cameraMessage('Applying camera settings…');
             try {
-                const payload = await cameraSettingsRequest('POST', settings);
+                const payload = await savedSettingsRequest('camera/settings', 'Camera settings', 'POST', settings);
                 showCameraSettings(payload);
                 reconnectPreview();
                 if (payload.warning) {
@@ -259,6 +307,79 @@
             } finally {
                 cameraSettingsPending = false;
                 updateUI();
+            }
+        }
+
+        function previewSettingsMessage(message, type = '') {
+            const element = document.getElementById('preview-settings-status');
+            element.textContent = message;
+            element.className = 'camera-message' + (type ? ' ' + type : '');
+        }
+
+        function updatePreviewSettingsAvailability() {
+            document.getElementById('preview-settings-fields').disabled = previewSettingsPending || !previewSettings;
+            document.getElementById('preview-settings-save').disabled = previewSettingsPending || !previewSettings;
+            document.getElementById('preview-settings-reload').disabled = previewSettingsPending;
+            document.getElementById('preview-settings-save').textContent = previewSettingsPending ? 'Applying…' : 'Save & apply preview';
+            document.getElementById('preview-settings-form').setAttribute('aria-busy', String(previewSettingsPending));
+        }
+
+        function showPreviewSettings(payload) {
+            const settings = payload.settings;
+            if (!settings || !Number.isInteger(settings.max_edge) || settings.max_edge < 0 || settings.max_edge > 16384 ||
+                !Number.isInteger(settings.quality) || settings.quality < 1 || settings.quality > 100) {
+                throw new Error('Invalid preview settings from server');
+            }
+            previewSettings = settings;
+            const size = document.getElementById('preview-max-edge');
+            if (!Array.from(size.options).some(option => Number(option.value) === settings.max_edge)) {
+                size.add(new Option(settings.max_edge + ' px · saved', settings.max_edge));
+            }
+            size.value = settings.max_edge;
+            document.getElementById('preview-quality').value = settings.quality;
+        }
+
+        async function loadPreviewSettings() {
+            if (previewSettingsPending) return;
+            previewSettingsPending = true;
+            updatePreviewSettingsAvailability();
+            previewSettingsMessage('Loading preview settings…');
+            try {
+                showPreviewSettings(await savedSettingsRequest('preview/settings', 'Preview settings'));
+                previewSettingsMessage('Saved preview settings loaded.');
+            } catch (error) {
+                previewSettingsMessage(error.message + ' Use Reload saved to retry.', 'error');
+            } finally {
+                previewSettingsPending = false;
+                updatePreviewSettingsAvailability();
+            }
+        }
+
+        async function savePreviewSettings(event) {
+            event.preventDefault();
+            if (document.getElementById('preview-settings-save').disabled) return;
+            let settings;
+            try {
+                const max_edge = Number(document.getElementById('preview-max-edge').value);
+                const quality = cameraNumber('preview-quality', 'JPEG quality');
+                if (!Number.isInteger(max_edge) || max_edge < 0 || max_edge > 16384) throw new Error('Choose a supported preview size.');
+                if (!Number.isInteger(quality)) throw new Error('JPEG quality must be an integer.');
+                settings = { max_edge, quality };
+            } catch (error) {
+                previewSettingsMessage(error.message, 'error');
+                return;
+            }
+            previewSettingsPending = true;
+            updatePreviewSettingsAvailability();
+            previewSettingsMessage('Applying preview settings…');
+            try {
+                showPreviewSettings(await savedSettingsRequest('preview/settings', 'Preview settings', 'POST', settings));
+                previewSettingsMessage('Preview settings saved and applied.', 'success');
+            } catch (error) {
+                previewSettingsMessage(error.message, 'error');
+            } finally {
+                previewSettingsPending = false;
+                updatePreviewSettingsAvailability();
             }
         }
 
@@ -650,4 +771,5 @@
         updateStatus();
         loadConfig();
         loadCameraSettings();
+        loadPreviewSettings();
         log('Web interface loaded');

@@ -18,15 +18,33 @@ CONTROL_DEFAULTS = {
     'exposure_mode': 'auto',
     'exposure_time_us': 20000,
     'analogue_gain': 1.0,
+    'brightness': 0.0,
+    'contrast': 1.0,
+    'saturation': 1.0,
+    'sharpness': 1.0,
+    'exposure_value': 0.0,
+    'noise_reduction': 'fast',
 }
 SETTING_KEYS = frozenset({'resolution', 'framerate', *CONTROL_DEFAULTS})
 RESOLUTIONS = {(1280, 720), (1280, 960), (1920, 1080)}
 AWB_MODES = {'auto': 0, 'indoor': 4, 'daylight': 5, 'cloudy': 6}
+NOISE_REDUCTION_MODES = {'off': 0, 'fast': 1, 'high_quality': 2, 'minimal': 3}
+IMAGE_RANGES = {
+    'brightness': (-1, 1), 'contrast': (0, 32), 'saturation': (0, 32),
+    'sharpness': (0, 16), 'exposure_value': (-8, 8),
+}
+IMAGE_CONTROLS = {
+    'brightness': 'Brightness', 'contrast': 'Contrast', 'saturation': 'Saturation',
+    'sharpness': 'Sharpness', 'exposure_value': 'ExposureValue',
+    'noise_reduction': 'NoiseReductionMode',
+}
 METADATA_KEYS = {
     'ExposureTime', 'AnalogueGain', 'DigitalGain', 'ColourGains',
     'ColourTemperature', 'FrameDuration', 'Lux', 'SensorTimestamp',
+    *IMAGE_CONTROLS.values(),
 }
-LIMIT_KEYS = ('ExposureTime', 'AnalogueGain', 'ColourGains', 'FrameDurationLimits')
+LIMIT_KEYS = ('ExposureTime', 'AnalogueGain', 'ColourGains', 'FrameDurationLimits',
+              *IMAGE_CONTROLS.values())
 
 
 def _number(value, name, minimum, maximum):
@@ -34,7 +52,7 @@ def _number(value, name, minimum, maximum):
         raise ValueError(f'{name} must be a number')
     try:
         value = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f'{name} must be a number') from exc
     if not math.isfinite(value) or not minimum <= value <= maximum:
         raise ValueError(f'{name} must be finite and between {minimum:g} and {maximum:g}')
@@ -72,6 +90,11 @@ def validate_camera_controls(camera: dict) -> dict:
         camera['exposure_time_us'], 'camera.exposure_time_us', 1, 1000000
     )
     camera['analogue_gain'] = _number(camera['analogue_gain'], 'camera.analogue_gain', 1, 16)
+    for key, (minimum, maximum) in IMAGE_RANGES.items():
+        camera[key] = _number(camera[key], f'camera.{key}', minimum, maximum)
+    camera['noise_reduction'] = _mode(
+        camera['noise_reduction'], 'camera.noise_reduction', NOISE_REDUCTION_MODES
+    )
     if camera['exposure_mode'] == 'manual':
         _validate_exposure_budget(camera)
     return camera
@@ -96,6 +119,15 @@ def controls_for_settings(settings: dict, available_controls: dict | None = None
     if settings['exposure_mode'] == 'manual':
         controls['ExposureTime'] = settings['exposure_time_us']
         controls['AnalogueGain'] = settings['analogue_gain']
+    for key, name in IMAGE_CONTROLS.items():
+        value = settings.get(key, CONTROL_DEFAULTS[key])
+        if available_controls is not None and name not in available_controls:
+            if value != CONTROL_DEFAULTS[key]:
+                raise ValueError(f'camera.{key} ({name}) is not supported by this camera')
+            continue
+        if key == 'exposure_value' and settings['exposure_mode'] == 'manual':
+            continue  # Retain the saved draft until automatic exposure is enabled.
+        controls[name] = NOISE_REDUCTION_MODES[value] if key == 'noise_reduction' else value
     if available_controls and {'AeFlickerMode', 'AeFlickerPeriod'} <= available_controls.keys():
         controls.update(AeFlickerMode=1, AeFlickerPeriod=10000)
     return controls
@@ -125,7 +157,8 @@ class CameraSettings:
         self.camera = camera
         self.reconfigure = reconfigure
         self._lock = lock if lock is not None else RLock()
-        self._settings = {key: copy.deepcopy(config['camera'][key]) for key in SETTING_KEYS}
+        camera_settings = validate_camera_controls(copy.deepcopy(config['camera']))
+        self._settings = {key: camera_settings[key] for key in SETTING_KEYS}
 
     def snapshot(self):
         with self._lock:
@@ -171,9 +204,16 @@ class CameraSettings:
         _validate_exposure_budget(candidate)
         return candidate
 
-    def _validate_hardware(self, settings):
-        controls = controls_for_settings(settings)
+    def _validate_hardware(self, settings, requested):
         available = getattr(self.camera, 'camera_controls', {})
+        for key in requested:
+            if key in IMAGE_CONTROLS and IMAGE_CONTROLS[key] not in available:
+                raise ValueError(f'camera.{key} ({IMAGE_CONTROLS[key]}) is not supported by this camera')
+        controls = controls_for_settings(settings, available)
+        # EV is stored in manual exposure mode, but must still fit this camera
+        # so it can be applied when autoexposure is restored.
+        if 'ExposureValue' in available:
+            controls['ExposureValue'] = settings['exposure_value']
         for name in LIMIT_KEYS:
             if name not in controls or name not in available:
                 continue
@@ -195,14 +235,14 @@ class CameraSettings:
     def update(self, patch):
         with self._lock:
             candidate = self._candidate(patch)
-            self._validate_hardware(candidate)
+            self._validate_hardware(candidate, patch)
             previous = self._settings
             geometry_changed = any(candidate[key] != previous[key]
                                    for key in ('resolution', 'framerate'))
             try:
                 if geometry_changed:
                     self.reconfigure(copy.deepcopy(candidate))
-                    self._validate_hardware(candidate)
+                    self._validate_hardware(candidate, patch)
                 self._apply_controls(candidate)
                 self._save(candidate)
             except Exception as error:
@@ -218,6 +258,12 @@ class CameraSettings:
             return self._snapshot()
 
     def _save(self, settings):
+        from pistream.config_store import config_file_lock
+
+        with config_file_lock(self.path):
+            self._save_locked(settings)
+
+    def _save_locked(self, settings):
         # Re-read here so an unrelated edit since service startup is preserved.
         if self.path.exists():
             with self.path.open(encoding='utf-8') as handle:

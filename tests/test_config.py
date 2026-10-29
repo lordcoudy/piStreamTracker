@@ -34,6 +34,16 @@ def _base():
 
 
 class ApplyPresetTests(unittest.TestCase):
+    def test_pi5_launcher_preset_preserves_the_live_two_pi_camera_and_thread_budget(self):
+        cfg = load_config(str(Path(__file__).resolve().parents[1] / 'config.yaml'))
+        before = cfg['camera'].copy()
+        threads = cfg['tracker']['movenet']['threads']
+        result = apply_preset(cfg, 'pi5')
+        self.assertEqual(result['tracker']['movenet']['threads'], threads)
+        self.assertEqual(result['camera'], before)
+        self.assertGreaterEqual(result['camera']['framerate'], 25)
+        self.assertGreaterEqual(result['camera']['resolution']['height'], 720)
+
     def test_fast_preset_overrides_scale(self):
         cfg = apply_preset(_base(), 'fast')
         self.assertEqual(cfg['tracker']['detection']['scale'], 0.35)
@@ -72,6 +82,50 @@ class CliOverrideTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, 'positive integer'):
             apply_cli_overrides(_base(), args)
+
+
+class EV3KeepAliveConfigTests(unittest.TestCase):
+    def test_missing_field_defaults_to_one_minute(self):
+        with TemporaryDirectory() as tmp:
+            config = load_config(str(Path(tmp) / 'missing.yaml'))
+        self.assertEqual(config['ev3']['keep_alive_interval'], 60)
+
+    def test_interval_can_be_disabled_or_configured_in_seconds(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            for value, expected in (('null', None), ('1', 1), ('2.5', 2.5), ('300', 300)):
+                with self.subTest(value=value):
+                    path.write_text(f'ev3:\n  keep_alive_interval: {value}\n')
+                    self.assertEqual(load_config(str(path))['ev3']['keep_alive_interval'], expected)
+
+    def test_invalid_keep_alive_interval_fails_before_usb_acquisition(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            for value in ('true', 'false', '0', '-1', '301', '.nan', '.inf', '-.inf', '[]', 'later'):
+                with self.subTest(value=value):
+                    path.write_text(f'ev3:\n  keep_alive_interval: {value}\n')
+                    with self.assertRaisesRegex(ValueError, 'ev3.keep_alive_interval'):
+                        load_config(str(path))
+
+
+class CameraImageControlsConfigTests(unittest.TestCase):
+    def test_legacy_config_keeps_manual_exposure_and_wb_with_neutral_image_controls(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.yaml'
+            path.write_text('camera:\n  exposure_mode: manual\n  exposure_time_us: 33300\n'
+                            '  analogue_gain: 10.66\n  awb_mode: manual\n'
+                            '  colour_gains: [1.1368712, 1.86235795]\n')
+            camera = load_config(str(path))['camera']
+        self.assertEqual(camera['exposure_mode'], 'manual')
+        self.assertEqual(camera['exposure_time_us'], 33300)
+        self.assertEqual(camera['analogue_gain'], 10.66)
+        self.assertEqual(camera['colour_gains'], [1.1368712, 1.86235795])
+        self.assertEqual(camera['brightness'], 0)
+        self.assertEqual(camera['contrast'], 1)
+        self.assertEqual(camera['saturation'], 1)
+        self.assertEqual(camera['sharpness'], 1)
+        self.assertEqual(camera['noise_reduction'], 'fast')
+        self.assertEqual(camera['exposure_value'], 0)
 
 
 class MotorBackendTests(unittest.TestCase):

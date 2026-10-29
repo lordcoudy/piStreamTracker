@@ -17,6 +17,12 @@ class FakeCamera:
         'AnalogueGain': (1.0, 10.0, 1.0),
         'ColourGains': (0.0, 32.0, None),
         'FrameDurationLimits': (20000, 100000, None),
+        'Brightness': (-1.0, 1.0, 0.0),
+        'Contrast': (0.0, 32.0, 1.0),
+        'Saturation': (0.0, 32.0, 1.0),
+        'Sharpness': (0.0, 16.0, 1.0),
+        'ExposureValue': (-8.0, 8.0, 0.0),
+        'NoiseReductionMode': (0, 4, 0),
     }
 
     def __init__(self):
@@ -66,6 +72,142 @@ def test_old_config_gets_automatic_controls_without_changing_geometry(tmp_path):
     assert camera['exposure_mode'] == 'auto'
     assert camera['exposure_time_us'] == 20000
     assert camera['analogue_gain'] == 1.0
+    assert {key: camera[key] for key in IMAGE_SETTINGS} == IMAGE_SETTINGS
+
+
+IMAGE_SETTINGS = {
+    'brightness': 0.0, 'contrast': 1.0, 'saturation': 1.0,
+    'sharpness': 1.0, 'exposure_value': 0.0, 'noise_reduction': 'fast',
+}
+
+
+def test_image_settings_apply_live_and_persist_without_changing_existing_controls(setup_manager):
+    manager, camera, path, config, changes = setup_manager
+    original = manager.snapshot()['settings']
+    desired = {'brightness': -0.2, 'contrast': 1.4, 'saturation': 0.8,
+               'sharpness': 2.5, 'exposure_value': 0.5, 'noise_reduction': 'high_quality'}
+    result = manager.update(desired)
+    assert all(result['settings'][key] == value for key, value in desired.items())
+    assert all(result['settings'][key] == value for key, value in original.items()
+               if key not in desired)
+    assert camera.controls[-1] == {
+        **controls_for_settings(original), 'Brightness': -0.2, 'Contrast': 1.4,
+        'Saturation': 0.8, 'Sharpness': 2.5, 'ExposureValue': 0.5, 'NoiseReductionMode': 2,
+    }
+    assert changes == []
+    saved = yaml.safe_load(path.read_text())
+    assert saved['camera']['token'] == 'preserved-token'
+    reloaded = CameraSettings(path, load_config(str(path)), camera, changes.append)
+    assert reloaded.snapshot()['settings'] == result['settings']
+    assert config['camera']['sharpness'] == 2.5
+
+
+@pytest.mark.parametrize('name,value', [
+    ('brightness', -1.1), ('brightness', 1.1), ('brightness', True),
+    ('contrast', -0.1), ('contrast', 33), ('contrast', float('nan')),
+    ('contrast', 10 ** 400),
+    ('saturation', -1), ('saturation', 33), ('saturation', float('inf')),
+    ('sharpness', -1), ('sharpness', 17), ('sharpness', False),
+    ('exposure_value', -9), ('exposure_value', 9), ('exposure_value', float('-inf')),
+    ('noise_reduction', 'zsl'), ('noise_reduction', 1), ('noise_reduction', None),
+])
+def test_invalid_image_setting_is_rejected_on_update_and_startup(setup_manager, name, value):
+    manager, camera, path, config, changes = setup_manager
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match=f'camera.{name}'):
+        manager.update({name: value})
+    assert path.read_bytes() == original
+    assert camera.controls == []
+    document = yaml.safe_load(path.read_text())
+    document['camera'][name] = value
+    path.write_text(yaml.safe_dump(document))
+    with pytest.raises(ValueError, match=f'camera.{name}'):
+        load_config(str(path))
+
+
+@pytest.mark.parametrize('mode,number', [
+    ('off', 0), ('fast', 1), ('high_quality', 2), ('minimal', 3),
+])
+def test_noise_reduction_uses_installed_libcamera_enum(setup_manager, mode, number):
+    manager, camera, path, config, changes = setup_manager
+    manager.update({'noise_reduction': mode})
+    assert camera.controls[-1]['NoiseReductionMode'] == number
+
+
+def test_noise_reduction_and_image_controls_report_hardware_limits(setup_manager):
+    manager, camera, path, config, changes = setup_manager
+    limits = manager.snapshot()['limits']
+    assert limits['Brightness'] == {'min': -1.0, 'max': 1.0, 'default': 0.0}
+    assert limits['Sharpness'] == {'min': 0.0, 'max': 16.0, 'default': 1.0}
+    assert limits['NoiseReductionMode'] == {'min': 0, 'max': 4, 'default': 0}
+
+
+@pytest.mark.parametrize('name,native', [
+    ('brightness', 'Brightness'), ('contrast', 'Contrast'), ('saturation', 'Saturation'),
+    ('sharpness', 'Sharpness'), ('exposure_value', 'ExposureValue'),
+    ('noise_reduction', 'NoiseReductionMode'),
+])
+def test_explicit_unsupported_image_control_is_rejected_even_at_default(setup_manager, name, native):
+    manager, camera, path, config, changes = setup_manager
+    camera.camera_controls = {key: value for key, value in camera.camera_controls.items()
+                              if key != native}
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match=f'camera.{name}.*not supported'):
+        manager.update({name: IMAGE_SETTINGS[name]})
+    assert path.read_bytes() == original
+    assert camera.controls == []
+    # Other controls still work; their default application skips the absent one.
+    manager.update({'awb_mode': 'indoor'})
+    assert native not in camera.controls[-1]
+    assert native not in manager.snapshot()['limits']
+
+
+@pytest.mark.parametrize('name,value,native,bounds', [
+    ('contrast', 2.5, 'Contrast', (0.0, 2.0, 1.0)),
+    ('sharpness', 6, 'Sharpness', (0.0, 4.0, 1.0)),
+    ('exposure_value', 6, 'ExposureValue', (-4.0, 4.0, 0.0)),
+    ('noise_reduction', 'minimal', 'NoiseReductionMode', (0, 2, 0)),
+])
+def test_image_settings_obey_narrower_hardware_limits(setup_manager, name, value, native, bounds):
+    manager, camera, path, config, changes = setup_manager
+    camera.camera_controls = {**camera.camera_controls, native: bounds}
+    with pytest.raises(ValueError, match='camera limits'):
+        manager.update({name: value})
+    assert camera.controls == []
+
+
+def test_exposure_compensation_is_saved_in_manual_mode_and_applied_with_auto_ae(setup_manager):
+    manager, camera, path, config, changes = setup_manager
+    result = manager.update({'exposure_mode': 'manual', 'exposure_time_us': 10000,
+                             'exposure_value': 1.25})
+    assert result['settings']['exposure_value'] == 1.25
+    assert 'ExposureValue' not in camera.controls[-1]
+    assert yaml.safe_load(path.read_text())['camera']['exposure_value'] == 1.25
+    manager.update({'exposure_mode': 'auto'})
+    assert camera.controls[-1]['ExposureValue'] == 1.25
+
+
+def test_image_settings_roll_back_on_persistence_failure(setup_manager):
+    manager, camera, path, config, changes = setup_manager
+    original = path.read_bytes()
+    previous = manager.snapshot()['settings']
+    with patch('pistream.camera_settings.os.replace', side_effect=OSError('disk failed')):
+        with pytest.raises(OSError, match='disk failed'):
+            manager.update({'brightness': 0.4, 'noise_reduction': 'off'})
+    assert path.read_bytes() == original
+    assert camera.controls[-1] == controls_for_settings(previous)
+    assert manager.snapshot()['settings'] == previous
+
+
+def test_legacy_helper_input_retains_native_image_defaults(setup_manager):
+    manager, camera, path, config, changes = setup_manager
+    settings = {key: value for key, value in manager.snapshot()['settings'].items()
+                if key not in IMAGE_SETTINGS}
+    controls = controls_for_settings(settings, camera.camera_controls)
+    assert controls['Brightness'] == 0
+    assert controls['Contrast'] == controls['Saturation'] == controls['Sharpness'] == 1
+    assert controls['NoiseReductionMode'] == 1
+    assert controls['ExposureValue'] == 0
 
 
 @pytest.mark.parametrize('name,value', [
@@ -143,6 +285,8 @@ def test_manual_controls_and_fixed_framerate_are_applied_and_saved(setup_manager
     assert camera.controls[-1] == {
         'AwbEnable': False, 'ColourGains': (1.7, 1.3), 'AeEnable': False,
         'ExposureTime': 10000, 'AnalogueGain': 2.0, 'FrameDurationLimits': (40000, 40000),
+        'Brightness': 0.0, 'Contrast': 1.0, 'Saturation': 1.0, 'Sharpness': 1.0,
+        'NoiseReductionMode': 1,
     }
     assert changes == []
     assert result['settings']['exposure_time_us'] == 10000

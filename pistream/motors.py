@@ -2,7 +2,7 @@
 
 import logging
 import time
-from threading import Lock
+from threading import Event, Lock, Thread, current_thread
 from typing import Optional
 
 from pistream.motors_math import compute_axis_command, motors_held
@@ -24,6 +24,7 @@ class MotorController:
         self.invert_y = config['invert']['y']
         self.cooldown = config['cooldown']
         self.home_hold = float(config.get('home_hold', 3.0))
+        self.keep_alive_interval = config.get('keep_alive_interval', 60)
         self.pan_port = config['ports']['pan']
         self.tilt_port = config['ports']['tilt']
 
@@ -35,6 +36,8 @@ class MotorController:
         self._last_cmd = 0.0
         self._hold_until = 0.0
         self._io_lock = Lock()
+        self._keep_alive_stop = Event()
+        self._keep_alive_thread = None
         self._cam_w = 1280
         self._cam_h = 960
         self.connected = False
@@ -46,6 +49,11 @@ class MotorController:
     def connect(self) -> bool:
         """Connect to EV3 via USB."""
         with self._io_lock:
+            if self.connected:
+                return True
+            if self._ev3 is not None:
+                self.error = self.error or 'EV3 USB cleanup is unfinished. Press Stop again to retry.'
+                return False
             try:
                 from pistream.ev3_usb import EV3_USB
                 logger.info("Connecting to EV3...")
@@ -68,17 +76,57 @@ class MotorController:
                     pass
 
                 self._stop_unlocked()
+                self._start_keep_alive_unlocked()
                 logger.info(f"EV3 connected (home: pan={self._pan_home}, tilt={self._tilt_home})")
                 return True
 
             except Exception as e:
                 logger.warning(f"EV3 connection failed: {e}")
-                self.connected = False
-                self.error = str(e)
+                self._keep_alive_stop.set()
+                self._release_usb_unlocked()
+                if not self.cleanup_pending:
+                    self.error = str(e)
                 return False
 
+    def _keep_alive_unlocked(self, brick):
+        """Retain a failed USB owner until explicit Stop; never reconnect here."""
+        try:
+            brick.keep_alive()
+        except Exception as exc:
+            message = f'EV3 keep-alive failed: {exc}'
+            if self.error != message:
+                logger.warning(message)
+            self.error = message
+        else:
+            if self.error and self.error.startswith('EV3 keep-alive failed:'):
+                self.error = None
+
+    def _start_keep_alive_unlocked(self):
+        if self.keep_alive_interval is None:
+            return
+        self._keep_alive_stop = stop = Event()
+        brick = self._ev3
+        self._keep_alive_unlocked(brick)
+
+        def keep_alive():
+            while not stop.wait(self.keep_alive_interval):
+                with self._io_lock:
+                    if stop.is_set() or not self.connected or self._ev3 is not brick:
+                        return
+                    self._keep_alive_unlocked(brick)
+
+        worker = Thread(target=keep_alive, name='ev3-keep-alive', daemon=True)
+        worker.start()
+        self._keep_alive_thread = worker
+
     def status(self) -> dict:
-        return {'backend': self.backend, 'connected': self.connected, 'error': self.error}
+        return {'backend': self.backend, 'connected': self.connected, 'error': self.error,
+                'cleanup_pending': self.cleanup_pending}
+
+    @property
+    def cleanup_pending(self) -> bool:
+        """A disconnected controller must retain an unconfirmed USB release."""
+        return self._ev3 is not None and not self.connected
 
     def frame_seen(self, timestamp=None):
         """EV3 finite moves retain their existing frame policy."""
@@ -124,13 +172,12 @@ class MotorController:
                 logger.debug(f"Motor error: {e}")
 
     def _stop_unlocked(self):
-        try:
-            if self._pan:
-                self._pan.stop()
-            if self._tilt:
-                self._tilt.stop()
-        except Exception:
-            pass
+        for motor in (self._pan, self._tilt):
+            try:
+                if motor is not None:
+                    motor.stop()
+            except Exception:
+                pass
 
     def stop(self):
         """Stop all motors. No-op while a home/manual hold is active."""
@@ -195,21 +242,34 @@ class MotorController:
 
     def disconnect(self):
         """Disconnect from EV3."""
+        self._keep_alive_stop.set()
         with self._io_lock:
-            if not self.connected:
+            # connect() may have created a replacement event while we waited.
+            self._keep_alive_stop.set()
+            worker = self._keep_alive_thread
+            self._keep_alive_thread = None
+            self._release_usb_unlocked()
+            if not self.cleanup_pending:
+                logger.info("EV3 disconnected")
+        if worker is not None and worker is not current_thread():
+            worker.join(timeout=1.0)
+
+    def _release_usb_unlocked(self):
+        """Release even an owner whose motor initialization was incomplete."""
+        self.connected = False
+        self._stop_unlocked()
+        if self._ev3 is not None:
+            try:
+                self._ev3.Led('orange', 'static')
+            except Exception:
+                pass
+            try:
+                self._ev3.close()
+            except Exception as exc:
+                self.error = f'EV3 USB cleanup failed: {exc}. Press Stop again to retry.'
+                logger.warning(self.error)
                 return
-            self._stop_unlocked()
-            try:
-                if self._ev3:
-                    self._ev3.Led('orange', 'static')
-            except Exception:
-                pass
-            try:
-                if self._ev3:
-                    self._ev3.close()
-            except Exception:
-                pass
-            self._pan = self._tilt = None
-            self._ev3 = None
-            self.connected = False
-            logger.info("EV3 disconnected")
+        self._pan = self._tilt = None
+        self._ev3 = None
+        if self.error and self.error.startswith('EV3 USB cleanup failed:'):
+            self.error = None
