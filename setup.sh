@@ -6,6 +6,7 @@
 #   ./setup.sh --camera
 #   ./setup.sh --tracker
 #   ./setup.sh --standalone --config config.pi4.yaml
+#   ./setup.sh --standalone --config config.pi4-ev3.yaml
 #   ./setup.sh --camera --skip-network
 #   ./setup.sh --tracker --dry-run
 #   ./setup.sh status
@@ -42,7 +43,7 @@ Usage: ./setup.sh [OPTIONS] [COMMAND] [ARGS...]
 Roles:
   --camera     Pi 3B+ camera server (192.168.100.1 from config.yaml)
   --tracker    Pi 5 tracker + EV3 (192.168.100.2 from config.yaml)
-  --standalone Pi 4 camera + GPIO servos + web UI (preserves existing networking)
+  --standalone Pi 4 camera + tracking + web UI (motor backend from config)
 
 Commands (default: install):
   install      Full automatic: network + udev (tracker) + systemd enable --now
@@ -58,6 +59,7 @@ Examples:
   ./setup.sh --camera
   ./setup.sh --tracker
   ./setup.sh --standalone --config config.pi4.yaml
+  ./setup.sh --standalone --config config.pi4-ev3.yaml
   ./setup.sh --camera --skip-network
   ./setup.sh --tracker --dry-run
   ./setup.sh status
@@ -115,9 +117,15 @@ install_system_deps() {
             python3-picamera2
     fi
     if [[ "$role" == "standalone" ]]; then
-        sudo apt-get install -y -qq rpicam-apps pigpiod python3-pigpio
+        sudo apt-get install -y -qq rpicam-apps
     fi
     print_step "System dependencies installed"
+}
+
+install_motor_system_deps() {
+    if [[ "$1" == "gpio_servo" ]]; then
+        sudo apt-get install -y -qq pigpiod python3-pigpio
+    fi
 }
 
 setup_venv() {
@@ -134,8 +142,13 @@ setup_venv() {
     print_step "Virtual environment ready"
 }
 
+configured_motor_backend() {
+    "$1" -c 'import sys; from pistream.config import load_config, motor_backend; print(motor_backend(load_config(sys.argv[1])))' "$2"
+}
+
 install_python_deps() {
     local role=$1
+    local config_path=${2:-config.yaml}
     # shellcheck disable=SC1091
     source venv/bin/activate
     pip install --upgrade pip -q
@@ -146,8 +159,24 @@ install_python_deps() {
     else
         print_step "Installing Tracker Python deps..."
         if [[ "$role" == "standalone" ]]; then
-            pip install -q -e '.[standalone]'
-            python -c 'import picamera2, libcamera, cv2, numpy, pigpio; from tflite_runtime.interpreter import Interpreter; print("Camera, OpenCV, NumPy, TFLite and pigpio imports OK")'
+            # Resolve the selected YAML before choosing GPIO-only dependencies.
+            pip install -q 'pyyaml>=6.0'
+            local backend
+            backend=$(configured_motor_backend python "$config_path")
+            if check_platform; then
+                install_motor_system_deps "$backend"
+            fi
+            if [[ "$backend" == "gpio_servo" ]]; then
+                pip install -q -e '.[standalone]'
+            else
+                pip install -q -e .
+            fi
+            python -c 'import picamera2, libcamera, cv2, numpy; from tflite_runtime.interpreter import Interpreter; print("Camera, OpenCV, NumPy and TFLite imports OK")'
+            if [[ "$backend" == "gpio_servo" ]]; then
+                python -c 'import pigpio; print("GPIO servo imports OK")'
+            elif [[ "$backend" == "ev3" ]]; then
+                python -c 'import ev3_dc; from pistream.ev3_usb import EV3_USB; print("EV3 USB imports OK")'
+            fi
         else
             pip install -q -e .
         fi
@@ -158,11 +187,13 @@ download_model() {
     print_step "Checking MoveNet runtime and model (downloads if absent)..."
     # Reuse the runtime loader's cache validation, primary URL and fallbacks.
     # Check the actual interpreter now so first Start does not need a download.
-    venv/bin/python - "$1" <<'PY'
+    venv/bin/python - "$1" "${2:-config.yaml}" <<'PY'
 import sys
+from pistream.config import load_config
 from pistream.detect import PoseDetector
 
-detector = PoseDetector(threads=2 if sys.argv[1] == 'standalone' else None)
+model = load_config(sys.argv[2])['tracker']['movenet']
+detector = PoseDetector(model_path=model.get('model_path'), threads=model.get('threads'))
 if not detector.ready:
     raise SystemExit('MoveNet initialization failed; check the runtime/model errors above and rerun setup.')
 PY
@@ -185,6 +216,7 @@ ROLE=""
 COMMAND=""
 DRY_RUN=0
 CONFIG_SET=0
+CONFIG_PATH="$SCRIPT_DIR/config.yaml"
 FORWARD=()
 
 if [[ $# -eq 0 ]]; then
@@ -220,11 +252,13 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             fi
             CONFIG_SET=1
+            CONFIG_PATH="$2"
             FORWARD+=("$1" "$2")
             shift 2
             ;;
         --config=*)
             CONFIG_SET=1
+            CONFIG_PATH="${1#--config=}"
             FORWARD+=("$1")
             shift
             ;;
@@ -288,7 +322,8 @@ if [[ -z "$pip_role" || "$pip_role" == "auto" ]]; then
 fi
 
 if [[ "$pip_role" == "standalone" && "$CONFIG_SET" -eq 0 ]]; then
-    FORWARD+=(--config "$SCRIPT_DIR/config.pi4.yaml")
+    CONFIG_PATH="$SCRIPT_DIR/config.pi4.yaml"
+    FORWARD+=(--config "$CONFIG_PATH")
 fi
 
 if [[ "$COMMAND" != "install" || "$DRY_RUN" -eq 1 ]]; then
@@ -301,9 +336,9 @@ else
         install_system_deps "$pip_role"
     fi
     setup_venv
-    install_python_deps "$pip_role"
+    install_python_deps "$pip_role" "$CONFIG_PATH"
     if [[ "$pip_role" != "camera" ]]; then
-        download_model "$pip_role"
+        download_model "$pip_role" "$CONFIG_PATH"
     fi
 fi
 

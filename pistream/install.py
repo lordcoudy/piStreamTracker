@@ -310,6 +310,7 @@ def plan_service_actions(
     enable: bool,
     config_path: str | None = None,
     legacy_service_exists: bool = False,
+    backend: str = 'gpio_servo',
 ) -> list[Action]:
     if role == 'standalone':
         if user == 'root':
@@ -318,16 +319,20 @@ def plan_service_actions(
         if legacy_service_exists:
             actions.append(RunAction(('systemctl', 'disable', '--now', 'pitracker')))
         actions.append(RunAction(('usermod', '-aG', 'video,render', user)))
-        actions.append(WriteAction('/etc/systemd/system/pigpiod.service', (
-            '[Unit]\nDescription=Local pigpio PWM daemon\n\n'
-            '[Service]\nType=simple\nExecStart=/usr/bin/pigpiod -g -l -f\n'
-            'Restart=on-failure\nRestartSec=2\n\n'
-            '[Install]\nWantedBy=multi-user.target\n'
-        )))
+        dependencies = ('pistream-camera.service',)
+        services = ('pistream-camera', 'pistream-tracker')
+        if backend == 'gpio_servo':
+            actions.append(WriteAction('/etc/systemd/system/pigpiod.service', (
+                '[Unit]\nDescription=Local pigpio PWM daemon\n\n'
+                '[Service]\nType=simple\nExecStart=/usr/bin/pigpiod -g -l -f\n'
+                'Restart=on-failure\nRestartSec=2\n\n'
+                '[Install]\nWantedBy=multi-user.target\n'
+            )))
+            dependencies = ('pigpiod.service',) + dependencies
+            services = ('pigpiod',) + services
         for name, script, after, requires in (
             ('pistream-camera', 'camera.py', (), ()),
-            ('pistream-tracker', 'web.py', ('pigpiod.service', 'pistream-camera.service'),
-             ('pigpiod.service', 'pistream-camera.service')),
+            ('pistream-tracker', 'web.py', dependencies, dependencies),
         ):
             actions.append(WriteAction(
                 f'/etc/systemd/system/{name}.service',
@@ -340,10 +345,14 @@ def plan_service_actions(
             ))
         actions.append(RunAction(('systemctl', 'daemon-reload')))
         if enable:
-            # Restart applies the localhost-only flags even to an already running daemon.
-            actions.append(RunAction(('systemctl', 'restart', 'pigpiod')))
-            actions.append(RunAction(('systemctl', 'enable', '--now', 'pigpiod',
-                                      'pistream-camera', 'pistream-tracker')))
+            actions.append(RunAction(('systemctl', 'enable') + services))
+            if backend == 'gpio_servo':
+                # Apply localhost-only flags even to an already running daemon.
+                actions.append(RunAction(('systemctl', 'restart', 'pigpiod')))
+            # Restart also applies changed config arguments and supplementary groups
+            # to existing applications; enable --now leaves active processes intact.
+            actions.append(RunAction(('systemctl', 'restart', 'pistream-camera')))
+            actions.append(RunAction(('systemctl', 'restart', 'pistream-tracker')))
         return actions
     script_name = 'camera.py' if role == 'camera' else 'web.py'
     description = (
@@ -382,6 +391,10 @@ def plan_udev_actions(username: str) -> list[Action]:
             content=render_udev_rule(),
         ),
         RunAction(('udevadm', 'control', '--reload-rules')),
+        RunAction((
+            'udevadm', 'trigger', '--action=change', '--subsystem-match=usb',
+            '--attr-match=idVendor=0694', '--settle',
+        )),
         RunAction(('usermod', '-aG', 'plugdev,video', username)),
     ]
 
@@ -529,6 +542,7 @@ def cmd_network(
 def cmd_service(
     args: argparse.Namespace,
     *,
+    load_cfg: Callable[[], dict[str, Any]] | None = None,
     run: Callable[..., Any] | None = None,
     write_file: Callable[[str, str], None] | None = None,
     stdout: TextIO | None = None,
@@ -546,9 +560,13 @@ def cmd_service(
     if not plat.startswith('linux'):
         print('Skipping systemd service (not Linux).', file=stdout)
         return 0
-    from pistream.config import project_root
+    from pistream.config import motor_backend, project_root
     root = (work_dir if work_dir is not None else project_root()).resolve()
     role = _resolved_role(args, model_text)
+    backend = 'none'
+    if role == 'standalone':
+        config = load_cfg() if load_cfg is not None else _load_config(args.config)
+        backend = motor_backend(config)
     if legacy_service_exists is None:
         legacy_service_exists = Path('/etc/systemd/system/pitracker.service').exists()
     actions = plan_service_actions(
@@ -559,6 +577,7 @@ def cmd_service(
         enable=not bool(getattr(args, 'no_enable', False)),
         config_path=str(Path(args.config).resolve()),
         legacy_service_exists=legacy_service_exists,
+        backend=backend,
     )
     execute_actions(
         actions,
@@ -604,9 +623,17 @@ def cmd_install(
     model_text = kwargs.get('model_text')
     role = _resolved_role(args, model_text)
     args.role = role
+    needs_udev = role == 'tracker'
+    if role == 'standalone':
+        from pistream.config import motor_backend
+        load_cfg = kwargs.get('load_cfg')
+        config = load_cfg() if load_cfg is not None else _load_config(args.config)
+        needs_udev = motor_backend(config) == 'ev3'
+        # Use the same snapshot for permissions and service dependencies.
+        kwargs = {**kwargs, 'load_cfg': lambda: config}
     if role != 'standalone' and not getattr(args, 'skip_network', False):
         cmd_network(args, **kwargs)
-    if role == 'tracker' and not getattr(args, 'skip_udev', False):
+    if needs_udev and not getattr(args, 'skip_udev', False):
         cmd_udev(args, **kwargs)
     if not getattr(args, 'skip_service', False):
         cmd_service(args, **kwargs)

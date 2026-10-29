@@ -1,6 +1,6 @@
 # piStreamTracker
 
-Follow-cam for a lecturer: run an IMX219 CSI camera, MoveNet + OpenCV tracking, a web UI and two SG90 pan/tilt servos on one Raspberry Pi 4, or use a Pi 4/Pi 3B+ IMX219 camera → Pi 5 tracker → USB EV3 setup.
+Follow-cam for a lecturer: run an IMX219 CSI camera, MoveNet + OpenCV tracking and a web UI on one Raspberry Pi 4 with USB EV3 or two SG90 pan/tilt servos. A separate Pi 4/Pi 3B+ camera → Pi 5 tracker → USB EV3 setup is also supported.
 
 Run application Python processes as an ordinary user. The standalone setup keeps existing Ethernet/Wi-Fi settings; the two-Pi setup assigns its Ethernet addresses once (EV3 access uses udev).
 
@@ -15,7 +15,7 @@ Run application Python processes as an ordinary user. The standalone setup keeps
 Direct Ethernet (or a switch) between the two Pis.
 The Pi 3B+ and Pi 4 use the same IMX219 camera module and share the
 `tuning/imx219-160-colour.json` profile through `camera.tuning_file` in
-`config.yaml` and `config.pi4.yaml`. The profile preserves the camera correction
+`config.yaml`, `config.pi4-ev3.yaml` and `config.pi4.yaml`. The profile preserves the camera correction
 from the supplied Pi 4 project.
 
 ```
@@ -85,7 +85,54 @@ bounds fixed imports. Picamera2/libcamera remain installed through apt.
 - Optional Bearer token on every `/record/*` operation; cap on concurrent `/stream` clients
 - Camera-mode recordings remain downloadable/deletable from the tracker UI; local fallback is automatic
 
-## One Raspberry Pi 4: assembly and first run
+## One Raspberry Pi 4 with USB EV3
+
+Use Raspberry Pi OS Bookworm 64-bit with its system Python 3.11, an IMX219 CSI
+camera and an EV3 brick connected by USB. Connect the pan motor to EV3 port A
+and tilt to port B. Select [config.pi4-ev3.yaml](config.pi4-ev3.yaml):
+
+```bash
+./setup.sh --standalone --config config.pi4-ev3.yaml
+```
+
+This installs camera and tracker dependencies, checks the inference runtime/model,
+grants EV3 access through udev and enables `pistream-camera` and `pistream-tracker`.
+The selected `motors.backend: ev3` does not need pigpio packages or a `pigpiod`
+service dependency. The GPIO configuration below selects those separately.
+Both applications run as the invoking ordinary user and receive the same absolute
+config path. Log out/in or reboot after group changes before a manual launch.
+Setup preserves current network settings and the selected YAML on repeat runs.
+
+`camera.py` owns CSI and serves `http://127.0.0.1:8000/stream`; tracking, camera
+controls and camera recordings use that localhost address. Open
+`http://<Pi-LAN-IP>:5000` from another LAN device. The profile uses 1280×960
+(4:3) at 25 camera/recording FPS, one MoveNet thread, and a 640-pixel preview
+at JPEG quality 65 with a 10 FPS preview cap. Camera WB and image controls retain
+the saved adjustments for the camera Pi. Check performance with tracking,
+preview and recording together; capture FPS and processing FPS are separate.
+
+Camera-side H.264 is encoded by the Pi 4 and saved to `camera-recordings/`;
+screenshots and fallback local recordings use `recordings/`. Keep these
+directories distinct so camera files do not also appear through local-file
+operations. The same camera/preview settings panels described below save into
+this config. Tracking and EV3 connect after the 120-second startup delay;
+manual Start/Stop cancels the pending start. EV3 directions and speed limits
+still need checking on the actual mechanism.
+
+For a foreground run, stop the installed application services first:
+
+```bash
+sudo systemctl stop pistream-tracker pistream-camera
+./run_standalone.sh --config config.pi4-ev3.yaml
+# Ctrl-C stops both applications.
+sudo systemctl start pistream-camera pistream-tracker
+```
+
+Launch this config without `--preset pi4`: that legacy preset overrides capture
+with **640×480 at 15 FPS** and changes inference threads. The standalone launcher
+and generated services use the selected config directly, without a preset.
+
+## One Raspberry Pi 4 with SG90: assembly and first run
 
 Use **Raspberry Pi OS Bookworm 64-bit with its system Python 3.11**, one CSI
 camera and two positional SG90 servos. The current `config.pi4.yaml` combines
@@ -135,7 +182,8 @@ Pi 4 auto-detection also selects `standalone`. Setup creates a
 `--system-site-packages` `venv/`, installs apt camera/libcamera bindings and
 `rpicam-apps`, installs `pigpiod` and the Python client, and installs project
 dependencies. It preserves the selected YAML file on repeat installations and
-does not reconfigure networking or install EV3 udev rules in this role.
+does not reconfigure networking. This GPIO configuration skips EV3 udev rules;
+the USB EV3 configuration above installs them.
 The applications run as the invoking ordinary user; the privileged daemon uses
 `pigpiod -g -l -f` (foreground, localhost connections, FIFO disabled).
 [Upstream daemon options](https://github.com/joan2937/pigpio/blob/master/pigpiod.c).
@@ -154,7 +202,7 @@ model if absent; an unavailable model/runtime fails setup. This still requires
 camera capture and inference checks on the installed Pi image. Log out/in or reboot after group changes
 before using the manual launcher.
 
-Setup enables three services: `pigpiod`, `pistream-camera`, and
+With `config.pi4.yaml`, setup enables three services: `pigpiod`, `pistream-camera`, and
 `pistream-tracker`. The tracker starts after and requires the camera and daemon.
 Both applications receive the same absolute config path. A previous
 `pitracker.service` on this device is stopped and disabled to avoid a second
@@ -218,7 +266,7 @@ Manual exposure is available in milliseconds with separate analogue gain; its
 upper limit follows both the sensor and frame period. The panel reports actual
 exposure/gain/frame rate separately from the tracker's processing FPS.
 
-Both Pi camera configurations load `tuning/imx219-160-colour.json`, preserving
+The bundled IMX219 configurations load `tuning/imx219-160-colour.json`, preserving
 the supplied sensor tuning and adding static colour shading based on Arducam's
 160-degree tables with measured strengths. It reduced the purple cast on the
 tested Pi 4: red ratios stayed within about 5% of the centre in six white-paper

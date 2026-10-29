@@ -243,6 +243,60 @@ class SshGuardTests(unittest.TestCase):
 
 
 class UnitFileTests(unittest.TestCase):
+    def test_standalone_apply_restarts_apps_after_reloading_updated_units(self):
+        for backend in ('ev3', 'gpio_servo', 'none'):
+            with self.subTest(backend=backend):
+                actions = plan_service_actions(
+                    role='standalone', user='pi', work_dir='/repo',
+                    python='/repo/venv/bin/python', config_path='/configs/new profile.yaml',
+                    enable=True, backend=backend,
+                )
+                runs = [a.argv for a in actions if isinstance(a, RunAction)]
+                camera_restart = ('systemctl', 'restart', 'pistream-camera')
+                tracker_restart = ('systemctl', 'restart', 'pistream-tracker')
+                self.assertIn(camera_restart, runs)
+                self.assertIn(tracker_restart, runs)
+                self.assertLess(runs.index(('systemctl', 'daemon-reload')),
+                                runs.index(camera_restart))
+                self.assertLess(runs.index(('usermod', '-aG', 'video,render', 'pi')),
+                                runs.index(camera_restart))
+                self.assertLess(runs.index(camera_restart), runs.index(tracker_restart))
+                if backend != 'gpio_servo':
+                    self.assertFalse(any('pigpiod' in command for command in runs))
+
+    def test_standalone_no_enable_does_not_start_or_restart_services(self):
+        for backend in ('ev3', 'gpio_servo', 'none'):
+            with self.subTest(backend=backend):
+                actions = plan_service_actions(
+                    role='standalone', user='pi', work_dir='/repo',
+                    python='/repo/venv/bin/python', enable=False, backend=backend,
+                )
+                systemctl = [a.argv for a in actions if isinstance(a, RunAction)
+                             and a.argv[0] == 'systemctl']
+                self.assertEqual(systemctl, [('systemctl', 'daemon-reload')])
+
+    def test_standalone_ev3_and_no_motor_services_do_not_use_pigpio(self):
+        for backend in ('ev3', 'none'):
+            with self.subTest(backend=backend):
+                actions = plan_service_actions(
+                    role='standalone', user='pi', work_dir='/repo',
+                    python='/repo/venv/bin/python', config_path='/configs/pi4.yaml',
+                    enable=True, backend=backend,
+                )
+                writes = {Path(a.path).name: a.content for a in actions
+                          if isinstance(a, WriteAction)}
+                self.assertEqual(set(writes), {
+                    'pistream-camera.service', 'pistream-tracker.service',
+                })
+                tracker = writes['pistream-tracker.service']
+                self.assertIn('After=network-online.target pistream-camera.service\n', tracker)
+                self.assertIn('Requires=pistream-camera.service\n', tracker)
+                self.assertNotIn('pigpio', ''.join(writes.values()))
+                runs = [a.argv for a in actions if isinstance(a, RunAction)]
+                self.assertFalse(any('pigpiod' in command for command in runs))
+                self.assertIn(('systemctl', 'enable', 'pistream-camera',
+                               'pistream-tracker'), runs)
+
     def test_standalone_services_share_config_and_order_camera_before_tracker(self):
         actions = plan_service_actions(
             role='standalone', user='pi', work_dir='/repo', python='/repo/venv/bin/python',
@@ -264,7 +318,7 @@ class UnitFileTests(unittest.TestCase):
                       writes['pistream-tracker.service'])
         self.assertIn('ExecStart=/usr/bin/pigpiod -g -l -f', writes['pigpiod.service'])
         runs = [a.argv for a in actions if isinstance(a, RunAction)]
-        self.assertIn(('systemctl', 'enable', '--now', 'pigpiod', 'pistream-camera',
+        self.assertIn(('systemctl', 'enable', 'pigpiod', 'pistream-camera',
                        'pistream-tracker'), runs)
 
     def test_standalone_apps_cannot_run_as_root(self):
@@ -303,6 +357,38 @@ class UnitFileTests(unittest.TestCase):
                     directory = next(line.removeprefix('WorkingDirectory=') for line in lines
                                      if line.startswith('WorkingDirectory='))
                     self.assertEqual(directory, str(root))
+
+    def test_standalone_service_resolves_backend_from_shared_config_with_spaces(self):
+        with TemporaryDirectory() as tmp:
+            root = (Path(tmp) / 'repo with spaces').resolve()
+            config_path = Path(tmp) / 'standalone ev3.yaml'
+            config_path.write_text('motors:\n  backend: ev3\n')
+            writes = {}
+            calls = []
+            args = parse_args([
+                '--config', os.path.relpath(config_path), 'service',
+                '--role', 'standalone', '--no-enable',
+            ])
+            self.assertEqual(cmd_service(
+                args, platform='linux', work_dir=root, user='pi',
+                python=str(root / 'venv/bin/python'), legacy_service_exists=False,
+                run=lambda argv, **_kwargs: calls.append(argv),
+                write_file=lambda path, content: writes.update({Path(path).name: content}),
+                stdout=StringIO(),
+            ), 0)
+            self.assertEqual(set(writes), {
+                'pistream-camera.service', 'pistream-tracker.service',
+            })
+            for name, script in [('pistream-camera.service', 'camera.py'),
+                                 ('pistream-tracker.service', 'web.py')]:
+                command = next(line.removeprefix('ExecStart=:')
+                               for line in writes[name].splitlines()
+                               if line.startswith('ExecStart='))
+                self.assertEqual(shlex.split(command), [
+                    str(root / 'venv/bin/python'), str(root / script),
+                    '--config', str(config_path.resolve()),
+                ])
+            self.assertEqual(calls[-1], ('sudo', 'systemctl', 'daemon-reload'))
 
     def test_camera_unit(self):
         body = render_unit_file(
@@ -349,6 +435,35 @@ class UnitFileTests(unittest.TestCase):
 
 
 class UdevTests(unittest.TestCase):
+    def test_plan_applies_reloaded_rules_only_to_attached_ev3_usb_devices(self):
+        actions = plan_udev_actions('milord')
+        reload = RunAction(('udevadm', 'control', '--reload-rules'))
+        trigger = RunAction((
+            'udevadm', 'trigger', '--action=change', '--subsystem-match=usb',
+            '--attr-match=idVendor=0694', '--settle',
+        ))
+        self.assertIn(trigger, actions)
+        self.assertLess(actions.index(reload), actions.index(trigger))
+
+    def test_ev3_install_dry_run_prints_filtered_trigger_without_running(self):
+        calls = []
+        writes = []
+        out = StringIO()
+        args = parse_args([
+            '--dry-run', 'install', '--role', 'standalone', '--skip-service',
+        ])
+        self.assertEqual(cmd_install(
+            args, load_cfg=lambda: {'motors': {'backend': 'ev3'}},
+            platform='linux', user='milord', stdout=out,
+            run=lambda *a, **k: calls.append((a, k)),
+            write_file=lambda p, c: writes.append((p, c)),
+        ), 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(writes, [])
+        self.assertIn('udevadm control --reload-rules', out.getvalue())
+        self.assertIn('udevadm trigger --action=change --subsystem-match=usb '
+                      '--attr-match=idVendor=0694 --settle', out.getvalue())
+
     def test_rule_vendor(self):
         rule = render_udev_rule()
         self.assertIn('idVendor}=="0694"', rule)
@@ -408,14 +523,74 @@ class CmdNetworkTests(unittest.TestCase):
                                      load_cfg=unexpected, is_active=unexpected, run=unexpected), 0)
         self.assertIn('preserving', out.getvalue())
 
-    def test_standalone_install_skips_ev3_udev_and_network(self):
+    def test_standalone_gpio_and_no_motor_install_skip_ev3_udev_and_network(self):
         from unittest.mock import patch
-        args = parse_args(['install', '--role', 'standalone', '--skip-service'])
-        with patch('pistream.install.cmd_network') as network, \
-                patch('pistream.install.cmd_udev') as udev:
-            self.assertEqual(cmd_install(args), 0)
-        network.assert_not_called()
+        for config in ({'motors': {'backend': 'gpio_servo'}},
+                       {'motors': {'backend': 'none'}, 'ev3': {'enabled': True}},
+                       {'ev3': {'enabled': False}}):
+            with self.subTest(config=config):
+                args = parse_args(['install', '--role', 'standalone', '--skip-service'])
+                with patch('pistream.install.cmd_network') as network, \
+                        patch('pistream.install.cmd_udev') as udev:
+                    self.assertEqual(cmd_install(args, load_cfg=lambda: config), 0)
+                network.assert_not_called()
+                udev.assert_not_called()
+
+    def test_auto_pi4_ev3_install_includes_udev_and_only_camera_tracker_services(self):
+        from unittest.mock import patch
+        for config in ({'motors': {'backend': 'ev3'}}, {'ev3': {'enabled': True}}):
+            with self.subTest(config=config):
+                calls = []
+                writes = {}
+                args = parse_args(['install', '--role', 'auto'])
+                with patch('pistream.install.cmd_network') as network:
+                    self.assertEqual(cmd_install(
+                        args, load_cfg=lambda: config, platform='linux',
+                        model_text='Raspberry Pi 4 Model B Rev 1.5', user='pi',
+                        work_dir=Path('/repo'), python='/repo/venv/bin/python',
+                        legacy_service_exists=False,
+                        run=lambda argv, **_kwargs: calls.append(argv),
+                        write_file=lambda path, content: writes.update({Path(path).name: content}),
+                        stdout=StringIO(),
+                    ), 0)
+                network.assert_not_called()
+                self.assertEqual(args.role, 'standalone')
+                self.assertEqual(set(writes), {
+                    '99-ev3.rules', 'pistream-camera.service', 'pistream-tracker.service',
+                })
+                self.assertIn(('sudo', 'usermod', '-aG', 'plugdev,video', 'pi'), calls)
+                self.assertFalse(any('pigpiod' in command for command in calls))
+
+    def test_standalone_ev3_install_honors_skip_udev(self):
+        from unittest.mock import patch
+        args = parse_args([
+            'install', '--role', 'standalone', '--skip-udev', '--skip-service',
+        ])
+        with patch('pistream.install.cmd_udev') as udev:
+            self.assertEqual(cmd_install(
+                args, load_cfg=lambda: {'motors': {'backend': 'ev3'}},
+            ), 0)
         udev.assert_not_called()
+
+    def test_standalone_gpio_install_keeps_gpio_service_and_no_usb_rule(self):
+        calls = []
+        writes = {}
+        args = parse_args(['install', '--role', 'standalone'])
+        self.assertEqual(cmd_install(
+            args, load_cfg=lambda: {'motors': {'backend': 'gpio_servo'}},
+            platform='linux', model_text='Raspberry Pi 4 Model B Rev 1.5',
+            user='pi', work_dir=Path('/repo'), python='/repo/venv/bin/python',
+            legacy_service_exists=False,
+            run=lambda argv, **_kwargs: calls.append(argv),
+            write_file=lambda path, content: writes.update({Path(path).name: content}),
+            stdout=StringIO(),
+        ), 0)
+        self.assertEqual(set(writes), {
+            'pigpiod.service', 'pistream-camera.service', 'pistream-tracker.service',
+        })
+        self.assertIn(('sudo', 'systemctl', 'restart', 'pigpiod'), calls)
+        self.assertIn('Requires=pigpiod.service pistream-camera.service\n',
+                      writes['pistream-tracker.service'])
 
     def test_standalone_service_disables_existing_legacy_owner(self):
         calls = []

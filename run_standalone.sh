@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 
 if [[ $EUID -eq 0 ]]; then
-    echo "Run as an ordinary user; pigpiod provides privileged GPIO access." >&2
+    echo "Run as an ordinary user; setup grants camera and motor access." >&2
     exit 1
 fi
 
@@ -18,7 +18,8 @@ while [[ $# -gt 0 ]]; do
             CONFIG="$2"; shift 2 ;;
         --config=*) CONFIG="${1#--config=}"; shift ;;
         --help|-h)
-            echo "Usage: $0 [--config config.pi4.yaml] [web.py options]"
+            echo "Usage: $0 [--config CONFIG] [web.py options]"
+            echo "Default: config.pi4.yaml (GPIO servos). Use config.pi4-ev3.yaml for EV3 USB."
             exit 0 ;;
         *) EXTRA_ARGS+=("$1"); shift ;;
     esac

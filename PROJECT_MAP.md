@@ -1,17 +1,18 @@
 # piStreamTracker project map
 
-Agent orientation, updated for the Pi 4 camera + Pi 5/EV3 deployment on
+Agent orientation, updated for the Pi 4 standalone and Pi 4 camera + Pi 5/EV3 deployments on
 2026-10-29, following the recording/recovery fixes in October. This is a
 navigation aid, not a specification. Source code and tests determine current
 behavior; recheck the relevant section before changing it.
 
 ## System at a glance
 
-A lecturer-following camera system with two deployment choices: a Pi 4 (also
-Pi 3B+) with an IMX219 camera and Pi 5 tracker with USB EV3, or one Pi 4 with an IMX219 camera
-and two GPIO SG90 servos. Both deployments use the same IMX219 camera module
+A lecturer-following camera system with three deployment choices: one Pi 4 with
+an IMX219 camera and USB EV3, one Pi 4 with the camera and two GPIO SG90 servos,
+or a separate Pi 4 (also Pi 3B+) camera and Pi 5 tracker with USB EV3.
+The deployments use the same IMX219 camera module
 and select the shared 160-degree profile with static colour shading through `camera.tuning_file`
-in `config.yaml` and `config.pi4.yaml`. Automatic
+in `config.yaml`, `config.pi4-ev3.yaml` and `config.pi4.yaml`. Automatic
 sensor tuning also remains available for OV5647 and other cameras.
 In standalone, `camera.py` alone opens CSI and `web.py` consumes its local MJPEG
 at `127.0.0.1:8000`; the Flask UI binds to the LAN. Tracking can also run with an
@@ -54,7 +55,7 @@ use the source and this map for current ownership.
 | Recording | [record.py](pistream/record.py), [recordings.py](pistream/recordings.py) | Timed local writer, encoder probing/fallback, file listing/path confinement, remote file operations |
 | Preview geometry | [preview.py](pistream/preview.py), [horizon.py](pistream/horizon.py) | New-frame/rate gates, resize/FPS caps, pose roll estimation, smoothing, rotate/crop |
 | HTTP helpers | [camera_auth.py](pistream/camera_auth.py), [jsonutil.py](pistream/jsonutil.py) | Bearer token checks, defensive JSON-object parsing; camera stream slots use `threading.BoundedSemaphore` in `camera.py` |
-| Configuration | [config.yaml](config.yaml), [config.py](pistream/config.py) | User settings, built-in defaults, validation, preset/CLI merge, host selection and logging |
+| Configuration | [config.yaml](config.yaml), [config.pi4-ev3.yaml](config.pi4-ev3.yaml), [config.pi4.yaml](config.pi4.yaml), [config.py](pistream/config.py) | Two-Pi, standalone USB EV3 and standalone GPIO settings; defaults, validation, preset/CLI merge, host selection and logging |
 | Installation | [setup.sh](setup.sh), [install.py](pistream/install.py) | apt/venv/pip bootstrap; planned network, systemd and udev operations |
 | Launch wrappers | [run_cam.sh](run_cam.sh), [run_tracker.sh](run_tracker.sh), [run_standalone.sh](run_standalone.sh) | Checkout working directory, venv selection, active-service checks; standalone child ownership/signal cleanup |
 | Browser UI | [index.html](pistream/templates/index.html), [app.js](pistream/static/app.js), [style.css](pistream/static/style.css) | Jinja page, plain JavaScript controls/status polling, CSS; no frontend build step |
@@ -303,6 +304,16 @@ keep the tracker copy's capture/recording defaults aligned across restarts.
 `web.autostart_delay` defaults to 120 seconds even for existing YAML files that
 omit it. Null disables the one-time automatic start; finite numeric values from
 0 to 86400 select another delay. The web UI remains available during the wait.
+`config.pi4-ev3.yaml` combines camera, tracking/web and USB EV3 on one Pi 4.
+Its camera host and explicit tracker stream URL use `127.0.0.1:8000`, while the
+web UI binds `0.0.0.0:5000`. It preserves the camera Pi's room-light WB/image
+adjustments and selects 1280×960/25, one inference thread, detection interval 10,
+and 640-pixel/Q65 preview at 10 FPS. H.264 remains camera-side, within the same Pi.
+Camera recordings use `camera-recordings/` and tracker outputs use `recordings/`;
+keep those directories disjoint so camera files stay out of local-file operations.
+Its explicit EV3 backend uses pan=A/tilt=B, inversions false/true, max speed 25,
+cooldown 0.25 seconds and keep-alive 60 seconds. This profile is a single-host
+starting budget; verify combined tracking/preview/recording load on the target.
 `config.pi4.yaml` uses the supplied Pi's localhost camera endpoints,
 camera-side H.264 recording, separate `camera-recordings/` and tracker `recordings/`
 directories, 1280×720 at 25 camera/recording FPS, JPEG quality 80, one inference
@@ -359,16 +370,23 @@ manual `ip address` / `ip link` changes do not persist across reboots. Each devi
 `pitracker.service`: `camera.py` on the camera, `web.py` on the tracker, running
 as a normal user. Tracker udev rules grant EV3 USB access.
 
-Standalone skips network and EV3 udev changes. `setup.sh --standalone --config ...`
-installs the union of camera/tracker dependencies and pigpio, preloads MoveNet,
-and writes `pistream-camera.service`, `pistream-tracker.service`, plus a localhost-only
-`pigpiod.service`. Tracker Requires/After camera and pigpiod; both applications get
-the same absolute config and an ordinary user with video/render groups. An existing
+Standalone always preserves network settings. `setup.sh --standalone --config ...`
+installs camera/tracker dependencies, checks the selected MoveNet model/interpreter,
+and writes `pistream-camera.service` and `pistream-tracker.service` using the same
+absolute config and an ordinary user with video/render groups. Dependency and
+permission setup follows the resolved `motors.backend`: EV3 installs its USB udev
+rule and plugdev/video access, while GPIO adds pigpio packages and the localhost-only
+`pigpiod.service`. Tracker Requires/After camera; only GPIO also requires pigpiod.
+Use `--config config.pi4-ev3.yaml` for USB EV3; the default standalone config remains
+`config.pi4.yaml` for GPIO. An existing
 legacy `pitracker.service` is disabled/stopped to avoid a second camera owner.
+An enabled standalone apply restarts camera and then tracker so changed config
+arguments and group membership also take effect on already-running services;
+`service --no-enable` only writes/reloads units.
 Pi 4 auto-selects standalone; a separate camera Pi 4 explicitly uses
 `setup.sh --camera --config config.yaml`. `run_standalone.sh` owns two subprocesses with a
 checkout lock, service guards and bounded signal/child-failure cleanup. Reboots
-restore the three services; tracking and configured motor connection start
+restore the selected application/daemon services; tracking and configured motor connection start
 automatically after the web process's delay unless manual Start/Stop cancels it.
 
 Laptop setup uses `pip install -e ".[dev,desktop]"`. The optional extra selects
@@ -401,7 +419,7 @@ status can use `rtk proxy .venv/bin/python -m pistream.install status`.
 
 | Change area | Relevant tests |
 |---|---|
-| Config/presets/validation and automatic-start delay | [test_config.py](tests/test_config.py) |
+| Config/presets/validation, standalone EV3 profile and automatic-start delay | [test_config.py](tests/test_config.py), [test_pi4_ev3_config.py](tests/test_pi4_ev3_config.py) |
 | Reconnect and frame identity | [test_capture_policy.py](tests/test_capture_policy.py), [test_frame_gate.py](tests/test_frame_gate.py) |
 | Async result semantics and tracker refresh/loss | [test_async_detector.py](tests/test_async_detector.py), [test_track_box.py](tests/test_track_box.py) |
 | Motor commands, holds, keep-alive and bounded USB release | [test_motors.py](tests/test_motors.py), [test_ev3_usb.py](tests/test_ev3_usb.py) |
@@ -542,6 +560,11 @@ These are code observations at the revision above, not fixes made by this map.
 - **Startup:** model acquisition happens during `HumanTracker` construction.
   Download timeouts can exceed the web lifecycle's default startup deadline.
   See `PoseDetector._get_model()` and `TrackerLifecycle.start()`.
+- **Single Pi 4 load:** camera MJPEG uses software `JpegEncoder`; tracking and
+  each visible preview also consume CPU. MoveNet input stays 192×192 regardless
+  of detection scale, and the no-target path submits inference whenever idle.
+  Measure capture/processing FPS and CPU/temperature under the combined workload;
+  an active web service alone does not establish a ready inference model.
 - **Reconnect/recording:** capture/detector/motor dimensions follow new frames,
   but an already-open local recorder retains its initial geometry. Keep camera
   resolution fixed during a recording.

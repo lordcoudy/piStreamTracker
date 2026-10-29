@@ -1,0 +1,68 @@
+# One Raspberry Pi 4: IMX219 camera, tracking/web and USB Mindstorms EV3.
+# Launch without --preset pi4, which selects a legacy low-resolution profile.
+network:
+  camera_ip: "127.0.0.1"
+  tracker_ip: "127.0.0.1"
+  interface: "eth0"
+  subnet: "24"
+
+camera:
+  host: "127.0.0.1"
+  port: 8000
+  resolution: {width: 1280, height: 960}
+  framerate: 25
+  jpeg_quality: 80
+  tuning_file: "tuning/imx219-160-colour.json"
+  recording_dir: "camera-recordings"
+  max_stream_clients: 4
+  token: null
+  # Preserve the working camera Pi's saved room-light adjustments.
+  awb_mode: manual
+  colour_gains: [1.1368712, 1.86235795]
+  exposure_mode: auto
+  exposure_time_us: 33300
+  analogue_gain: 10.66
+  brightness: 0.15
+  contrast: 1.1
+  saturation: 0.7
+  sharpness: 1.3
+  noise_reduction: high_quality
+  exposure_value: 0.0
+
+tracker:
+  stream_url: "http://127.0.0.1:8000/stream"
+  output_dir: "recordings"
+  recording_mode: "camera"
+  recording_encoder: auto
+  recording_fps: 25
+  detection: {interval: 10, scale: 0.4, confidence: 0.4, keypoint_threshold: 0.3}
+  movenet: {threads: 1}
+  horizon: {enabled: false}
+
+motors:
+  backend: ev3
+
+ev3:
+  enabled: true
+  ports: {pan: "a", tilt: "b"}
+  deadzone: {x: 90, y: 90}
+  speed_factor: 1.0
+  max_speed: 25
+  invert: {x: false, y: true}
+  cooldown: 0.25
+  home_hold: 3.0
+  keep_alive_interval: 60
+
+web:
+  host: "0.0.0.0"
+  port: 5000
+  autostart_delay: 120
+  overlay: true
+  preview_quality: 65
+  preview_max_edge: 640
+  preview_max_fps: 10
+
+logging:
+  level: "INFO"
+  file: null
+  verbose_shifts: false
